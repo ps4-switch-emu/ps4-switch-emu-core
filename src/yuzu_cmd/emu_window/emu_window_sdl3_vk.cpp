@@ -84,8 +84,15 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
 #ifdef __OPENORBIS__
         window_info.type = Core::Frontend::WindowSystemType::Headless;
 #else
-        LOG_CRITICAL(Frontend, "Unable to determine native window backend from SDL properties");
-        std::exit(EXIT_FAILURE);
+        // SDL_VIDEO_DRIVER=offscreen (no display, e.g. a profiling run on a build box): render
+        // into a headless Vulkan surface.
+        const char* driver = SDL_GetCurrentVideoDriver();
+        if (driver && std::string_view{driver} == "offscreen") {
+            window_info.type = Core::Frontend::WindowSystemType::Headless;
+        } else {
+            LOG_CRITICAL(Frontend, "Unable to determine native window backend from SDL properties");
+            std::exit(EXIT_FAILURE);
+        }
 #endif
     }
 

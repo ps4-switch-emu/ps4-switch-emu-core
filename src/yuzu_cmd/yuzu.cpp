@@ -56,6 +56,7 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#include "core/frontend/framebuffer_layout.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
 #include "yuzu_cmd/emu_window/emu_window_sdl3_gl.h"
@@ -1110,8 +1111,48 @@ static void PS4HomeMenu(SdlState* state) {
 }
 #endif
 
+// EDEN_SCREENSHOTS=<dir>: saves the game's picture there every EDEN_SCREENSHOT_EVERY seconds
+// (default 5) as shot-<seconds>.ppm, to see where a game is when nobody watches the screen (PC
+// runs driven by EDEN_AUTOPRESS).
+static void MaybeScreenshot(Core::System& system) {
+    static const char* const dir = std::getenv("EDEN_SCREENSHOTS");
+    if (!dir || !system.IsPoweredOn() || system.Renderer().IsScreenshotPending())
+        return;
+    static const double every = std::getenv("EDEN_SCREENSHOT_EVERY") ? std::atof(std::getenv("EDEN_SCREENSHOT_EVERY")) : 5.0;
+    static const auto start = std::chrono::steady_clock::now();
+    static double next = every;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (now < next)
+        return;
+    next = now + every;
+    constexpr u32 kW = 1280, kH = 720;
+    static std::vector<u8> pixels(size_t(kW) * kH * 4);
+    const int seconds = int(now);
+    system.Renderer().RequestScreenshot(
+        pixels.data(),
+        [seconds](bool invert_y) {
+            const std::string path = fmt::format("{}/shot-{:04d}.ppm", dir, seconds);
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fprintf(f, "P6 %u %u 255\n", kW, kH);
+                std::vector<u8> row(size_t(kW) * 3);
+                for (u32 y = 0; y < kH; y++) {
+                    const u8* src = pixels.data() + size_t(invert_y ? kH - 1 - y : y) * kW * 4;
+                    for (u32 x = 0; x < kW; x++) { // BGRA -> RGB
+                        row[x * 3] = src[x * 4 + 2];
+                        row[x * 3 + 1] = src[x * 4 + 1];
+                        row[x * 3 + 2] = src[x * 4];
+                    }
+                    std::fwrite(row.data(), 1, row.size(), f);
+                }
+                std::fclose(f);
+            }
+        },
+        Layout::DefaultFrameLayout(kW, kH));
+}
+
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
+    MaybeScreenshot(state->system);
 #ifdef __OPENORBIS__
     // Nothing to draw here (rendering happens on its own thread); don't spin a whole Jaguar core.
     SDL_Delay(4);

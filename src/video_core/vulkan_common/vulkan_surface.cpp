@@ -79,6 +79,17 @@ vk::SurfaceKHR CreateSurface(
 #elif defined(__OPENORBIS__)
     // No native
 #else
+    if (window_info.type == Core::Frontend::WindowSystemType::Headless) {
+        const VkHeadlessSurfaceCreateInfoEXT headless_ci{VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT,
+                                                         nullptr, 0};
+        const auto vkCreateHeadlessSurfaceEXT = reinterpret_cast<PFN_vkCreateHeadlessSurfaceEXT>(
+            dld.vkGetInstanceProcAddr(*instance, "vkCreateHeadlessSurfaceEXT"));
+        if (!vkCreateHeadlessSurfaceEXT ||
+            vkCreateHeadlessSurfaceEXT(*instance, &headless_ci, nullptr, &unsafe_surface) != VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "Failed to initialize headless surface");
+            throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+        }
+    }
     if (window_info.type == Core::Frontend::WindowSystemType::X11) {
         const VkXlibSurfaceCreateInfoKHR xlib_ci{
             VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR, nullptr, 0,

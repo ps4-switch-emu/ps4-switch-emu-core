@@ -42,6 +42,11 @@ namespace {
     extensions.reserve(6);
     switch (window_type) {
     case Core::Frontend::WindowSystemType::Headless:
+#if !defined(__OPENORBIS__) && !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
+        // Desktop runs without a window (SDL's offscreen driver): a headless surface.
+        extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        extensions.push_back(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME);
+#endif
         break;
 #ifdef _WIN32
     case Core::Frontend::WindowSystemType::Windows:
