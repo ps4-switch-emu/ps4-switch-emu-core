@@ -46,6 +46,11 @@
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
 #include "input_common/main.h"
+#include "input_common/drivers/virtual_gamepad.h"
+#include <cmath>
+#include <fstream>
+#include <sstream>
+#include <thread>
 #include "network/network.h"
 #include "sdl_config.h"
 #include "video_core/gpu.h"
@@ -369,6 +374,99 @@ static void OnStatusMessageReceived(const Network::StatusMessageEntry& msg) {
     }();
     if (!message.empty())
         std::cout << std::endl << "* " << message << std::endl << std::endl;
+}
+
+// EDEN_AUTOPRESS=<file>: player 1 becomes a virtual controller that presses buttons from a script,
+// so a game can be driven without a controller (profiling gameplay on a PC, scripts/profile-pc.sh).
+// One instruction per line, times in seconds from the start, '#' starts a comment:
+//   at <time> <button> [hold ms]
+//   every <period> <button> [hold ms] from <time> [until <time>]
+//   hold <button> from <time> until <time>
+// Buttons: A B X Y L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN.
+static void StartAutopress(InputCommon::InputSubsystem& input, Core::HID::EmulatedController* controller,
+                           const char* path) {
+    static const char* const kNames[] = {"A", "B", "X", "Y", "", "", "L", "R", "ZL", "ZR",
+                                         "PLUS", "MINUS", "LEFT", "UP", "RIGHT", "DOWN"};
+    constexpr int kButtons = 16; // Settings::NativeButton and VirtualButton agree up to DDown
+    for (int b = 0; b < kButtons; b++) {
+        Common::ParamPackage param;
+        param.Set("engine", "virtual_gamepad");
+        param.Set("port", 0);
+        param.Set("button", b);
+        controller->SetButtonParam(b, param);
+    }
+    controller->SaveCurrentConfig(); // as for a real controller: settings reloads keep the mapping
+    controller->ReloadFromSettings();
+    struct Press {
+        double from, until, period, hold;
+        int button;
+    };
+    std::vector<Press> presses;
+    std::ifstream file(path);
+    std::string line;
+    const auto button_of = [&](const std::string& name) {
+        for (int b = 0; b < kButtons; b++)
+            if (name == kNames[b])
+                return b;
+        return -1;
+    };
+    while (std::getline(file, line)) {
+        line = line.substr(0, line.find('#'));
+        std::istringstream in(line);
+        std::string kind, name, word;
+        if (!(in >> kind))
+            continue;
+        Press p{0, 0, 0, 0.1, -1};
+        if (kind == "at") {
+            in >> p.from >> name;
+            if (in >> word)
+                p.hold = std::stod(word) / 1000.0;
+            p.until = p.from + p.hold;
+        } else if (kind == "every") {
+            in >> p.period >> name;
+            p.until = 1e9;
+            while (in >> word) {
+                if (word == "from")
+                    in >> p.from;
+                else if (word == "until")
+                    in >> p.until;
+                else
+                    p.hold = std::stod(word) / 1000.0;
+            }
+        } else if (kind == "hold") {
+            in >> name >> word >> p.from >> word >> p.until;
+            p.hold = p.until - p.from;
+        }
+        p.button = button_of(name);
+        if (p.button < 0) {
+            LOG_ERROR(Input, "autopress: can't read \"{}\"", line);
+            continue;
+        }
+        presses.push_back(p);
+    }
+    LOG_INFO(Input, "autopress: {} instructions from {}", presses.size(), path);
+    std::thread([pad = input.GetVirtualGamepad(), controller, presses] {
+        const auto start = std::chrono::steady_clock::now();
+        bool down[kButtons] = {};
+        for (;;) {
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            bool want[kButtons] = {};
+            for (const Press& p : presses) {
+                if (now < p.from || now >= p.until)
+                    continue;
+                want[p.button] |= p.period > 0 ? std::fmod(now - p.from, p.period) < p.hold : true;
+            }
+            for (int b = 0; b < kButtons; b++)
+                if (want[b] != down[b]) {
+                    pad->SetButtonState(0, b, down[b] = want[b]);
+                    if (std::getenv("EDEN_AUTOPRESS_TRACE"))
+                        LOG_WARNING(Input, "autopress: {:.2f} s {} {} (controller sees {}, connected {})", now,
+                                    kNames[b], want[b] ? "down" : "up", controller->GetButtonsValues()[b].value,
+                                    controller->IsConnected());
+                }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }).detach();
 }
 
 struct SdlState {
@@ -801,6 +899,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     {
         auto emulated_controller = state->system.HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+        if (const char* script = getenv("EDEN_AUTOPRESS")) {
+            StartAutopress(input_subsystem, emulated_controller, script);
+            goto skip_controller_mapping;
+        }
         auto const input_devices = input_subsystem.GetInputDevices();
         for (const auto& e : input_devices) {
             LOG_INFO(Input, "FOUND=Device -> {} {}", e.Get("display", "Unknown"), e.Serialize());
