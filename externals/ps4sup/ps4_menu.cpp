@@ -102,6 +102,41 @@ int CountInstallFiles() {
     return count;
 }
 
+#ifdef __OPENORBIS__
+struct SceKernelSwVersion {
+    size_t size;
+    char version_string[0x1C];
+    uint32_t version; // e.g. 0x13020000 for 13.02
+};
+extern "C" int sceKernelGetSystemSwVersion(SceKernelSwVersion* out);
+#endif
+
+// Settings > About: this package's version (written into it by scripts/package-eden.sh).
+std::string AppVersion() {
+    char text[32] = "";
+    if (FILE* f = fopen("/app0/version.txt", "r")) {
+        if (!fgets(text, sizeof(text), f))
+            text[0] = 0;
+        fclose(f);
+    }
+    text[strcspn(text, "\r\n")] = 0;
+    return text[0] ? std::string("v") + text : "Unknown";
+}
+
+// Settings > About: the console's system software version.
+std::string Ps4Firmware() {
+#ifdef __OPENORBIS__
+    SceKernelSwVersion v{};
+    v.size = sizeof(v);
+    if (sceKernelGetSystemSwVersion(&v) == 0 && v.version != 0) {
+        char text[16];
+        snprintf(text, sizeof(text), "%x.%02x", v.version >> 24, (v.version >> 16) & 0xFF);
+        return text;
+    }
+#endif
+    return "Unknown";
+}
+
 // What commercial games need from the user's own Switch, for Settings > Setup.
 struct Setup {
     bool prod_keys = false, title_keys = false;
@@ -841,7 +876,8 @@ void ps4_menu_run() {
     ps4_launcher_show(true);
 
     enum Row { kGraphics, kMode, kResolution, kGpuAccuracy, kButtons, kSpread, kMulticore, kFastmem, kAccuracy, kAsync, kProfiler, kBenchmarks, kInstall,
-               kBackup, kUseGlobal, kOverlay, kOverlayCorner, kKeys, kFirmware, kLayout };
+               kBackup, kUseGlobal, kOverlay, kOverlayCorner, kKeys, kFirmware, kLayout, kAppVersion, kPs4Firmware };
+    const std::string app_version = AppVersion(), ps4_firmware = Ps4Firmware();
     int layout = ReadLayout();
     int shortcut = -1; // row layout: the selected shortcut below the games (-1: a game)
     static const char* const kOverlayModes[] = {"Off", "FPS", "Detailed"};
@@ -875,7 +911,7 @@ void ps4_menu_run() {
         if (game_scope)
             ids.push_back(kUseGlobal);
         else
-            ids.insert(ids.end(), {kBenchmarks, kInstall, kBackup, kKeys, kFirmware});
+            ids.insert(ids.end(), {kBenchmarks, kInstall, kBackup, kKeys, kFirmware, kAppVersion, kPs4Firmware});
         char keys_value[48], firmware_value[48];
         snprintf(keys_value, sizeof(keys_value), "%s",
                  setup.prod_keys && setup.title_keys ? "Found"
@@ -977,6 +1013,15 @@ void ps4_menu_run() {
                                     "Grid shows 24 games at a time. Console row shows one row of large tiles "
                                     "with shortcuts below (Down to reach them), like a console's home screen."});
                 break;
+            case kAppVersion:
+                settings.push_back({"Version", app_version.c_str(),
+                                    "PS4 Switch Emu, an unofficial port of the Eden emulator. Please include this "
+                                    "version and the PS4 firmware below in bug reports."});
+                break;
+            case kPs4Firmware:
+                settings.push_back({"PS4 firmware", ps4_firmware.c_str(),
+                                    "The console's system software version, as the console reports it."});
+                break;
             case kKeys:
                 settings.push_back({"Keys", keys_value,
                                     "prod.keys and title.keys, dumped from your own Switch, go in "
@@ -1029,6 +1074,10 @@ void ps4_menu_run() {
                 break;
             case kKeys: case kFirmware:
                 settings[j].group = "Setup";
+                settings[j].kind = kSettingText;
+                break;
+            case kAppVersion: case kPs4Firmware:
+                settings[j].group = "About";
                 settings[j].kind = kSettingText;
                 break;
             case kUseGlobal:
