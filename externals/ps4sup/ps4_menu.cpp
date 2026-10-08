@@ -1231,7 +1231,13 @@ void ps4_menu_run() {
         usleep(16 * 1000);
     }
     sounds.Play(MenuSounds::kConfirm);
-    usleep(180 * 1000); // let the confirm chime finish before the port closes
+    if (start_game && !games.empty()) {
+        // The card zooms into the loading screen (also lets the chime finish).
+        ps4_launcher_set_loading(titles[size_t(game)].c_str(), icons[size_t(game)].empty() ? nullptr : icons[size_t(game)].data());
+        ps4_launcher_launch();
+    } else {
+        usleep(180 * 1000); // let the confirm chime finish before the port closes
+    }
     // What this run uses: the started game's own settings, or the global ones.
     Options o = global;
     if (start_game && !games.empty())

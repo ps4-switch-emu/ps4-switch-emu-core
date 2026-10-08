@@ -66,6 +66,8 @@ void ps4_launcher_set_layout(int layout, int shortcut);
 // The button hints' install count, and whether a controller is connected (else a warning).
 void ps4_launcher_set_info(int install_count, bool has_pad);
 void ps4_launcher_show(bool on);
+// The chosen game's card zooms into the loading screen (blocks for the animation, ~1/3 s).
+void ps4_launcher_launch();
 // A short message shown at the bottom for a few seconds (e.g. "Backup complete").
 void ps4_launcher_toast(const char* text);
 // Settings tab heading ("All games" or a game's title) and whether Square switches it.
@@ -75,6 +77,8 @@ void ps4_launcher_set_loading(const char* title, const uint32_t* icon);
 // In-game Home menu into a swap image (see vk_swapchain.cpp's overlay); capture: take src as the
 // new background.
 void ps4_status_draw_home(uint32_t* dst, const uint32_t* src, int pitch, const Ps4HomeMenu* menu, bool capture);
+// True while the Home menu animates (opening, the highlight moving): keep redrawing it.
+bool ps4_status_home_animating();
 // Draws the overlay panel (kOverlayFpsW x kOverlayFpsH or the detailed size) into dst.
 void ps4_status_render_overlay(uint32_t* dst, int w, int h, const Ps4OverlayStats* stats);
 // The title of the game being played (for the Home menu).

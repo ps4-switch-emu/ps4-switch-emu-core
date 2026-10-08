@@ -106,6 +106,7 @@ extern "C" void ps4_menu_restart_now();
 extern "C" bool ps4_swapchain_overlay_begin();
 extern "C" void ps4_swapchain_overlay_draw(void (*draw)(uint32_t*, const uint32_t*, int, void*), void* ctx);
 extern "C" void ps4_swapchain_overlay_end();
+extern "C" bool ps4_status_home_animating(); // status_screen.cpp
 extern "C" unsigned long long ps4_gpu_wait_us(); // vk_swapchain.cpp
 extern "C" void ps4_overlay_configure(int mode, int corner); // vk_present_manager.cpp
 extern "C" int ps4_overlay_mode();
@@ -974,7 +975,7 @@ static void PS4HomeMenu(SdlState* state) {
             menu.selected = (menu.selected + menu.count - 1) % menu.count;
         if (pressed & kDown)
             menu.selected = (menu.selected + 1) % menu.count;
-        if (menu.selected != old)
+        if (menu.selected != old || ps4_status_home_animating()) // the panel rising in, the highlight gliding
             ps4_swapchain_overlay_draw(draw, &ctx);
         if ((pressed & kBack) || ((pressed & kSelect) && menu.selected == 0)) {
             ps4_swapchain_overlay_end();

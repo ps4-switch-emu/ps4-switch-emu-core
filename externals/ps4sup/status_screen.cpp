@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <pthread.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "ps4_launcher.h"
@@ -287,8 +288,61 @@ struct Anim {
     float tint_r = 30, tint_g = 60, tint_b = 120; // background tint
     float tab_x = -1, tab_w = 0;                  // tab underline
     float row_scroll = 0;                         // row layout: pixels
+    float grow[kMaxGames] = {};                   // each card's growth toward the selected size, 0..1
+    float shortcut_grow[kShortcutCount] = {};     // row layout: each shortcut's highlight, 0..1
+    float bar_y = -1;                             // settings: the highlight bar, list space
+    float toggle[kMaxSettings];                   // settings: each switch's knob, 0 (off) .. 1 (on)
+    bool toggle_known[kMaxSettings] = {};
+    float help_fade = 1;                          // settings: the help card's text fading in
+    int help_row = -1;
+    float page_fade = 0;                          // cross-fade from the previous page, 1 .. 0
+    int last_tab = -1, last_layout = -1;
+    char last_scope[96] = "";
+    int sel_x = 0, sel_y = 0, sel_size = 0;       // where the selected card was last drawn
     double last = 0;
 } g_anim;
+uint32_t* g_prev = nullptr;   // the frame before a page change or a game's launch (cross-fades)
+double g_launch_t0 = -1;      // a game is starting: the card zooms into the loading screen
+bool g_launch_snapped = false;
+
+// Approach for values in 0..1 (and Home menu item positions): snaps only when very close.
+bool ApproachUnit(float& v, float target, float k) {
+    if (std::fabs(target - v) < 0.004f) {
+        v = target;
+        return false;
+    }
+    v += (target - v) * k;
+    return true;
+}
+
+// Smooth start and end for 0..1.
+float Ease(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// d toward s by a/256 (packed pixels, fast enough for whole-frame cross-fades).
+inline uint32_t Lerp(uint32_t d, uint32_t s, uint32_t a) {
+    const uint32_t rb = (((s & 0xFF00FFu) * a + (d & 0xFF00FFu) * (256 - a)) >> 8) & 0xFF00FFu;
+    const uint32_t g = (((s & 0x00FF00u) * a + (d & 0x00FF00u) * (256 - a)) >> 8) & 0x00FF00u;
+    return 0xFF000000u | rb | g;
+}
+
+// Blends the saved frame over rows y0.. of the current one (a = 256: all the saved frame).
+void BlendPrev(int y0, uint32_t a) {
+    if (!g_prev || a == 0)
+        return;
+    for (size_t i = size_t(y0) * kWidth; i < size_t(kWidth) * kHeight; i++)
+        g_frame[i] = Lerp(g_frame[i], g_prev[i], a);
+}
+
+bool SnapshotFrame() {
+    if (!g_prev)
+        g_prev = static_cast<uint32_t*>(malloc(kFrameBytes));
+    if (g_prev)
+        memcpy(g_prev, g_frame, kFrameBytes);
+    return g_prev != nullptr;
+}
 
 // Moves v toward target; true while it still moves.
 bool Approach(float& v, float target, float k) {
@@ -664,11 +718,13 @@ void Ellipsize(const Font& f, char* text, size_t size, int max_w) {
 }
 
 // An on/off switch, right-aligned at x_right.
-void Toggle(int x_right, int y, bool on, bool selected) {
+// A switch; pos slides the knob from off (0) to on (1).
+void Toggle(int x_right, int y, float pos, bool selected) {
     constexpr int kW = 66, kH = 36;
     const int x = x_right - kW;
-    RoundRect(x, y, kW, kH, kH / 2, on ? kAccent : Rgb(58, 66, 88));
-    Disc(on ? x + kW - kH / 2 : x + kH / 2, y + kH / 2, kH / 2 - 4, selected || on ? kWhite : Rgb(200, 205, 215));
+    RoundRect(x, y, kW, kH, kH / 2, Mix(Rgb(58, 66, 88), kAccent, pos));
+    const int knob = x + kH / 2 + int(float(kW - kH) * Ease(pos));
+    Disc(knob, y + kH / 2, kH / 2 - 4, selected ? kWhite : Mix(Rgb(200, 205, 215), kWhite, pos));
 }
 
 void DrawToast(double now) {
@@ -707,23 +763,31 @@ bool DrawGameRow(int game_sel, int game_count, int shortcut, float k) {
     moving |= Approach(g_anim.ring_x, sel_x, k);
     const int scroll = int(g_anim.row_scroll);
     const bool on_games = shortcut < 0;
+    for (int i = 0; i < game_count; i++)
+        moving |= ApproachUnit(g_anim.grow[i], i == game_sel ? 1.0f : 0.0f, k);
 
     Lock();
     for (int i = 0; i < game_count; i++) {
         const int x = kLeft + i * kPitch - scroll;
         if (i == game_sel || x < kLeft - kGap || x > kWidth)
             continue; // the edge of the screen shows there is more to the right; the left stays clear
-        Shadow(x, kTop, kTile, kTile, 22);
-        DrawCardImage(g_games[i], x, kTop, kTile);
+        const int size = kTile + int(float(kBig - kTile) * Ease(g_anim.grow[i]));
+        const int off = (size - kTile) / 2;
+        Shadow(x - off, kTop - off, size, size, 22);
+        DrawCardImage(g_games[i], x - off, kTop - off, size);
     }
     GameEntry& g = g_games[game_sel];
-    const int sx = int(g_anim.ring_x) - scroll, sy = kTop - (kBig - kTile) / 2;
-    Shadow(sx, sy, kBig, kBig, 26);
+    const int big = kTile + int(float(kBig - kTile) * Ease(g_anim.grow[game_sel]));
+    const int boff = (big - kTile) / 2;
+    const int sx = kLeft + game_sel * kPitch - scroll - boff, sy = kTop - boff;
+    Shadow(sx, sy, big, big, 26);
     if (on_games) {
-        RoundRect(sx - 9, sy - 9, kBig + 18, kBig + 18, 32, kAccent);
-        RoundRect(sx - 4, sy - 4, kBig + 8, kBig + 8, 27, Rgb(14, 20, 34));
+        const int rcx = int(g_anim.ring_x) - scroll + kBig / 2, rcy = kTop + kTile / 2;
+        RoundRect(rcx - big / 2 - 9, rcy - big / 2 - 9, big + 18, big + 18, 32, kAccent);
+        RoundRect(rcx - big / 2 - 4, rcy - big / 2 - 4, big + 8, big + 8, 27, Rgb(14, 20, 34));
     }
-    DrawCardImage(g, sx, sy, kBig);
+    DrawCardImage(g, sx, sy, big);
+    g_anim.sel_x = sx, g_anim.sel_y = sy, g_anim.sel_size = big;
     char title[96], detail[128];
     CopyText(title, sizeof(title), g.title);
     CopyText(detail, sizeof(detail), g.detail);
@@ -731,8 +795,8 @@ bool DrawGameRow(int game_sel, int game_count, int shortcut, float k) {
     // The selected game's title above it, kept on screen.
     Ellipsize(kBold, title, sizeof(title), 900);
     const int tw = TextWidth(kBold, title);
-    const int tx = std::clamp(sx + kBig / 2 - tw / 2, kLeft, kWidth - kLeft - tw);
-    DrawText(kBold, tx, sy - 62, title, on_games ? kAccent : kDim);
+    const int tx = std::clamp(sx + big / 2 - tw / 2, kLeft, kWidth - kLeft - tw);
+    DrawText(kBold, tx, kTop - (kBig - kTile) / 2 - 62, title, on_games ? kAccent : kDim);
 
     // Shortcuts: round buttons, centred, with the selected one's name under it.
     static const char* const kNames[kShortcutCount] = {"Settings", "Install updates and DLC", "Back up saves"};
@@ -740,11 +804,14 @@ bool DrawGameRow(int game_sel, int game_count, int shortcut, float k) {
     const int x0 = kWidth / 2 - (kShortcutCount - 1) * kStep / 2;
     for (int i = 0; i < kShortcutCount; i++) {
         const int cx = x0 + i * kStep;
-        const bool sel = i == shortcut;
-        if (sel)
-            Disc(cx, kY, kR + 8, kAccent);
-        Disc(cx, kY, kR, sel ? Rgb(48, 62, 96) : Rgb(30, 40, 64));
-        const uint32_t ink = sel ? kWhite : Rgb(190, 202, 225);
+        moving |= ApproachUnit(g_anim.shortcut_grow[i], i == shortcut ? 1.0f : 0.0f, k * 1.3f);
+        const float sg = Ease(g_anim.shortcut_grow[i]);
+        const bool sel = sg > 0.5f;
+        if (sg > 0.02f)
+            Disc(cx, kY, kR + int(8 * sg), Mix(Rgb(14, 20, 34), kAccent, sg));
+        const uint32_t fill = Mix(Rgb(30, 40, 64), Rgb(48, 62, 96), sg);
+        Disc(cx, kY, kR, fill);
+        const uint32_t ink = Mix(Rgb(190, 202, 225), kWhite, sg);
         switch (i) {
         case kShortcutSettings: // a gear
             for (int t = 0; t < 8; t++) {
@@ -752,7 +819,7 @@ bool DrawGameRow(int game_sel, int game_count, int shortcut, float k) {
                 Disc(cx + int(std::cos(a) * 20), kY + int(std::sin(a) * 20), 6, ink);
             }
             Disc(cx, kY, 19, ink);
-            Disc(cx, kY, 8, sel ? Rgb(48, 62, 96) : Rgb(30, 40, 64));
+            Disc(cx, kY, 8, fill);
             break;
         case kShortcutInstall: // an arrow into a tray
             Line(cx, kY - 24, cx, kY + 8, 6, ink);
@@ -761,7 +828,7 @@ bool DrawGameRow(int game_sel, int game_count, int shortcut, float k) {
             Line(cx - 22, kY + 22, cx + 22, kY + 22, 6, ink);
             break;
         default: { // a save card
-            const uint32_t bg = sel ? Rgb(48, 62, 96) : Rgb(30, 40, 64);
+            const uint32_t bg = fill;
             RoundRect(cx - 21, kY - 24, 42, 48, 7, ink);
             RoundRect(cx - 13, kY - 24, 24, 15, 3, bg);
             RoundRect(cx - 13, kY + 4, 26, 14, 3, bg);
@@ -770,8 +837,9 @@ bool DrawGameRow(int game_sel, int game_count, int shortcut, float k) {
         }
     }
     if (!on_games) {
-        const char* name = kNames[std::clamp(shortcut, 0, kShortcutCount - 1)];
-        DrawText(kBold, x0 + shortcut * kStep - TextWidth(kBold, name) / 2, kY + kR + 22, name, kWhite);
+        const int i = std::clamp(shortcut, 0, kShortcutCount - 1);
+        DrawText(kBold, x0 + i * kStep - TextWidth(kBold, kNames[i]) / 2, kY + kR + 22, kNames[i],
+                 Mix(Rgb(14, 20, 34), kWhite, Ease(g_anim.shortcut_grow[i])));
     }
 
     // Info bar: the selected game's details.
@@ -786,12 +854,46 @@ bool DrawGameRow(int game_sel, int game_count, int shortcut, float k) {
     return moving;
 }
 
+// A game was chosen: its card moves and grows into its place on the loading screen (DrawLoading)
+// while the launcher fades out behind it. Returns true until done.
+bool DrawLaunch(double now) {
+    if (!g_launch_snapped)
+        g_launch_snapped = SnapshotFrame();
+    const float t = Ease(float((now - g_launch_t0) / 0.32));
+    Lock();
+    const int sel = std::clamp(g_game_sel, 0, std::max(0, g_game_count - 1));
+    const uint32_t accent = g_game_count > 0 ? g_games[sel].accent : kAccent;
+    char title[96] = "";
+    if (g_game_count > 0)
+        CopyText(title, sizeof(title), g_games[sel].title);
+    Unlock();
+    DrawBackground(accent);
+    DrawBrand();
+    BlendPrev(0, uint32_t((1.0f - t) * 256.0f));
+    // DrawLoading's card: 360 at (140, 300).
+    const float from_x = float(g_anim.sel_x), from_y = float(g_anim.sel_y), from_size = float(std::max(g_anim.sel_size, 1));
+    const int size = int(from_size + (360.0f - from_size) * t);
+    const int x = int(from_x + (140.0f - from_x) * t), y = int(from_y + (300.0f - from_y) * t);
+    Shadow(x, y, size, size, 24);
+    if (g_game_count > 0) {
+        Lock();
+        DrawCardImage(g_games[sel], x, y, size);
+        Unlock();
+    }
+    DrawText(kTitleFont, 140 + 360 + 90, 300 + 24, title, Mix(Rgb(14, 20, 34), kWhite, t), kWidth - 80);
+    return t < 1.0f;
+}
+
 void DrawLauncher() {
     const double now = Elapsed();
     const float dt = g_anim.last > 0 ? float(std::min(now - g_anim.last, 0.1)) : 1.0f;
     g_anim.last = now;
     const float k = 1.0f - std::exp(-dt * 16.0f); // easing toward targets
     bool moving = false;
+    if (g_launch_t0 >= 0) {
+        g_animating = DrawLaunch(now);
+        return;
+    }
 
     Lock();
     const int tab = g_tab, game_sel = g_game_sel, setting_sel = g_setting_sel, game_count = g_game_count,
@@ -802,6 +904,15 @@ void DrawLauncher() {
     CopyText(scope, sizeof(scope), g_scope);
     const uint32_t accent = game_count > 0 && tab == kLauncherGames ? g_games[game_sel].accent : kAccent;
     Unlock();
+
+    // A new page (tab, layout, or the settings' scope) cross-fades from the last frame shown.
+    if (g_anim.last_tab >= 0 && (tab != g_anim.last_tab || layout != g_anim.last_layout ||
+                                 (tab == kLauncherSettings && strcmp(scope, g_anim.last_scope) != 0))) {
+        if (SnapshotFrame())
+            g_anim.page_fade = 1;
+    }
+    g_anim.last_tab = tab, g_anim.last_layout = layout;
+    CopyText(g_anim.last_scope, sizeof(g_anim.last_scope), scope);
 
     // Background tint follows the selected game.
     moving |= Approach(g_anim.tint_r, R(accent), k);
@@ -865,6 +976,8 @@ void DrawLauncher() {
             moving |= Approach(g_anim.ring_x, ring_x, k);
             moving |= Approach(g_anim.ring_y, ring_y, k);
             const int clip_top = kTop - 24, clip_bottom = kTop + kRows * kRowH - 10;
+            for (int i = 0; i < game_count; i++)
+                moving |= ApproachUnit(g_anim.grow[i], i == game_sel ? 1.0f : 0.0f, k);
             Lock();
             for (int i = 0; i < game_count; i++) {
                 const int r = i / kCols, c = i % kCols;
@@ -873,25 +986,32 @@ void DrawLauncher() {
                     continue;
                 const bool sel = i == game_sel;
                 if (sel)
-                    continue; // drawn last, larger, on top
-                Shadow(x, y, kCardSize, kCardSize, 18);
-                DrawCardImage(g_games[i], x, y, kCardSize);
+                    continue; // drawn last, on top
+                const int size = kCardSize + int(float(kCardBig - kCardSize) * Ease(g_anim.grow[i]));
+                const int off = (size - kCardSize) / 2;
+                Shadow(x - off, y - off, size, size, 18);
+                DrawCardImage(g_games[i], x - off, y - off, size);
                 char title[96];
                 CopyText(title, sizeof(title), g_games[i].title);
                 Ellipsize(kRegular, title, sizeof(title), kCardSize + kGapX - 14);
                 DrawText(kRegular, x, y + kCardSize + 12, title, kDim, x + kCardSize + kGapX);
             }
-            // The selected card: larger, with a ring that glides to it.
+            // The selected card grows in place; a ring glides over to it.
             GameEntry& g = g_games[game_sel];
-            const int sx = int(g_anim.ring_x), sy = int(g_anim.ring_y) - scroll;
-            Shadow(sx, sy, kCardBig, kCardBig, 22);
-            RoundRect(sx - 7, sy - 7, kCardBig + 14, kCardBig + 14, 28, kWhite);
-            RoundRect(sx - 3, sy - 3, kCardBig + 6, kCardBig + 6, 24, Rgb(14, 20, 34));
-            DrawCardImage(g, sx, sy, kCardBig);
+            const int size = kCardSize + int(float(kCardBig - kCardSize) * Ease(g_anim.grow[game_sel]));
+            const int off = (size - kCardSize) / 2;
+            const int slot_x = kLeft + sel_col * (kCardSize + kGapX), slot_y = kTop + sel_row * kRowH - scroll;
+            const int sx = slot_x - off, sy = slot_y - off;
+            const int ring_cx = int(g_anim.ring_x) + kCardBig / 2, ring_cy = int(g_anim.ring_y) - scroll + kCardBig / 2;
+            Shadow(sx, sy, size, size, 22);
+            RoundRect(ring_cx - size / 2 - 7, ring_cy - size / 2 - 7, size + 14, size + 14, 28, kWhite);
+            RoundRect(ring_cx - size / 2 - 3, ring_cy - size / 2 - 3, size + 6, size + 6, 24, Rgb(14, 20, 34));
+            DrawCardImage(g, sx, sy, size);
+            g_anim.sel_x = sx, g_anim.sel_y = sy, g_anim.sel_size = size;
             char title[96];
             CopyText(title, sizeof(title), g.title);
             Ellipsize(kBold, title, sizeof(title), kCardBig + kGapX / 2 - 8);
-            DrawText(kBold, sx, sy + kCardBig + 10, title, kWhite, sx + kCardBig + kGapX);
+            DrawText(kBold, sx, sy + size + 10, title, kWhite, sx + kCardBig + kGapX);
             char detail[128];
             CopyText(detail, sizeof(detail), g.detail);
             char full_title[96];
@@ -963,6 +1083,15 @@ void DrawLauncher() {
                                                : std::clamp(ys[setting_sel] - view / 2 + kRowH, 0, std::max(0, total - view));
         moving |= Approach(g_anim.list_scroll, float(target), k);
         const int scroll = int(g_anim.list_scroll);
+        // The highlight bar glides between rows (behind them).
+        if (setting_count > 0) {
+            if (g_anim.bar_y < 0)
+                g_anim.bar_y = float(ys[setting_sel]);
+            moving |= Approach(g_anim.bar_y, float(ys[setting_sel]), k * 1.3f);
+            const int by = kTop + int(g_anim.bar_y) - scroll;
+            RoundRect(kListX - 10, by, kListW + 20, kRowH - 6, 16, Rgb(236, 240, 248), 34);
+            RoundRect(kListX - 10, by + 10, 6, kRowH - 26, 3, kAccent);
+        }
         last_group[0] = 0;
         for (int i = 0; i < setting_count; i++) {
             const SettingEntry& e = g_settings[i];
@@ -976,14 +1105,16 @@ void DrawLauncher() {
             if (y < kTop - 10 || y + kRowH > kBottom + 10)
                 continue;
             const bool sel = i == setting_sel;
-            if (sel)
-                RoundRect(kListX - 10, y, kListW + 20, kRowH - 6, 16, Rgb(236, 240, 248), 34);
-            if (sel)
-                RoundRect(kListX - 10, y + 10, 6, kRowH - 26, 3, kAccent);
             DrawText(kRegular, kListX + 22, y + (kRowH - 6 - kStatusFontHeight) / 2, e.label, sel ? kWhite : kText);
             const int vr = kListX + kListW - 20;
             if (e.kind == kSettingToggle) {
-                Toggle(vr, y + (kRowH - 6 - 36) / 2, strcmp(e.value, "On") == 0, sel);
+                const float on = strcmp(e.value, "On") == 0 ? 1.0f : 0.0f;
+                if (!g_anim.toggle_known[i])
+                    g_anim.toggle[i] = on, g_anim.toggle_known[i] = true;
+                moving |= ApproachUnit(g_anim.toggle[i], on, k * 1.4f);
+                if (std::fabs(g_anim.toggle[i] - on) < 0.02f)
+                    g_anim.toggle[i] = on;
+                Toggle(vr, y + (kRowH - 6 - 36) / 2, g_anim.toggle[i], sel);
             } else {
                 char value[110];
                 if (e.kind == kSettingChoice)
@@ -1012,9 +1143,13 @@ void DrawLauncher() {
         const int px = 1180, pw = kWidth - px - 80, py = kTop;
         Shadow(px, py, pw, 330, 24);
         RoundRect(px, py, pw, 330, 24, kCard);
+        if (setting_sel != g_anim.help_row)
+            g_anim.help_row = setting_sel, g_anim.help_fade = 0;
+        moving |= ApproachUnit(g_anim.help_fade, 1.0f, k);
+        const float hf = Ease(g_anim.help_fade);
         if (selected.group[0])
-            DrawText(kRegular, px + 32, py + 26, selected.group, kAccent);
-        DrawText(kBold, px + 32, py + 26 + kStatusFontHeight + 4, selected.label, kWhite, px + pw - 20);
+            DrawText(kRegular, px + 32, py + 26, selected.group, Mix(kCard, kAccent, hf));
+        DrawText(kBold, px + 32, py + 26 + kStatusFontHeight + 4, selected.label, Mix(kCard, kWhite, hf), px + pw - 20);
         int y = py + 26 + kStatusFontHeight + kBoldFontHeight + 24;
         const char* p = selected.help;
         char line[kLineLen];
@@ -1033,7 +1168,7 @@ void DrawLauncher() {
                 len = last_space + 1;
             memcpy(line, p, size_t(len));
             line[len] = 0;
-            DrawText(px + 32, y, line, kText, px + pw - 20);
+            DrawText(px + 32, y, line, Mix(kCard, kText, hf), px + pw - 20);
             y += kStatusFontHeight + 4;
             p += len;
         }
@@ -1057,6 +1192,11 @@ void DrawLauncher() {
 
     if (!has_pad)
         DrawText(kWidth - 80 - TextWidth(kRegular, "Connect a controller"), kHeight - 66, "Connect a controller", kBad);
+    if (g_anim.page_fade > 0) { // below the header, which stays put
+        BlendPrev(104, uint32_t(Ease(g_anim.page_fade) * 256.0f));
+        g_anim.page_fade = std::max(0.0f, g_anim.page_fade - dt / 0.22f);
+        moving = true;
+    }
     g_animating = moving;
 }
 
@@ -1109,24 +1249,45 @@ void DrawLoading(const char* progress) {
 // In-game Home menu (yuzu_cmd): drawn over a darkened copy of the game's last frame.
 uint32_t* g_pause_bg = nullptr;
 
+// Home menu animation: the panel rises in when opened, the highlight glides between items.
+struct PauseAnim {
+    double opened = -1, last = 0;
+    float highlight = -1;
+} g_pause_anim;
+
+bool PauseAnimating() {
+    const double now = Elapsed();
+    return now - g_pause_anim.opened < 0.25 || g_pause_anim.highlight < 0 ||
+           std::fabs(g_pause_anim.highlight - std::floor(g_pause_anim.highlight + 0.5f)) > 0.01f;
+}
+
 void DrawPause(const Ps4HomeMenu& m) {
     if (g_pause_bg)
         memcpy(g_frame, g_pause_bg, kFrameBytes);
     else
         DrawBackground();
+    const double now = Elapsed();
+    const float dt = float(std::min(now - g_pause_anim.last, 0.1));
+    g_pause_anim.last = now;
+    const float open = Ease(float((now - g_pause_anim.opened) / 0.22));
+    if (g_pause_anim.highlight < 0)
+        g_pause_anim.highlight = float(m.selected);
+    ApproachUnit(g_pause_anim.highlight, float(m.selected), 1.0f - std::exp(-dt * 18.0f));
     constexpr int kW = 820, kH = 610;
-    const int x = (kWidth - kW) / 2, y = (kHeight - kH) / 2;
+    const int x = (kWidth - kW) / 2, y = (kHeight - kH) / 2 + int((1.0f - open) * 40.0f);
     Shadow(x, y, kW, kH, 32);
-    RoundRect(x, y, kW, kH, 32, kCard, 245);
+    RoundRect(x, y, kW, kH, 32, kCard, uint32_t(245 * open));
     DrawText(kTitleFont, x + 50, y + 34, m.title ? m.title : "Paused", kWhite, x + kW - 40);
     DrawText(x + 50, y + 34 + kTitleFontHeight + 4, m.stats ? m.stats : "", kDim, x + kW - 40);
     const int list_y = y + 34 + kTitleFontHeight + kStatusFontHeight + 36;
+    const float hl = g_pause_anim.highlight;
+    RoundRect(x + 30, list_y + int(hl * 72.0f), kW - 60, 60, 18, Rgb(236, 240, 248));
     for (int i = 0; i < m.count; i++) {
         const int ry = list_y + i * 72;
-        const bool sel = i == m.selected;
-        if (sel)
-            RoundRect(x + 30, ry, kW - 60, 60, 18, Rgb(236, 240, 248));
-        DrawText(kBold, x + 60, ry + (60 - kBoldFontHeight) / 2, m.items[i], sel ? Rgb(14, 20, 34) : kText, x + kW - 40);
+        // Dark text where the highlight covers the item, light elsewhere, blending as it passes.
+        const float cover = std::clamp(1.0f - std::fabs(hl - float(i)), 0.0f, 1.0f);
+        DrawText(kBold, x + 60, ry + (60 - kBoldFontHeight) / 2, m.items[i], Mix(kText, Rgb(14, 20, 34), cover),
+                 x + kW - 40);
     }
     int hx = x + 50;
     const int hy = y + kH - 74;
@@ -1139,6 +1300,13 @@ void DrawPause(const Ps4HomeMenu& m) {
 void DrawFrame(int tick) {
     if (g_launcher_on) {
         DrawLauncher();
+        return;
+    }
+    // A game is starting with graphics on: the loading screen right away (the launch zoom ends on
+    // it), until the Vulkan swap chain takes over the screen.
+    struct stat st;
+    if (g_loading_title[0] && !g_crashed && stat("/data/switch-emu/null-renderer", &st) != 0) {
+        DrawLoading("Starting...");
         return;
     }
     const int line_h = kStatusFontHeight + 2;
@@ -1434,7 +1602,15 @@ void ps4_launcher_toast(const char* text) {
 
 void ps4_launcher_show(bool on) {
     g_launcher_on = on;
+    g_launch_t0 = -1;
     g_dirty++;
+}
+
+void ps4_launcher_launch() {
+    g_launch_snapped = false;
+    g_launch_t0 = Elapsed();
+    g_dirty++;
+    usleep(340 * 1000); // the zoom (DrawLaunch) takes 0.32 s
 }
 
 const char* ps4_launcher_loading_title() {
@@ -1472,6 +1648,11 @@ void ps4_status_draw_home(uint32_t* dst, const uint32_t* src, int pitch, const P
         g_pause_bg = static_cast<uint32_t*>(malloc(kFrameBytes));
     if (!frame || !dst || !menu)
         return;
+    if (capture) { // the menu was just opened
+        g_pause_anim.opened = Elapsed();
+        g_pause_anim.last = g_pause_anim.opened;
+        g_pause_anim.highlight = -1;
+    }
     if (capture && src && g_pause_bg) {
         for (int y = 0; y < kHeight; y++) {
             const uint32_t* row = src + size_t(y) * size_t(pitch);
@@ -1487,6 +1668,11 @@ void ps4_status_draw_home(uint32_t* dst, const uint32_t* src, int pitch, const P
     g_frame = saved;
     for (int y = 0; y < kHeight; y++)
         memcpy(dst + size_t(y) * size_t(pitch), frame + size_t(y) * kWidth, size_t(kWidth) * 4);
+}
+
+// True while the Home menu is still animating (the caller keeps redrawing it).
+bool ps4_status_home_animating() {
+    return PauseAnimating();
 }
 
 // Performance overlay: rendered into a w x h panel (top-left of a scratch frame, then copied out).
