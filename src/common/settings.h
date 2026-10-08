@@ -198,8 +198,8 @@ struct Values {
     // Core
     SwitchableSetting<bool> use_multi_core{linkage,
 #ifdef __OPENORBIS__
-        // Re-enable once proper TLS support is added
-        false,
+        // On (measured on a PS4 Pro: 1.35-1.6x faster CPU emulation than single-core)
+        true,
 #else
         true,
 #endif
@@ -487,7 +487,7 @@ struct Values {
                                          linkage, 0, "bg_blue", Category::Renderer, Specialization::Default, true, true};
 
     SwitchableSetting<GpuAccuracy, true> gpu_accuracy{linkage,
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__OPENORBIS__) // weak GPU: the mobile defaults
                                                       GpuAccuracy::Low,
 #else
                                                       GpuAccuracy::High,
@@ -527,7 +527,7 @@ struct Values {
                                                       "nvdec_emulation", Category::RendererAdvanced};
 
     SwitchableSetting<AnisotropyMode, true> max_anisotropy{linkage,
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__OPENORBIS__) // weak GPU: the mobile defaults
                                                            AnisotropyMode::Default,
 #else
                                                            AnisotropyMode::Automatic,
@@ -580,7 +580,7 @@ struct Values {
                                                 Category::RendererAdvanced};
 
     SwitchableSetting<bool> use_reactive_flushing{linkage,
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__OPENORBIS__) // weak GPU: the mobile defaults
                                                   false,
 #else
                                                   true,
@@ -881,7 +881,15 @@ struct Values {
                                      linkage, false, "reporting_services", Category::Debugging, Specialization::Default, false};
     Setting<bool> quest_flag{linkage, false, "quest_flag", Category::Debugging};
     Setting<bool> use_dev_keys{linkage, false, "use_dev_keys", Category::Debugging};
-    Setting<bool> disable_macro_jit{linkage, false, "disable_macro_jit",
+    Setting<bool> disable_macro_jit{linkage,
+#ifdef __OPENORBIS__
+                                    // The macro JIT's Xbyak buffer isn't mapped the PS4 way
+                                    // (dynarmic's PS4ExecAllocator); the interpreter is used.
+                                    true,
+#else
+                                    false,
+#endif
+                                    "disable_macro_jit",
                                     Category::DebuggingGraphics};
     Setting<bool> disable_macro_hle{linkage, false, "disable_macro_hle",
                                     Category::DebuggingGraphics};

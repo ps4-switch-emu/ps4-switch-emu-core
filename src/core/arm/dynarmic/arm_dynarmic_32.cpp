@@ -4,7 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
+
 #include "common/settings.h"
+#include "core/device_memory.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
 #include "core/arm/dynarmic/dynarmic_cp15.h"
@@ -193,7 +196,10 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
             Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize()) < (1ULL << 39)) {
             // Systems like FreeBSD allocate memory really low by default, and since we pack our page table entries,
             // we have to manually sign extend when our actual pointer is negative.
-            config.page_table_sign_extension = Common::PageTable::SIGN_BIT;
+            // The pointer's sign bit: PageEntryData keeps 44 bits of page number above the 12-bit
+            // offset and ATTRIBUTE_MASK clears everything above, so it's bit 55 (ExtractPointer).
+            // (SIGN_BIT, 57, is always clear after the mask.)
+            config.page_table_sign_extension = 44 + 12 - 1;
         }
     }
 
@@ -207,7 +213,9 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
 
     // Code cache size
 #if defined(__OPENORBIS__)
-    config.code_cache_size = std::uint32_t(8_MiB);
+    // Executable memory comes from the system flexible pool (shared with the app heap); 32 MiB
+    // per core instead of 8 keeps hot code from being thrown away and recompiled.
+    config.code_cache_size = std::uint32_t(32_MiB);
 #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     config.code_cache_size = std::uint32_t(128_MiB);
 #else
@@ -310,6 +318,15 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+#ifdef __OPENORBIS__
+    if (config.fastmem_pointer) {
+        // 32-bit guests use 4 GiB: fine with any arena of at least that size.
+        if (m_system.DeviceMemory().buffer.FastmemArenaSize() < (size_t(1) << 32)) {
+            config.fastmem_pointer = std::nullopt;
+            config.fastmem_exclusive_access = false;
+        }
+    }
+#endif
     m_jit.emplace(config);
 }
 

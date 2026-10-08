@@ -4,7 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
+#include <cstdlib>
+
 #include "common/settings.h"
+#include "core/device_memory.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
@@ -232,10 +236,17 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.recompile_on_exclusive_fastmem_failure = true;
 
         if (reinterpret_cast<u64>(m_system.DeviceMemory().buffer.BackingBasePointer() +
-            Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize()) < (1ULL << 39)) {
+            Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize()) < (1ULL << 39)
+#ifndef __OPENORBIS__
+            || std::getenv("EDEN_FORCE_PT_SIGN_EXTENSION") // PC test of the PS4's (low) layout
+#endif
+            ) {
             // Systems like FreeBSD allocate memory really low by default, and since we pack our page table entries,
             // we have to manually sign extend when our actual pointer is negative.
-            config.page_table_sign_extension = Common::PageTable::SIGN_BIT;
+            // The pointer's sign bit: PageEntryData keeps 44 bits of page number above the 12-bit
+            // offset and ATTRIBUTE_MASK clears everything above, so it's bit 55 (ExtractPointer).
+            // (SIGN_BIT, 57, is always clear after the mask.)
+            config.page_table_sign_extension = 44 + 12 - 1;
         }
     }
 
@@ -259,7 +270,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
     // Code cache size
 #if defined(__OPENORBIS__)
-    config.code_cache_size = std::uint32_t(8_MiB);
+    // Executable memory comes from the system flexible pool (shared with the app heap); 32 MiB
+    // per core instead of 8 keeps hot code from being thrown away and recompiled.
+    config.code_cache_size = std::uint32_t(32_MiB);
 #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     config.code_cache_size = std::uint32_t(128_MiB);
 #else
@@ -361,6 +374,28 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+#ifndef __OPENORBIS__
+    // PC experiment: EDEN_FASTMEM_BITS=34 gives the JIT the PS4's arena-sized fastmem window.
+    if (const char* bits = std::getenv("EDEN_FASTMEM_BITS"); bits && config.fastmem_pointer) {
+        config.fastmem_address_space_bits = u32(std::atoi(bits));
+        config.silently_mirror_fastmem = false;
+    }
+#endif
+#ifdef __OPENORBIS__
+    // The PS4's fastmem arena may be smaller than the guest address space: always bounds-check
+    // against it (the Auto/Unsafe presets above turn the check off with 64 bits).
+    if (config.fastmem_pointer) {
+        const size_t arena = m_system.DeviceMemory().buffer.FastmemArenaSize();
+        const u32 arena_bits = arena ? u32(std::bit_width(arena) - 1) : 0;
+        if (arena_bits < 12) {
+            config.fastmem_pointer = std::nullopt;
+            config.fastmem_exclusive_access = false;
+        } else {
+            config.fastmem_address_space_bits = std::min<u32>(config.fastmem_address_space_bits, arena_bits);
+            config.silently_mirror_fastmem = false;
+        }
+    }
+#endif
     m_jit.emplace(config);
 }
 

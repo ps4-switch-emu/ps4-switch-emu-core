@@ -26,6 +26,9 @@
 #ifdef __ANDROID__
 #include "common/fs/fs_android.h"
 #endif
+#ifdef __OPENORBIS__
+#include <orbis/libkernel.h>
+#endif
 
 namespace FileSys {
 
@@ -346,7 +349,13 @@ std::size_t RealVfsFile::Write(const u8* data, std::size_t length, std::size_t o
     if (!reference->file || !reference->file->Seek(static_cast<s64>(offset))) {
         return 0;
     }
-    return reference->file->WriteSpan(std::span{data, length});
+    const std::size_t written = reference->file->WriteSpan(std::span{data, length});
+#ifdef __OPENORBIS__
+    // The PS4 ends apps by killing them (PS button): nothing gets to close files, so data still in
+    // the stdio buffer (save files, the shader cache) would be lost. Writes are rare; flush each.
+    reference->file->Flush();
+#endif
+    return written;
 }
 
 bool RealVfsFile::Rename(std::string_view name) {

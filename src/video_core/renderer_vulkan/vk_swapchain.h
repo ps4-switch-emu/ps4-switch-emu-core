@@ -141,6 +141,26 @@ private:
     VkExtent2D extent{};
     VkPresentModeKHR present_mode{};
     VkSurfaceFormatKHR surface_format{};
+#ifdef __OPENORBIS__
+    // PS4: no VK_KHR_swapchain. Linear images in host-visible memory registered as VideoOut
+    // buffers; presenting queues a VideoOut flip behind the GPU work (vk_swapchain.cpp).
+    void CreatePS4();
+    void DestroyPS4();
+    void WaitForImageOffScreenPS4();
+    std::vector<VkDeviceMemory> ps4_memory;
+    int ps4_buffer_set{-1};
+    u64 ps4_flips{};
+
+public:
+    // In-game Home menu (yuzu_cmd, emulation paused): draw into a swap image that is neither on
+    // screen nor next for the game, flip it, and flip the game's frame back afterwards.
+    bool OverlayBeginPS4();
+    void OverlayDrawPS4(void (*draw)(uint32_t* dst, const uint32_t* src, int pitch, void* ctx), void* ctx);
+    void OverlayEndPS4();
+
+private:
+    int overlay_shown{-1}, overlay_spare{-1};
+#endif
     bool has_imm{false};
     bool has_mailbox{false};
     bool has_fifo_relaxed{false};

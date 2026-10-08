@@ -67,13 +67,9 @@ public:
         const void* code_ptr = nullptr;
     };
     static_assert(sizeof(FastDispatchEntry) == 0x10);
-#ifdef __OPENORBIS__
-    static constexpr u64 fast_dispatch_table_mask = 0xFF0;
-    static constexpr size_t fast_dispatch_table_size = 0x100;
-#else
+    // Full size on the PS4 too (was cut to 0x100 entries: every lookup missed - measured slower).
     static constexpr u64 fast_dispatch_table_mask = 0xFFFF0;
     static constexpr size_t fast_dispatch_table_size = 0x10000;
-#endif
 
     void ClearFastDispatchTable();
     void GenFastmemFallbacks();

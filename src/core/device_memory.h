@@ -29,8 +29,11 @@ public:
 
     template <typename T>
     Common::PhysicalAddress GetPhysicalAddr(const T* ptr) const {
-        return (reinterpret_cast<uintptr_t>(ptr) -
-                reinterpret_cast<uintptr_t>(buffer.BackingBasePointer())) +
+        return GetPhysicalAddr(reinterpret_cast<uintptr_t>(ptr));
+    }
+
+    Common::PhysicalAddress GetPhysicalAddr(uintptr_t ptr) const {
+        return (ptr - reinterpret_cast<uintptr_t>(buffer.BackingBasePointer())) +
                DramMemoryMap::Base;
     }
 

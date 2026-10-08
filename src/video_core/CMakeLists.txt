@@ -363,6 +363,10 @@ endif()
 
 target_link_libraries(video_core PUBLIC common core)
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
+if (OPENORBIS)
+    # ps4_launcher.h: the in-game performance overlay's panel renderer.
+    target_include_directories(video_core PRIVATE ${PROJECT_SOURCE_DIR}/externals/ps4sup)
+endif()
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)
 endif()

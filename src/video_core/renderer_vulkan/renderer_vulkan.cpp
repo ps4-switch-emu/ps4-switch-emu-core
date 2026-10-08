@@ -228,7 +228,13 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     }
 #endif
 
+#ifdef __OPENORBIS__
+    // No binary semaphores between our own submissions on the PS4: the one graphics queue runs
+    // them in order (see Swapchain::Present), as DolphinPS4 does.
+    scheduler.Flush();
+#else
     scheduler.Flush(*frame->render_ready);
+#endif
 
     present_manager.Present(frame);
 #ifdef HAS_LSFG

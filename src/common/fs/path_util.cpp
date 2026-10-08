@@ -131,7 +131,7 @@ public:
         eden_path_cache = eden_path / CACHE_DIR;
         eden_path_config = eden_path / CONFIG_DIR;
 #elif defined(__OPENORBIS__)
-        eden_path = "/data/eden";
+        eden_path = "/data/switch-emu";
         eden_path_cache = eden_path / CACHE_DIR;
         eden_path_config = eden_path / CONFIG_DIR;
 #else
@@ -160,7 +160,11 @@ public:
         GenerateEdenPath(EdenPath::DumpDir, eden_path / DUMP_DIR);
         GenerateEdenPath(EdenPath::KeysDir, eden_path / KEYS_DIR);
         GenerateEdenPath(EdenPath::LoadDir, eden_path / LOAD_DIR);
+#ifdef __OPENORBIS__
+        GenerateEdenPath(EdenPath::LogDir, eden_path / "logs"); // with the PS4 port's own logs
+#else
         GenerateEdenPath(EdenPath::LogDir, eden_path / LOG_DIR);
+#endif
         GenerateEdenPath(EdenPath::LosslessDir, eden_path / LOSSLESS_DIR);
         GenerateEdenPath(EdenPath::NANDDir, eden_path / NAND_DIR);
         GenerateEdenPath(EdenPath::PlayTimeDir, eden_path / PLAY_TIME_DIR);

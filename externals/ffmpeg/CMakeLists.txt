@@ -163,11 +163,13 @@ if (OPENORBIS)
         -lSceSysmodule
         -lSceNet
         -lSceLibcInternal
+        -lc
+        -lm
     )
     list(APPEND FFmpeg_CROSS_COMPILE_FLAGS
         --disable-pthreads
-        --extra-cflags=${CMAKE_SYSROOT}/usr/include
-        --extra-cxxflags=${CMAKE_SYSROOT}/usr/include
+        --extra-cflags=-I${CMAKE_SYSROOT}/usr/include
+        --extra-cxxflags=-I${CMAKE_SYSROOT}/usr/include
         --extra-libs="${FFmpeg_CROSS_COMPILE_LIBS}"
     )
 elseif (MANAGARM)

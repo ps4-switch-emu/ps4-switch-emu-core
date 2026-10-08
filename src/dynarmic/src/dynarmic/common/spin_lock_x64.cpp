@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include "dynarmic/backend/x64/xbyak.h"
+#include "dynarmic/common/ps4_exec_allocator.h"
 
 #include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/hostloc.h"
@@ -79,7 +80,11 @@ namespace {
 struct SpinLockImpl {
     void Initialize() noexcept;
     static void GlobalInitialize() noexcept;
+#ifdef __OPENORBIS__
+    Xbyak::CodeGenerator code = Xbyak::CodeGenerator(Xbyak::inner::getPageSize(), nullptr, &Dynarmic::Common::PS4ExecAllocator::Get());
+#else
     Xbyak::CodeGenerator code = Xbyak::CodeGenerator(Xbyak::inner::getPageSize(), default_cg_mode);
+#endif
     void (*lock)(volatile int*) = nullptr;
     void (*unlock)(volatile int*) = nullptr;
 };

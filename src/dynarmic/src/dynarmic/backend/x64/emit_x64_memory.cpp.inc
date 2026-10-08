@@ -7,6 +7,12 @@
 #define CONCATENATE_TOKENS_IMPL(x, y) x##y
 
 #define AxxEmitX64 CONCATENATE_TOKENS(Axx, EmitX64)
+
+#ifdef __OPENORBIS__
+// Eden's externals/ps4sup/stub.cpp: counts fastmem faults for the lag spike trace. (C linkage:
+// this file is included inside dynarmic's namespace.)
+extern "C" void ps4_count_fastmem_fault();
+#endif
 #define AxxEmitContext CONCATENATE_TOKENS(Axx, EmitContext)
 #define AxxJitState CONCATENATE_TOKENS(Axx, JitState)
 #define AxxUserConfig Axx::UserConfig
@@ -30,12 +36,18 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
 FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
     const auto iter = fastmem_patch_info.find(rip_);
     if (iter != fastmem_patch_info.end()) {
+#ifdef __OPENORBIS__
+        ps4_count_fastmem_fault(); // lag spike diagnostics
+#endif
         FakeCall result{
             .call_rip = iter->second.callback,
             .ret_rip = iter->second.resume_rip,
         };
         if (iter->second.recompile) {
             const auto marker = iter->second.marker;
+            // (The PS4 build used to wait for 64 faults here, while its page-table path was broken
+            // and every slow access was a callback; with that fixed, one signal per access site
+            // is cheaper than repeated faults - each is a kernel signal on the PS4.)
             do_not_fastmem.insert(marker);
             InvalidateBasicBlocks({std::get<0>(marker)});
         }

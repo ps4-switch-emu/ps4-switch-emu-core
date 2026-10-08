@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -11,6 +13,10 @@
 #include "core/hle/kernel/k_page_table_base.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_system_resource.h"
+
+#ifdef __OPENORBIS__
+extern "C" __attribute__((weak)) void ps4_boot_trace(const char* stage); // externals/ps4sup/crashlog.cpp
+#endif
 
 namespace Kernel {
 
@@ -318,6 +324,17 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
         stack_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
         kmap_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
     }
+#ifdef __OPENORBIS__
+    else if (remaining_size >= 3 * RegionAlignment) {
+        // Order heap, stack, kernel map, then alias (the rnd values only decide the order here):
+        // the busy regions sit right after the code, inside the PS4's fastmem arena (16 GiB on
+        // hardware), with the 64+ GiB alias region last instead of first.
+        heap_rnd = 0;
+        stack_rnd = RegionAlignment;
+        kmap_rnd = 2 * RegionAlignment;
+        alias_rnd = 3 * RegionAlignment;
+    }
+#endif
 
     // Setup heap and alias regions.
     m_alias_region_start = alloc_start + alias_rnd;
@@ -386,6 +403,20 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
             }
         }
     }
+
+#ifdef __OPENORBIS__
+    if (ps4_boot_trace) {
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "kernel: %u-bit layout: code %#llx, heap %#llx+%#llx, stack %#llx+%#llx, kmap %#llx+%#llx, alias %#llx+%#llx",
+                 unsigned(m_address_space_width), (unsigned long long)GetInteger(process_code_start),
+                 (unsigned long long)GetInteger(m_heap_region_start), (unsigned long long)heap_region_size,
+                 (unsigned long long)GetInteger(m_stack_region_start), (unsigned long long)stack_region_size,
+                 (unsigned long long)GetInteger(m_kernel_map_region_start), (unsigned long long)kernel_map_region_size,
+                 (unsigned long long)GetInteger(m_alias_region_start), (unsigned long long)alias_region_size);
+        ps4_boot_trace(line);
+    }
+#endif
 
     // Set heap and fill members.
     m_current_heap_end = m_heap_region_start;

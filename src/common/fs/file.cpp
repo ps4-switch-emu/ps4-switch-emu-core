@@ -22,6 +22,7 @@
 #endif
 #ifdef __OPENORBIS__
 #include <sys/stat.h>
+#include <orbis/libkernel.h>
 #endif
 
 #ifdef _MSC_VER

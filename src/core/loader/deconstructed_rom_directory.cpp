@@ -233,6 +233,11 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     // TODO: this is bad form of ASLR, it sucks
     std::uintptr_t aslr_offset = ((::Settings::values.rng_seed_enabled.GetValue()
         ? ::Settings::values.rng_seed.GetValue() : Common::Random::Random64(0)) << 12) & 0xfff000;
+#ifdef __OPENORBIS__
+    // 16 KiB steps on the PS4: its fastmem maps 16 KiB pages, and only guest memory whose
+    // virtual and physical addresses line up at 16 KiB can use it.
+    aslr_offset &= ~std::uintptr_t(0x3FFF);
+#endif
 
     // Setup the process code layout
     if (process.LoadFromMetadata(system.Kernel(), metadata, code_size, fastmem_base, aslr_offset).IsError()) {

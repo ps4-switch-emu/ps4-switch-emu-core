@@ -103,8 +103,12 @@ template<>
         code.and_(page, tmp);
     }
     if (ctx.conf.page_table_sign_extension) {
-        code.shl(page, *ctx.conf.page_table_sign_extension);
-        code.sar(page, *ctx.conf.page_table_sign_extension);
+        // The setting is the sign bit's index (A64::UserConfig, and the arm64 backend's SBFM):
+        // move that bit to bit 63 and back. (Shifting by the index itself, as before, wiped the
+        // pointer, so every lookup took the slow path - every guest access on the PS4.)
+        const int shift = 63 - int(*ctx.conf.page_table_sign_extension);
+        code.shl(page, shift);
+        code.sar(page, shift);
     }
 
     code.jz(abort, code.T_NEAR);
@@ -173,8 +177,12 @@ template<>
         code.and_(page, tmp);
     }
     if (ctx.conf.page_table_sign_extension) {
-        code.shl(page, *ctx.conf.page_table_sign_extension);
-        code.sar(page, *ctx.conf.page_table_sign_extension);
+        // The setting is the sign bit's index (A64::UserConfig, and the arm64 backend's SBFM):
+        // move that bit to bit 63 and back. (Shifting by the index itself, as before, wiped the
+        // pointer, so every lookup took the slow path - every guest access on the PS4.)
+        const int shift = 63 - int(*ctx.conf.page_table_sign_extension);
+        code.shl(page, shift);
+        code.sar(page, shift);
     }
 
     code.jz(abort, code.T_NEAR);

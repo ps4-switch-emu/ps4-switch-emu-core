@@ -17,7 +17,127 @@
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+#ifdef __OPENORBIS__
+#include <atomic>
+#include <chrono>
+#include "ps4_launcher.h" // externals/ps4sup: the overlay panel renderer
+extern "C" {
+unsigned long long ps4_gpu_wait_us(); // vk_swapchain.cpp
+size_t sceKernelGetDirectMemorySize();
+int32_t sceKernelAvailableDirectMemorySize(off_t start, off_t end, size_t align, off_t* start_out, size_t* size_out);
+}
+extern std::atomic<unsigned long long> ps4_pipelines_built; // externals/ps4sup/stub.cpp
+#endif
+
 namespace Vulkan {
+
+#ifdef __OPENORBIS__
+// In-game performance overlay: a small panel (frame rate, frame times, GPU wait, shaders, GPU
+// memory) drawn by the CPU twice a second and copied into the corner of each swap image right
+// after the game's frame. One upload buffer per swap image, so the CPU never rewrites one the
+// GPU may still be reading.
+namespace {
+std::atomic<int> g_overlay_mode{kOverlayOff}, g_overlay_corner{kOverlayTopRight};
+struct OverlayState {
+    std::array<vk::Buffer, 3> buffers;
+    std::array<int, 3> version{-1, -1, -1};
+    int version_now = 0;
+    int mode_built = -1;
+    std::chrono::steady_clock::time_point window_start{}, last_frame{};
+    int frames = 0;
+    float worst_ms = 0;
+    unsigned long long gpu_wait_start = 0;
+    Ps4OverlayStats stats{};
+    std::vector<uint32_t> pixels;
+};
+OverlayState g_overlay;
+
+void RecordPS4Overlay(MemoryAllocator& allocator, const vk::CommandBuffer& cmdbuf, VkImage image, VkExtent2D extent,
+                      size_t image_index) {
+    auto& o = g_overlay;
+    const auto now = std::chrono::steady_clock::now();
+    if (o.last_frame.time_since_epoch().count() != 0) {
+        o.worst_ms = std::max(o.worst_ms, std::chrono::duration<float, std::milli>(now - o.last_frame).count());
+        o.frames++;
+    } else {
+        o.window_start = now;
+        o.gpu_wait_start = ps4_gpu_wait_us();
+    }
+    o.last_frame = now;
+    const float window = std::chrono::duration<float>(now - o.window_start).count();
+    if (window >= 0.5f && o.frames > 0) {
+        const unsigned long long wait = ps4_gpu_wait_us();
+        o.stats.fps = float(o.frames) / window;
+        o.stats.frame_ms = window * 1000.0f / float(o.frames);
+        o.stats.worst_ms = o.worst_ms;
+        o.stats.gpu_wait = std::min(1.0f, float(wait - o.gpu_wait_start) / (window * 1e6f));
+        o.stats.new_shaders = int(ps4_pipelines_built.load(std::memory_order_relaxed));
+        off_t at = 0;
+        size_t free_bytes = 0;
+        sceKernelAvailableDirectMemorySize(0, off_t(sceKernelGetDirectMemorySize()), 16 * 1024, &at, &free_bytes);
+        o.stats.gpu_free_mb = int(free_bytes >> 20);
+        o.window_start = now;
+        o.gpu_wait_start = wait;
+        o.frames = 0;
+        o.worst_ms = 0;
+        o.version_now++;
+    }
+    const int mode = g_overlay_mode.load(std::memory_order_relaxed);
+    if (mode == kOverlayOff)
+        return;
+    if (mode != o.mode_built) { // size changed: redraw every buffer
+        o.version = {-1, -1, -1};
+        o.mode_built = mode;
+    }
+    const u32 w = mode == kOverlayFps ? kOverlayFpsW : kOverlayDetailW;
+    const u32 h = mode == kOverlayFps ? kOverlayFpsH : kOverlayDetailH;
+    if (extent.width < w + 64 || extent.height < h + 64)
+        return;
+    const size_t index = image_index % o.buffers.size();
+    vk::Buffer& buffer = o.buffers[index];
+    if (!buffer) {
+        const VkBufferCreateInfo ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = VkDeviceSize(kOverlayDetailW) * kOverlayDetailH * 4,
+            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        };
+        buffer = allocator.CreateBuffer(ci, MemoryUsage::Upload);
+        if (!buffer || buffer.Mapped().empty())
+            return;
+    }
+    if (o.version[index] != o.version_now) {
+        o.stats.mode = mode;
+        o.pixels.resize(size_t(w) * h);
+        ps4_status_render_overlay(o.pixels.data(), int(w), int(h), &o.stats);
+        std::memcpy(buffer.Mapped().data(), o.pixels.data(), o.pixels.size() * 4);
+        if (!buffer.IsHostCoherent())
+            buffer.Flush();
+        o.version[index] = o.version_now;
+    }
+    const int corner = g_overlay_corner.load(std::memory_order_relaxed);
+    constexpr u32 kMargin = 28;
+    const s32 x = s32((corner & 1) ? extent.width - w - kMargin : kMargin);
+    const s32 y = s32((corner & 2) ? extent.height - h - kMargin : kMargin);
+    // After the game frame's copy into the same image: write after write.
+    const VkMemoryBarrier after_frame{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+    };
+    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, after_frame);
+    const VkBufferImageCopy region{
+        .bufferOffset = 0,
+        .bufferRowLength = w,
+        .bufferImageHeight = h,
+        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .imageOffset = {x, y, 0},
+        .imageExtent = {w, h, 1},
+    };
+    cmdbuf.CopyBufferToImage(*buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+}
+} // namespace
+#endif
 
 
 namespace {
@@ -509,6 +629,9 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          MakeImageCopy(frame->width, frame->height, extent.width, extent.height));
     }
+#ifdef __OPENORBIS__
+    RecordPS4Overlay(memory_allocator, cmdbuf, image, extent, swapchain.GetImageIndex());
+#endif
 
     cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, {},
                            {}, {}, post_barriers);
@@ -524,15 +647,22 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         VK_PIPELINE_STAGE_TRANSFER_BIT,
     };
 
+#ifdef __OPENORBIS__
+    // The PS4 swap chain has no acquire to wait for, and the flip is queued behind this
+    // submission on the same queue, so there is nothing to wait for or signal.
+    constexpr u32 num_semaphores = 0;
+#else
+    constexpr u32 num_semaphores = 1;
+#endif
     const VkSubmitInfo submit_info{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .pNext = nullptr,
-        .waitSemaphoreCount = 2U,
+        .waitSemaphoreCount = 2U * num_semaphores,
         .pWaitSemaphores = wait_semaphores.data(),
         .pWaitDstStageMask = wait_stage_masks.data(),
         .commandBufferCount = 1,
         .pCommandBuffers = cmdbuf.address(),
-        .signalSemaphoreCount = 1U,
+        .signalSemaphoreCount = num_semaphores,
         .pSignalSemaphores = &render_semaphore,
     };
 
@@ -553,7 +683,18 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
-    swapchain.Present(render_semaphore);
+    swapchain.Present(num_semaphores ? render_semaphore : VK_NULL_HANDLE);
 }
 
 } // namespace Vulkan
+
+#ifdef __OPENORBIS__
+// Launcher settings / the Home menu: overlay mode (Ps4OverlayMode) and corner (Ps4OverlayCorner).
+extern "C" void ps4_overlay_configure(int mode, int corner) {
+    Vulkan::g_overlay_mode = mode;
+    Vulkan::g_overlay_corner = corner;
+}
+extern "C" int ps4_overlay_mode() {
+    return Vulkan::g_overlay_mode.load();
+}
+#endif

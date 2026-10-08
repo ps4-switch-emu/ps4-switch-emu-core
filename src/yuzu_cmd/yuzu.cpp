@@ -24,17 +24,25 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/string_util.h"
-#include "common/virtual_buffer.h"
+#include "common/sparse_large_vector.h"
 #include "core/core.h"
+#include "core/file_sys/vfs/vfs.h"
+#include "core/hle/service/acc/profile_manager.h"
+#include "core/perf_stats.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/hle/service/am/applet_manager.h"
+#include "core/device_memory.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
+#include <algorithm>
+#include <strings.h>
+#include <dirent.h>
+#include "frontend_common/content_manager.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
 #include "input_common/main.h"
@@ -63,12 +71,101 @@
 #include <unistd.h>
 #endif
 
+#if !defined(__OPENORBIS__)
+#define PS4_TRACE(...) ((void)0)
+#define PS4_STAGE(...) ((void)0)
+#endif
 #if defined(__OPENORBIS__)
 #include <orbis/libkernel.h>
 #include <orbis/SystemService.h>
 #include <orbis/AudioOut.h>
 #include <orbis/Pad.h>
 #include <orbis/UserService.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <pthread_np.h>
+extern "C" void ps4_boot_trace(const char* stage); // externals/ps4sup/crashlog.cpp
+// externals/ps4sup/dps4/ps4_runtime.cpp (DolphinPS4)
+extern "C" int ps4_exec_probe();
+extern "C" const char* ps4rt_heap_source(void);
+extern "C" size_t ps4rt_heap_size(void);
+#define PS4_TRACE(...) ps4_boot_trace(fmt::format(__VA_ARGS__).c_str())
+// externals/ps4sup/status_screen.cpp: on-screen status while there is no renderer.
+extern "C" void ps4_status_start(const char* title);
+extern "C" void ps4_status_stop();
+extern "C" void ps4_status_set_stage(const char* stage);
+extern "C" void ps4_status_watch_file(const char* path, const char* heading);
+// externals/ps4sup/ps4_menu.cpp: start menu (DualShock 4) and the automatic benchmark suite.
+extern "C" void ps4_menu_run();
+extern "C" void ps4_menu_guest_exited();
+extern "C" void ps4_menu_poll_restart();
+extern "C" void ps4_menu_load_failed(int code, const char* path);
+extern "C" void ps4_sampler_start(); // externals/ps4sup/sampler.cpp
+extern "C" void ps4_menu_restart_to_menu(const char* message);
+extern "C" void ps4_menu_restart_now();
+extern "C" bool ps4_swapchain_overlay_begin();
+extern "C" void ps4_swapchain_overlay_draw(void (*draw)(uint32_t*, const uint32_t*, int, void*), void* ctx);
+extern "C" void ps4_swapchain_overlay_end();
+extern "C" unsigned long long ps4_gpu_wait_us(); // vk_swapchain.cpp
+extern "C" void ps4_overlay_configure(int mode, int corner); // vk_present_manager.cpp
+extern "C" int ps4_overlay_mode();
+extern "C" void ps4_swapchain_show_loading(const char* progress); // vk_swapchain.cpp
+#define PS4_STAGE(...) ps4_status_set_stage(fmt::format(__VA_ARGS__).c_str())
+
+// Menu "Install updates/DLC": installs every .nsp in /data/switch-emu/install into the emulated user
+// NAND (Eden applies updates and DLC from there when the base game starts), moves the installed
+// files to /data/switch-emu/install/installed/, then restarts to the menu. Doesn't return.
+static void PS4InstallPending(Core::System& system) {
+    constexpr const char* kDir = "/data/switch-emu/install";
+    std::vector<std::string> files;
+    if (DIR* dir = opendir(kDir)) {
+        while (dirent* entry = readdir(dir)) {
+            const std::string name = entry->d_name;
+            if (name.size() > 4 && strcasecmp(name.c_str() + name.size() - 4, ".nsp") == 0)
+                files.push_back(name);
+        }
+        closedir(dir);
+    }
+    std::sort(files.begin(), files.end());
+    mkdir("/data/switch-emu/install/installed", 0777);
+    int ok = 0, failed = 0, base = 0;
+    for (size_t i = 0; i < files.size(); i++) {
+        const std::string path = std::string(kDir) + "/" + files[i];
+        int last_percent = -1;
+        const auto progress = [&](size_t total, size_t done) {
+            const int percent = total ? int(done * 100 / total) : 0;
+            if (percent != last_percent) {
+                last_percent = percent;
+                PS4_STAGE("Installing {} ({}/{}): {}%", files[i], i + 1, files.size(), percent);
+            }
+            return false; // never cancel
+        };
+        const auto result = ContentManager::InstallNSP(system, *system.GetFilesystem(), path, progress);
+        const char* what = "failed";
+        switch (result) {
+        case ContentManager::InstallResult::Success:
+        case ContentManager::InstallResult::Overwrite:
+            what = result == ContentManager::InstallResult::Success ? "installed" : "reinstalled";
+            ok++;
+            rename(path.c_str(), (std::string(kDir) + "/installed/" + files[i]).c_str());
+            break;
+        case ContentManager::InstallResult::BaseInstallAttempted:
+            what = "is a base game - put it in /data/switch-emu/games instead";
+            base++;
+            break;
+        default:
+            failed++;
+            break;
+        }
+        PS4_TRACE("install: {} {}", files[i], what);
+    }
+    char summary[200];
+    snprintf(summary, sizeof(summary),
+             "Install finished: %d installed, %d failed, %d base games (belong in /data/switch-emu/games). Back to the menu...",
+             ok, failed, base);
+    ps4_menu_restart_to_menu(summary);
+}
+extern "C" const char* ps4_menu_game_path();
 #elif defined(_WIN32)
 extern "C" {
 // tells Nvidia and AMD drivers to use the dedicated GPU by default on laptops with switchable
@@ -198,7 +295,25 @@ struct SdlState {
 };
 
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
+#ifdef __OPENORBIS__
+    {
+        pthread_attr_t attr;
+        void* stack_addr = nullptr;
+        size_t stack_size = 0;
+        int here = 0;
+        pthread_attr_init(&attr);
+        pthread_attr_get_np(pthread_self(), &attr);
+        pthread_attr_getstack(&attr, &stack_addr, &stack_size);
+        pthread_attr_destroy(&attr);
+        PS4_TRACE("main: SDL_AppInit on stack {} + {} KiB, sp {} ({} KiB left)", stack_addr, stack_size >> 10,
+                  static_cast<void*>(&here), (uintptr_t(&here) - uintptr_t(stack_addr)) >> 10);
+    }
+#endif
+    PS4_TRACE("main: SDL_AppInit, constructing Core::System");
     SdlState* state = new SdlState();
+    // Handed back to SDL_AppIterate/AppEvent/AppQuit (was never stored: they got nullptr).
+    *appstate = state;
+    PS4_TRACE("main: Core::System constructed");
 
 #ifdef _WIN32
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
@@ -211,8 +326,30 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
 
-    sceUserServiceInitialize(nullptr);
+    ps4_status_start("PS4 Switch Emu");
+    // A fresh run: drop the previous run's output so its lines aren't taken as already seen.
+    remove("/data/switch-emu/sdmc/cpu-benchmark.txt");
+    ps4_status_watch_file("/data/switch-emu/sdmc/cpu-benchmark.txt", "test.nro output");
+    PS4_STAGE("Starting up");
+    PS4_TRACE("main: eden-cli starting, heap {} MiB from {}", ps4rt_heap_size() >> 20, ps4rt_heap_source());
+    // How this jailbreak lets us map JIT code (0 = plain RWX mmap ... 4 = JIT shared memory,
+    // -1 = none works); dynarmic's PS4ExecAllocator maps through the method found here.
+    PS4_TRACE("main: executable memory method {}", ps4_exec_probe());
+    if (struct stat st; stat("/data/switch-emu/test-crash", &st) == 0) {
+        // Test switch: checks that crash.log gets written.
+        PS4_TRACE("main: test-crash: writing to address 0x10");
+        *reinterpret_cast<volatile int*>(0x10) = 1;
+    }
+    if (struct stat st; stat("/data/switch-emu/skip-userservice", &st) == 0) {
+        PS4_TRACE("main: skip-userservice: not calling sceUserServiceInitialize");
+    } else {
+        PS4_TRACE("main: calling sceUserServiceInitialize");
+        PS4_TRACE("main: user service init: {:#x}", u32(sceUserServiceInitialize(nullptr)));
+    }
     Common::InitSwap();
+    PS4_TRACE("main: swap handler installed");
+    // Options menu (or the next run of a benchmark suite); sets the switch files read below.
+    ps4_menu_run();
 #endif
 
     Common::Log::Initialize();
@@ -270,7 +407,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef __OPENORBIS__
     // PS4 will use this path by default UNLESS overriden; this is so users
     // can quickly launch whatever they want.
-    filepath = "/data/eden/games/test.nro";
+    filepath = ps4_menu_game_path(); // chosen in the start menu (default test.nro)
 #endif
     while (optind < argc) {
         int arg = getopt_long(argc, argv, "g:fhvcip::c:u:d:", long_options, &option_index);
@@ -402,13 +539,70 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return SDL_APP_FAILURE;
     }
 
+#ifdef __OPENORBIS__
+    // Test switches, applied before System::Initialize (changing multi-core afterwards makes Eden
+    // re-create the whole emulated system): /data/switch-emu/cpu-unsafe (faster, less exact floating
+    // point) and /data/switch-emu/singlecore (multi-core is the default).
+    // Set explicitly both ways: Eden's saved config (sdl2-config.ini) would otherwise keep values
+    // from earlier runs (seen: multi-core stayed off after its default changed).
+    {
+        struct stat st;
+        Settings::values.cpu_accuracy.SetValue(stat("/data/switch-emu/cpu-unsafe", &st) == 0
+                                                   ? Settings::CpuAccuracy::Unsafe
+                                                   : Settings::CpuAccuracy::Auto);
+        Settings::values.use_multi_core.SetValue(stat("/data/switch-emu/singlecore", &st) != 0);
+        Settings::values.cpuopt_unsafe_host_mmu.SetValue(true);
+        // /data/switch-emu/async-shaders: draw without a pipeline until it's built in the background
+        // (less stutter, brief glitches).
+        Settings::values.use_asynchronous_shaders.SetValue(stat("/data/switch-emu/async-shaders", &st) == 0);
+        // Performance overlay (launcher: Debug): /data/switch-emu/overlay.txt "<mode> <corner>".
+        if (FILE* f = fopen("/data/switch-emu/overlay.txt", "r")) {
+            int mode = 0, corner = 1;
+            if (fscanf(f, "%d %d", &mode, &corner) == 2)
+                ps4_overlay_configure(mode, corner);
+            fclose(f);
+        }
+        // GPU: the mobile defaults (Android's) suit the PS4 - set explicitly, the saved config
+        // would keep desktop values. /data/switch-emu/gpu-high: High accuracy for a game that needs it.
+        Settings::values.gpu_accuracy.SetValue(stat("/data/switch-emu/gpu-high", &st) == 0 ? Settings::GpuAccuracy::High
+                                                                                    : Settings::GpuAccuracy::Low);
+        Settings::values.use_reactive_flushing.SetValue(false);
+        Settings::values.max_anisotropy.SetValue(Settings::AnisotropyMode::Default);
+        // Launcher: console mode (handheld renders at 720p) and resolution scale.
+        Settings::values.use_docked_mode.SetValue(stat("/data/switch-emu/handheld", &st) == 0 ? Settings::ConsoleMode::Handheld
+                                                                                       : Settings::ConsoleMode::Docked);
+        Settings::values.resolution_setup.SetValue(stat("/data/switch-emu/res-050", &st) == 0   ? Settings::ResolutionSetup::Res1_2X
+                                                   : stat("/data/switch-emu/res-075", &st) == 0 ? Settings::ResolutionSetup::Res3_4X
+                                                                                          : Settings::ResolutionSetup::Res1X);
+    }
+    PS4_TRACE("main: cpu accuracy {}, multi-core {}, fastmem enabled {}, console mode {}, resolution setup {}",
+              int(Settings::values.cpu_accuracy.GetValue()), Settings::values.use_multi_core.GetValue(),
+              Settings::IsFastmemEnabled(), int(Settings::values.use_docked_mode.GetValue()),
+              int(Settings::values.resolution_setup.GetValue()));
+#endif
+    PS4_TRACE("main: game path {}", filepath);
+    PS4_STAGE("Initializing the emulated Switch");
     state->system.Initialize();
+    PS4_TRACE("main: system initialized");
 
     InputCommon::InputSubsystem input_subsystem{};
 
     // Apply the command line arguments
     state->system.ApplySettings();
     Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Vulkan);
+    // EDEN_NULL_RENDERER=1: run without graphics (PC baseline runs of the PS4 benchmark).
+    if (getenv("EDEN_NULL_RENDERER"))
+        Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Null);
+#ifdef __OPENORBIS__
+    // Test switch: create /data/switch-emu/null-renderer to run without graphics (CPU/memory bring-up).
+    // Install runs keep the status screen (no renderer) to show progress.
+    if (struct stat st; stat("/data/switch-emu/null-renderer", &st) == 0 || stat("/data/switch-emu/install-now", &st) == 0)
+        Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Null);
+    PS4_TRACE("main: renderer backend {}", int(Settings::values.renderer_backend.GetValue()));
+    // A real renderer needs VideoOut; the status screen only runs without one.
+    if (Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Null)
+        ps4_status_stop();
+#endif
     Common::Log::SetGlobalFilter(Common::Log::Filter(Common::Log::Level::Trace));
 
     switch (Settings::values.renderer_backend.GetValue()) {
@@ -435,15 +629,73 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     state->system.CoreTiming().SetTimerResolutionNs(Common::Windows::GetCurrentTimerResolution());
 #endif
 
+    PS4_TRACE("main: window created");
     state->system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     state->system.GetFileSystemController().CreateFactories(*state->system.GetFilesystem());
     state->system.GetUserChannel().clear();
+#ifdef __OPENORBIS__
+    if (struct stat st; stat("/data/switch-emu/install-now", &st) == 0) {
+        remove("/data/switch-emu/install-now");
+        PS4InstallPending(state->system);
+    }
+#endif
 
     Service::AM::FrontendAppletParameters load_parameters{
         .applet_id = Service::AM::AppletId::Application,
     };
+    PS4_TRACE("main: loading game");
+    PS4_STAGE("Loading {}", filepath);
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, filepath, load_parameters);
+    PS4_TRACE("main: load result {}", int(load_result));
+#ifdef __OPENORBIS__
+    if (load_result == Core::SystemResultStatus::Success) {
+        // The launcher's library: remember this game's real title and icon
+        // (/data/switch-emu/titles/<file>.txt and .jpg).
+        if (const auto file = state->system.GetFilesystem()->OpenFile(filepath, FileSys::OpenMode::Read)) {
+            if (const auto loader = Loader::GetLoader(state->system, file)) {
+                const std::string base = filepath.substr(filepath.rfind('/') + 1);
+                mkdir("/data/switch-emu/titles", 0777);
+                std::string title;
+                if (loader->ReadTitle(title) == Loader::ResultStatus::Success && !title.empty()) {
+                    if (FILE* f = fopen(("/data/switch-emu/titles/" + base + ".txt").c_str(), "w")) {
+                        fputs(title.c_str(), f);
+                        fclose(f);
+                    }
+                }
+                std::vector<u8> icon;
+                if (loader->ReadIcon(icon) == Loader::ResultStatus::Success && !icon.empty()) {
+                    if (FILE* f = fopen(("/data/switch-emu/titles/" + base + ".jpg").c_str(), "wb")) {
+                        fwrite(icon.data(), 1, icon.size(), f);
+                        fclose(f);
+                    }
+                }
+                PS4_TRACE("library: \"{}\", icon {} bytes", title, icon.size());
+            }
+        }
+        // Saves live per user and title: show which user is active and whether this game has saved
+        // before (so a missing save after a restart can be told apart from a changed user).
+        const auto user = state->system.GetProfileManager().GetUser(Settings::values.current_user.GetValue());
+        if (user) {
+            const u128 id = user->AsU128();
+            const std::string save = fmt::format("/data/switch-emu/nand/user/save/0000000000000000/{:016X}{:016X}/{:016X}",
+                                                 id[1], id[0], state->system.GetApplicationProcessProgramID());
+            struct stat st;
+            PS4_TRACE("saves: user {}, {} at {}", user->FormattedString(),
+                      stat(save.c_str(), &st) == 0 ? "existing save" : "no save yet", save);
+        } else {
+            PS4_TRACE("saves: no user profile {}", Settings::values.current_user.GetValue());
+        }
+    }
+#endif
+    if (load_result != Core::SystemResultStatus::Success) {
+        PS4_STAGE("Loading failed (error {})", int(load_result));
+#ifdef __OPENORBIS__
+        // Back to the menu (or on with the benchmark suite) instead of shutting down a system
+        // that never started - that crashed in InputSubsystem::Shutdown on hardware.
+        ps4_menu_load_failed(int(load_result), filepath.c_str());
+#endif
+    }
     switch (load_result) {
     case Core::SystemResultStatus::Success:
         break; // Expected case
@@ -463,9 +715,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         const u16 loader_id = u16(Core::SystemResultStatus::ErrorLoader);
         const u16 error_id = u16(load_result) - loader_id;
         LOG_CRITICAL(Frontend,
-            "While attempting to load the ROM requested, an error occurred. Please "
-            "refer to the Eden wiki for more information or the Eden discord for "
-            "additional help.\n\nError Code: {:04X}-{:04X}\nError Description: {}",
+            "While attempting to load the ROM requested, an error occurred. Check that "
+            "the keys and firmware are installed (see the README).\n\nError Code: "
+            "{:04X}-{:04X}\nError Description: {}",
             loader_id, error_id, Loader::ResultStatus(error_id));
         return SDL_APP_FAILURE;
     }
@@ -490,7 +742,15 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         for (const auto& e : input_devices) {
             LOG_INFO(Input, "FOUND=Device -> {} {}", e.Get("display", "Unknown"), e.Serialize());
         }
-        auto const& device = input_devices[3];
+        // First SDL gamepad (the DualShock 4 on the PS4); was a fixed input_devices[3], which is
+        // out of range without a controller (crash on a headless PC).
+        auto const it = std::find_if(input_devices.begin(), input_devices.end(),
+                                     [](const auto& e) { return e.Get("engine", "") == "sdl"; });
+        if (it == input_devices.end()) {
+            LOG_WARNING(Input, "No SDL gamepad found; controller not auto-mapped");
+            goto skip_controller_mapping;
+        }
+        auto const& device = *it;
         LOG_INFO(Input, "selected? {}", device.Serialize());
         auto const button_mappings = input_subsystem.GetButtonMappingForDevice(device);
         auto const analog_mappings = input_subsystem.GetAnalogMappingForDevice(device);
@@ -518,19 +778,45 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             LOG_INFO(Input, "Mapped=Device? -> {}", e.Get("display", "Unknown"));
         }
     }
+skip_controller_mapping:
 
     // Core is loaded, start the GPU (makes the GPU contexts current to this thread)
+    PS4_TRACE("main: starting GPU");
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
+    PS4_TRACE("main: GPU started");
 
     if (Settings::values.use_disk_shader_cache.GetValue()) {
+        const u64 load_start = SDL_GetTicks();
+        static size_t s_pipelines = 0;
         state->system.Renderer().ReadRasterizer()->LoadDiskResources(
             state->system.GetApplicationProcessProgramID(), std::stop_token{},
-            [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
+            [](VideoCore::LoadCallbackStage stage, size_t value, size_t total) {
+                if (stage == VideoCore::LoadCallbackStage::Build)
+                    s_pipelines = total;
+#ifdef __OPENORBIS__
+                // Progress on the loading screen, a few times a second.
+                static u64 s_last = 0;
+                if (const u64 now = SDL_GetTicks(); stage == VideoCore::LoadCallbackStage::Build && now - s_last >= 200) {
+                    s_last = now;
+                    ps4_swapchain_show_loading(
+                        fmt::format("Building shaders from the cache: {} of {}", value, total).c_str());
+                }
+#endif
+            });
+        PS4_TRACE("shader cache: {} pipelines built from disk in {:.1f} s (async shaders {})", s_pipelines,
+                  (SDL_GetTicks() - load_start) / 1000.0, Settings::values.use_asynchronous_shaders.GetValue());
     }
 
     // don't do anything, SDL3 already exists for us :D
-    state->system.RegisterExitCallback([] {});
+    state->system.RegisterExitCallback([state] {
+        state->system.DeviceMemory().buffer.LogFastmemStats("guest exit");
+        PS4_TRACE("main: guest program exited");
+        PS4_STAGE("Finished - the program exited. Close the app with the PS button.");
+#ifdef __OPENORBIS__
+        ps4_menu_guest_exited();
+#endif
+    });
 
     // QLaunch launched applications (should) now reload shader cache.
     static std::mutex shader_cache_reload_mutex;
@@ -555,22 +841,166 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         state->system.Run();
     });
 
+    PS4_TRACE("main: running emulation");
+#ifdef __OPENORBIS__
+    if (struct stat st; stat("/data/switch-emu/profile", &st) == 0)
+        ps4_sampler_start();
+#endif
+    state->system.DeviceMemory().buffer.LogFastmemStats("emulation start");
+    PS4_STAGE("Running {} (null renderer: no picture, output on the right)", filepath);
     void(state->system.Run());
     if (state->system.DebuggerEnabled())
         state->system.InitializeDebugger();
-    return SDL_APP_SUCCESS;
+    // SDL3 main callbacks: SDL_APP_SUCCESS here would mean "quit now"; keep iterating.
+    return SDL_APP_CONTINUE;
 }
+#ifdef __OPENORBIS__
+#include "ps4_launcher.h"
+static std::string g_ps4_last_perf = "Frame rate: measuring...";
+
+// First connected gamepad's buttons as a bit set (SDL_GamepadButton bits).
+static u32 PS4GamepadButtons() {
+    u32 bits = 0;
+    int count = 0;
+    if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
+        if (count > 0)
+            if (SDL_Gamepad* gp = SDL_GetGamepadFromID(ids[0]))
+                for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT && b < 32; b++)
+                    if (SDL_GetGamepadButton(gp, SDL_GamepadButton(b)))
+                        bits |= 1u << b;
+        SDL_free(ids);
+    }
+    return bits;
+}
+
+// In-game Home menu (hold L3 + R3): pauses the game and draws over its last frame.
+static void PS4HomeMenu(SdlState* state) {
+    PS4_TRACE("main: Home menu");
+    void(state->system.Pause());
+    // Let the GPU thread finish what the game queued (its presents would flip over the menu).
+    state->system.GPU().WaitForIdle();
+    if (!ps4_swapchain_overlay_begin()) { // no frame shown yet: just leave
+        ps4_menu_restart_now();
+        return;
+    }
+    static const char* const kOverlayLabels[] = {"Performance overlay: Off", "Performance overlay: FPS",
+                                                  "Performance overlay: Detailed"};
+    const char* items[] = {"Resume", "Restart game", "Quit to launcher", kOverlayLabels[ps4_overlay_mode() % 3]};
+    Ps4HomeMenu menu{ps4_launcher_loading_title(), g_ps4_last_perf.c_str(), items, 4, 0};
+    struct Ctx {
+        const Ps4HomeMenu* menu;
+        bool capture;
+    } ctx{&menu, true};
+    const auto draw = [](uint32_t* dst, const uint32_t* src, int pitch, void* c) {
+        auto* x = static_cast<Ctx*>(c);
+        ps4_status_draw_home(dst, src, pitch, x->menu, x->capture);
+    };
+    ps4_swapchain_overlay_draw(draw, &ctx);
+    ctx.capture = false;
+    constexpr u32 kUp = 1u << SDL_GAMEPAD_BUTTON_DPAD_UP, kDown = 1u << SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+                  kSelect = 1u << SDL_GAMEPAD_BUTTON_SOUTH, kBack = 1u << SDL_GAMEPAD_BUTTON_EAST,
+                  kSticks = (1u << SDL_GAMEPAD_BUTTON_LEFT_STICK) | (1u << SDL_GAMEPAD_BUTTON_RIGHT_STICK);
+    u32 previous = PS4GamepadButtons() | kSticks; // ignore what's still held from opening it
+    for (;;) {
+        SDL_PumpEvents();
+        SDL_UpdateGamepads();
+        const u32 now = PS4GamepadButtons();
+        const u32 pressed = now & ~previous;
+        previous = now;
+        const int old = menu.selected;
+        if (pressed & kUp)
+            menu.selected = (menu.selected + menu.count - 1) % menu.count;
+        if (pressed & kDown)
+            menu.selected = (menu.selected + 1) % menu.count;
+        if (menu.selected != old)
+            ps4_swapchain_overlay_draw(draw, &ctx);
+        if ((pressed & kBack) || ((pressed & kSelect) && menu.selected == 0)) {
+            ps4_swapchain_overlay_end();
+            state->system.Run();
+            PS4_TRACE("main: Home menu closed, resuming");
+            return;
+        }
+        if ((pressed & kSelect) && menu.selected == 1) {
+            if (FILE* f = fopen("/data/switch-emu/autostart", "w"))
+                fclose(f);
+            ps4_menu_restart_now();
+        }
+        if ((pressed & kSelect) && menu.selected == 2)
+            ps4_menu_restart_now();
+        if ((pressed & kSelect) && menu.selected == 3) { // cycle the overlay (this session)
+            const int mode = (ps4_overlay_mode() + 1) % 3;
+            int corner = 1;
+            if (FILE* f = fopen("/data/switch-emu/overlay.txt", "r")) {
+                int ignored = 0;
+                if (fscanf(f, "%d %d", &ignored, &corner) != 2)
+                    corner = 1;
+                fclose(f);
+            }
+            ps4_overlay_configure(mode, corner);
+            items[3] = kOverlayLabels[mode];
+            ps4_swapchain_overlay_draw(draw, &ctx);
+        }
+        SDL_Delay(16);
+    }
+}
+#endif
+
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
+#ifdef __OPENORBIS__
+    // Nothing to draw here (rendering happens on its own thread); don't spin a whole Jaguar core.
+    SDL_Delay(4);
+    ps4_menu_poll_restart();
+    // Hold L3 + R3 for 1 s: the Home menu (the PS button belongs to the system).
+    {
+        static u64 s_combo_since = 0;
+        bool held = false;
+        int count = 0;
+        if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
+            for (int i = 0; i < count && !held; i++)
+                if (SDL_Gamepad* gp = SDL_GetGamepadFromID(ids[i]))
+                    held = SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_LEFT_STICK) &&
+                           SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_RIGHT_STICK);
+            SDL_free(ids);
+        }
+        const u64 now = SDL_GetTicks();
+        if (!held) {
+            s_combo_since = 0;
+        } else if (s_combo_since == 0) {
+            s_combo_since = now;
+        } else if (now - s_combo_since >= 1000 && state->system.IsPoweredOn()) {
+            s_combo_since = 0;
+            PS4HomeMenu(state);
+        }
+    }
+    // Performance every 5 s in boot-trace.log (the status screen is hidden under Vulkan).
+    static u64 s_last_perf = SDL_GetTicks();
+    if (const u64 now = SDL_GetTicks(); now - s_last_perf >= 5000 && state->system.IsPoweredOn()) {
+        s_last_perf = now;
+        const Core::PerfStatsResults perf = state->system.GetAndResetPerfStats();
+        static unsigned long long s_gpu_wait = 0;
+        const unsigned long long gpu_wait = ps4_gpu_wait_us();
+        PS4_TRACE("perf: game {:.1f} fps, emulation speed {:.0f}%, {:.1f} ms per frame, waiting for the GPU {:.0f}% of "
+                  "the time",
+                  perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0,
+                  double(gpu_wait - s_gpu_wait) / 50000.0); // us per 5 s -> %
+        s_gpu_wait = gpu_wait;
+        g_ps4_last_perf = fmt::format("Frame rate: {:.0f} fps (last 5 s)", perf.average_game_fps);
+    }
+#endif
     return state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;
 }
 extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     SdlState *state = (SdlState *)appstate;
     state->emu_window->OnEvent(*event);
-    return SDL_APP_SUCCESS;
+    // Only stop once the window has been closed (SDL_APP_SUCCESS ends the app).
+    return state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;
 }
 extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     SdlState *state = (SdlState *)appstate;
+    PS4_TRACE("quit: result {}", int(result));
+    if (!state)
+        return; // SDL_AppInit failed before creating the state
     state->system.DetachDebugger();
     void(state->system.Pause());
     state->system.ShutdownMainProcess();

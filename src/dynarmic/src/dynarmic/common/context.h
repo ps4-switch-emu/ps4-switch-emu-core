@@ -45,6 +45,12 @@
 #else
 #   ifdef __OpenBSD__
 #       define CTX_DECLARE(raw_context) ucontext_t* ucontext = reinterpret_cast<ucontext_t*>(raw_context);
+#   elif defined(__OPENORBIS__)
+// The PS4 kernel's ucontext has 0x30 more bytes before the mcontext than FreeBSD's (which the
+// libc-overlay headers describe): mcontext is at 0x40, measured on hardware (DolphinPS4's crash
+// handler; Eden's Orbis::Ucontext in sparse_large_vector.cpp). The mcontext itself matches.
+#       define CTX_DECLARE(raw_context) [[maybe_unused]] auto& mctx = \
+        *reinterpret_cast<mcontext_t*>(static_cast<char*>(raw_context) + 0x40);
 #   else
 #       define CTX_DECLARE(raw_context) ucontext_t* ucontext = reinterpret_cast<ucontext_t*>(raw_context);  \
         [[maybe_unused]] auto& mctx = ucontext->uc_mcontext;
@@ -132,8 +138,9 @@
 #        define CTX_PC (mctx.__pollution(gregs)[REG_RIP])
 #        define CTX_SP (mctx.__pollution(gregs)[REG_RSP])
 #    elif defined(__OPENORBIS__)
-#        define CTX_RIP (mctx.gregs[REG_RIP])
-#        define CTX_RSP (mctx.gregs[REG_RSP])
+// The PS4 kernel delivers FreeBSD's mcontext (the libc-overlay signal.h declares it).
+#        define CTX_PC (mctx.mc_rip)
+#        define CTX_SP (mctx.mc_rsp)
 #    else
 #        error "unknown platform"
 #    endif

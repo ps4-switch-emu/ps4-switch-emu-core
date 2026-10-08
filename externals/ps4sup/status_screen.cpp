@@ -1,0 +1,1425 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// PS4 status screen: while Eden runs without a renderer (bring-up, benchmarks) the TV would only
+// show black. This draws its own 1080p frame through VideoOut a few times a second: what Eden is
+// doing (the boot-trace lines), for how long, and the contents of a file the guest writes (e.g.
+// the benchmark's results), so progress is visible on the console itself.
+//
+// Independent of Eden's video code: CPU-drawn into an off-screen buffer, copied into one of two
+// linear direct-memory framebuffers and flipped. Must be stopped before a real renderer opens
+// VideoOut (one handle per output bus).
+
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
+#include <pthread.h>
+#include <unistd.h>
+
+#include "ps4_launcher.h"
+#include "status_font.h"
+#include "status_font_bold.h"
+#include "status_font_title.h"
+#include "status_logo.h"
+
+extern "C" {
+int32_t sceVideoOutOpen(int32_t user, int32_t bus, int32_t index, const void* param);
+int32_t sceVideoOutClose(int32_t handle);
+int32_t sceVideoOutRegisterBuffers(int32_t handle, int32_t start, void* const* addresses, int32_t count,
+                                   const void* attribute);
+int32_t sceVideoOutUnregisterBuffers(int32_t handle, int32_t set);
+int32_t sceVideoOutSubmitFlip(int32_t handle, int32_t index, uint32_t mode, int64_t arg);
+int32_t sceVideoOutSetFlipRate(int32_t handle, int32_t rate);
+int32_t sceVideoOutIsFlipPending(int32_t handle);
+size_t sceKernelGetDirectMemorySize();
+int32_t sceKernelAllocateDirectMemory(off_t start, off_t end, size_t length, size_t alignment, int32_t type,
+                                      off_t* phys);
+int32_t sceKernelMapDirectMemory(void** addr, size_t length, int32_t prot, int32_t flags, off_t phys,
+                                 size_t alignment);
+int32_t sceKernelMunmap(void* addr, size_t length);
+int32_t sceKernelReleaseDirectMemory(off_t start, size_t length);
+}
+
+namespace {
+
+constexpr int kWidth = 1920, kHeight = 1080, kBuffers = 2;
+constexpr size_t kFrameBytes = size_t(kWidth) * kHeight * 4;
+constexpr size_t kFrameAligned = (kFrameBytes + (2u << 20) - 1) & ~size_t((2u << 20) - 1);
+constexpr int32_t kUserIdSystem = 0xFF, kBusMain = 0, kFlipVsync = 1;
+constexpr int32_t kWcGarlic = 3, kProtCpuGpuRw = 0x3 | 0x30;
+
+struct BufferAttribute { // OrbisVideoOutBufferAttribute
+    int32_t format, tmode, aspect;
+    uint32_t width, height, pixel_pitch;
+    uint64_t reserved[2];
+};
+
+// Colours in the framebuffer's A8B8G8R8 layout (little endian: 0xAABBGGRR).
+constexpr uint32_t Rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return 0xFF000000u | (uint32_t(b) << 16) | (uint32_t(g) << 8) | r;
+}
+constexpr uint32_t kBackground = Rgb(14, 20, 34), kPanel = Rgb(24, 33, 54), kAccent = Rgb(90, 170, 255);
+constexpr uint32_t kText = Rgb(228, 233, 242), kDim = Rgb(140, 152, 175), kGood = Rgb(110, 220, 140),
+                   kBad = Rgb(255, 110, 110);
+
+// Recent trace lines: fixed storage, no allocation (ps4_boot_trace is called from inside malloc).
+constexpr int kLines = 64, kLineLen = 160;
+char g_lines[kLines][kLineLen];
+int g_line_count = 0;
+char g_stage[kLineLen] = "Starting";
+char g_title[64] = "PS4 Switch Emu";
+char g_watch_path[256] = "";
+char g_watch_heading[64] = "";
+std::atomic_flag g_lock = ATOMIC_FLAG_INIT;
+std::atomic<bool> g_running{false}, g_stop{false}, g_crashed{false}, g_ready{false};
+pthread_t g_thread;
+timespec g_start;
+
+// Watched-file lines as shown: the text plus, for "end <test>..." lines, the real time since the
+// matching "begin <test>" (the guest can't time itself: its clock follows emulated cycles in
+// single-core mode). Each new line is also written to boot-trace.log with the real time.
+constexpr int kWatchLines = 24;
+char g_watch_lines[kWatchLines][kLineLen];
+int g_watch_count = 0;
+char g_begin_name[kLineLen] = "";
+double g_begin_time = 0.0;
+
+// Menu (ps4_menu.cpp): when set, drawn in place of the log. A line starting with "> " is the
+// selected one.
+constexpr int kMenuLines = 20;
+char g_menu[kMenuLines][kLineLen];
+int g_menu_count = 0;
+
+void Lock() {
+    while (g_lock.test_and_set(std::memory_order_acquire)) {
+    }
+}
+void Unlock() {
+    g_lock.clear(std::memory_order_release);
+}
+
+void CopyText(char* dst, size_t size, const char* src) {
+    size_t i = 0;
+    for (; src && src[i] && src[i] != '\n' && i + 1 < size; i++)
+        dst[i] = (src[i] >= 32 && src[i] < 127) ? src[i] : ' ';
+    dst[i] = 0;
+}
+
+double Elapsed();
+extern "C" __attribute__((weak)) void ps4_boot_trace(const char* stage);
+
+// Reads the watched file and takes in lines it hasn't seen yet (status thread only).
+void PollWatchedFile(const char* path) {
+    FILE* f = path[0] ? fopen(path, "r") : nullptr;
+    if (!f)
+        return;
+    char line[kLineLen];
+    int index = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strchr(line, '\n'))
+            break; // still being written
+        if (index++ < g_watch_count)
+            continue;
+        char clean[kLineLen];
+        CopyText(clean, sizeof(clean), line);
+        const double now = Elapsed();
+        char shown[kLineLen];
+        snprintf(shown, sizeof(shown), "%s", clean);
+        if (strncmp(clean, "begin ", 6) == 0) {
+            CopyText(g_begin_name, sizeof(g_begin_name), clean + 6);
+            g_begin_time = now;
+        } else if (strncmp(clean, "end ", 4) == 0 && g_begin_name[0] &&
+                   strncmp(clean + 4, g_begin_name, strlen(g_begin_name)) == 0) {
+            snprintf(shown, sizeof(shown), "%.90s  -> %.1f s real", clean, now - g_begin_time);
+            g_begin_name[0] = 0;
+        }
+        Lock();
+        if (g_watch_count < kWatchLines)
+            CopyText(g_watch_lines[g_watch_count], kLineLen, shown);
+        g_watch_count++;
+        Unlock();
+        if (ps4_boot_trace) {
+            char traced[kLineLen + 16];
+            snprintf(traced, sizeof(traced), "output: %s", shown);
+            ps4_boot_trace(traced);
+        }
+    }
+    fclose(f);
+}
+
+// --- drawing into the off-screen frame ---------------------------------------------------------
+
+uint32_t* g_frame; // kWidth * kHeight
+
+void FillRect(int x, int y, int w, int h, uint32_t color) {
+    for (int row = y; row < y + h && row < kHeight; row++)
+        for (int col = x; col < x + w && col < kWidth; col++)
+            g_frame[row * kWidth + col] = color;
+}
+
+uint32_t Blend(uint32_t dst, uint32_t src, uint32_t alpha) {
+    uint32_t out = 0xFF000000u;
+    for (int shift = 0; shift < 24; shift += 8) {
+        const uint32_t d = (dst >> shift) & 0xFF, s = (src >> shift) & 0xFF;
+        out |= ((s * alpha + d * (255 - alpha)) / 255) << shift;
+    }
+    return out;
+}
+
+struct Font {
+    int height;
+    const StatusGlyph* glyphs;
+    const uint8_t* alpha;
+};
+constexpr Font kRegular{kStatusFontHeight, kStatusGlyphs, kStatusFontAlpha};
+constexpr Font kBold{kBoldFontHeight, kBoldGlyphs, kBoldFontAlpha};
+constexpr Font kTitleFont{kTitleFontHeight, kTitleGlyphs, kTitleFontAlpha};
+
+// Draws one line of text; returns the x after it. Stops at max_x.
+int DrawText(const Font& font, int x, int y, const char* text, uint32_t color, int max_x = kWidth - 40) {
+    for (; *text; text++) {
+        const int c = static_cast<unsigned char>(*text);
+        if (c < 32 || c > 126)
+            continue;
+        const StatusGlyph& g = font.glyphs[c - 32];
+        if (x + g.advance > max_x)
+            break;
+        const uint8_t* alpha = font.alpha + g.offset;
+        for (int row = 0; row < font.height; row++) {
+            const int py = y + row;
+            if (py < 0 || py >= kHeight)
+                continue;
+            for (int col = 0; col < g.width; col++) {
+                const int px = x + col;
+                const uint32_t a = alpha[row * g.width + col];
+                if (a && px >= 0 && px < kWidth)
+                    g_frame[py * kWidth + px] = Blend(g_frame[py * kWidth + px], color, a);
+            }
+        }
+        x += g.advance;
+    }
+    return x;
+}
+
+int DrawText(int x, int y, const char* text, uint32_t color, int max_x = kWidth - 40) {
+    return DrawText(kRegular, x, y, text, color, max_x);
+}
+
+int TextWidth(const Font& font, const char* text) {
+    int w = 0;
+    for (; *text; text++) {
+        const int c = static_cast<unsigned char>(*text);
+        if (c >= 32 && c <= 126)
+            w += font.glyphs[c - 32].advance;
+    }
+    return w;
+}
+
+double Elapsed() {
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return double(now.tv_sec - g_start.tv_sec) + double(now.tv_nsec - g_start.tv_nsec) / 1e9;
+}
+
+// --- launcher (start screen) ---------------------------------------------------------------------
+//
+// A games grid and a settings list over a background tinted with the selected game's colour.
+// Rounded, anti-aliased cards with soft shadows; the selection ring, scrolling and the tint
+// glide (the thread redraws at ~60 Hz while something moves, otherwise on changes only).
+
+constexpr int kMaxGames = 128, kMaxSettings = 24;
+constexpr int kCardSize = 160, kCardBig = 180; // icon sizes kept scaled per game (normal, selected)
+struct GameEntry {
+    char title[96];
+    char detail[128];
+    const uint32_t* icon;
+    uint32_t accent; // the icon's average colour (or the tile colour)
+    // Icon scaled (box filter) to kCardSize and kCardBig, made on first use.
+    uint32_t* small = nullptr;
+    uint32_t* big = nullptr;
+};
+GameEntry g_games[kMaxGames];
+int g_game_count = 0;
+struct SettingEntry {
+    char label[64];
+    char value[96];
+    char help[200];
+    char group[32];
+    int kind;
+};
+SettingEntry g_settings[kMaxSettings];
+int g_setting_count = 0;
+int g_tab = 0, g_game_sel = 0, g_setting_sel = 0, g_install_count = 0;
+char g_scope[kLineLen] = "All games";
+bool g_scope_switchable = false;
+bool g_has_pad = true;
+char g_setup[kLineLen] = "";
+char g_toast[kLineLen] = "";
+double g_toast_until = 0;
+std::atomic<bool> g_launcher_on{false};
+std::atomic<int> g_dirty{0};           // bumped on every change: the thread redraws at once
+std::atomic<bool> g_animating{false};  // something is still moving: keep redrawing
+
+constexpr uint32_t kCard = Rgb(30, 40, 66), kWhite = Rgb(255, 255, 255), kShadow = Rgb(0, 0, 0);
+constexpr uint32_t kCrossBlue = Rgb(124, 178, 232), kCircleRed = Rgb(255, 102, 102),
+                   kTriangleGreen = Rgb(64, 226, 160), kSquarePink = Rgb(255, 105, 248);
+
+uint8_t R(uint32_t c) { return uint8_t(c); }
+uint8_t G(uint32_t c) { return uint8_t(c >> 8); }
+uint8_t B(uint32_t c) { return uint8_t(c >> 16); }
+uint32_t Mix(uint32_t a, uint32_t b, float t) {
+    return Rgb(uint8_t(R(a) + (R(b) - R(a)) * t), uint8_t(G(a) + (G(b) - G(a)) * t), uint8_t(B(a) + (B(b) - B(a)) * t));
+}
+
+// Animated state (status thread only).
+struct Anim {
+    float ring_x = -1, ring_y = 0, ring_size = 0; // selection ring
+    float grid_scroll = 0, list_scroll = 0;       // pixels
+    float tint_r = 30, tint_g = 60, tint_b = 120; // background tint
+    float tab_x = -1, tab_w = 0;                  // tab underline
+    double last = 0;
+} g_anim;
+
+// Moves v toward target; true while it still moves.
+bool Approach(float& v, float target, float k) {
+    if (std::fabs(target - v) < 0.5f) {
+        v = target;
+        return false;
+    }
+    v += (target - v) * k;
+    return true;
+}
+
+// Background: a vertical gradient tinted with the selected game's colour near the top.
+void DrawBackground(uint32_t tint) {
+    for (int y = 0; y < kHeight; y++) {
+        const float t = float(y) / kHeight;
+        const uint32_t base = Rgb(uint8_t(16 - 9 * t), uint8_t(20 - 12 * t), uint8_t(34 - 20 * t));
+        const float glow = std::max(0.0f, 1.0f - t * 1.6f);
+        const uint32_t row = Mix(base, tint, glow * glow * 0.28f);
+        uint32_t* p = g_frame + size_t(y) * kWidth;
+        for (int x = 0; x < kWidth; x++)
+            p[x] = row;
+    }
+}
+
+void DrawBackground() {
+    DrawBackground(Rgb(uint8_t(g_anim.tint_r), uint8_t(g_anim.tint_g), uint8_t(g_anim.tint_b)));
+}
+
+// Repaints the background over rows [y0, y1): clips the scrolling grid/list under the header and
+// above the footer.
+void RepaintBackground(int y0, int y1) {
+    const uint32_t tint = Rgb(uint8_t(g_anim.tint_r), uint8_t(g_anim.tint_g), uint8_t(g_anim.tint_b));
+    for (int y = std::max(y0, 0); y < std::min(y1, kHeight); y++) {
+        const float t = float(y) / kHeight;
+        const uint32_t base = Rgb(uint8_t(16 - 9 * t), uint8_t(20 - 12 * t), uint8_t(34 - 20 * t));
+        const float glow = std::max(0.0f, 1.0f - t * 1.6f);
+        const uint32_t row = Mix(base, tint, glow * glow * 0.28f);
+        uint32_t* p = g_frame + size_t(y) * kWidth;
+        for (int x = 0; x < kWidth; x++)
+            p[x] = row;
+    }
+}
+
+void FillBlend(int x, int y, int w, int h, uint32_t color, uint32_t alpha) {
+    for (int row = y < 0 ? 0 : y; row < y + h && row < kHeight; row++)
+        for (int col = x < 0 ? 0 : x; col < x + w && col < kWidth; col++)
+            g_frame[row * kWidth + col] = Blend(g_frame[row * kWidth + col], color, alpha);
+}
+
+// Coverage (0..255) of pixel (px, py) inside a rounded rectangle; corners anti-aliased.
+inline uint32_t RoundCoverage(int px, int py, int x, int y, int w, int h, int r) {
+    const int cx = px < x + r ? x + r : (px >= x + w - r ? x + w - r - 1 : px);
+    const int cy = py < y + r ? y + r : (py >= y + h - r ? y + h - r - 1 : py);
+    if (cx == px || cy == py)
+        return 255;
+    const float dx = float(px - cx), dy = float(py - cy);
+    const float d = std::sqrt(dx * dx + dy * dy);
+    const float c = float(r) + 0.5f - d;
+    return c >= 1.0f ? 255 : c <= 0.0f ? 0 : uint32_t(c * 255.0f);
+}
+
+void RoundRect(int x, int y, int w, int h, int r, uint32_t color, uint32_t alpha = 255) {
+    for (int py = std::max(y, 0); py < std::min(y + h, kHeight); py++) {
+        uint32_t* row = g_frame + size_t(py) * kWidth;
+        const bool corner_row = py < y + r || py >= y + h - r;
+        for (int px = std::max(x, 0); px < std::min(x + w, kWidth); px++) {
+            uint32_t a = alpha;
+            if (corner_row && (px < x + r || px >= x + w - r))
+                a = a * RoundCoverage(px, py, x, y, w, h, r) / 255;
+            if (a == 255)
+                row[px] = color;
+            else if (a)
+                row[px] = Blend(row[px], color, a);
+        }
+    }
+}
+
+// A soft drop shadow under a rounded rectangle. The shape's alpha is worked out once per size
+// (four expanding rounded layers) and only pixels outside the rectangle itself are blended:
+// the card covers the rest - cheap enough to redraw a full grid at 60 Hz on the PS4's CPU.
+struct ShadowMask {
+    int w = 0, h = 0, r = 0;
+    std::vector<uint8_t> alpha; // (w + 2 * kPad) x (h + 2 * kPad + kDrop)
+};
+constexpr int kShadowPad = 12, kShadowDrop = 8;
+
+const ShadowMask& GetShadowMask(int w, int h, int r) {
+    static std::vector<ShadowMask> cache;
+    for (const ShadowMask& m : cache)
+        if (m.w == w && m.h == h && m.r == r)
+            return m;
+    ShadowMask m;
+    m.w = w, m.h = h, m.r = r;
+    const int mw = w + 2 * kShadowPad, mh = h + 2 * kShadowPad + kShadowDrop;
+    m.alpha.assign(size_t(mw) * mh, 0);
+    for (int i = 4; i >= 1; i--) {
+        const int lx = kShadowPad - i * 3, ly = kShadowPad - i * 3 + kShadowDrop, lw = w + i * 6, lh = h + i * 6, lr = r + i * 3;
+        for (int py = std::max(ly, 0); py < std::min(ly + lh, mh); py++)
+            for (int px = std::max(lx, 0); px < std::min(lx + lw, mw); px++) {
+                const uint32_t cover = 22 * RoundCoverage(px, py, lx, ly, lw, lh, lr) / 255;
+                uint8_t& a = m.alpha[size_t(py) * mw + px];
+                a = uint8_t(a + cover * (255 - a) / 255); // layers stack like blending black
+            }
+    }
+    cache.push_back(std::move(m));
+    return cache.back();
+}
+
+void Shadow(int x, int y, int w, int h, int r) {
+    const ShadowMask& m = GetShadowMask(w, h, r);
+    const int mw = w + 2 * kShadowPad, mh = h + 2 * kShadowPad + kShadowDrop;
+    const int ox = x - kShadowPad, oy = y - kShadowPad;
+    for (int my = 0; my < mh; my++) {
+        const int py = oy + my;
+        if (py < 0 || py >= kHeight)
+            continue;
+        const bool beside_only = py >= y + r && py < y + h - r; // rows where the card covers its width
+        uint32_t* row = g_frame + size_t(py) * kWidth;
+        const uint8_t* a = m.alpha.data() + size_t(my) * mw;
+        for (int mx = 0; mx < mw; mx++) {
+            const int px = ox + mx;
+            if (beside_only && px >= x && px < x + w) {
+                mx += w - 1; // skip what the card will cover
+                continue;
+            }
+            if (a[mx] && px >= 0 && px < kWidth)
+                row[px] = Blend(row[px], kShadow, a[mx]);
+        }
+    }
+}
+
+// Filled disc / ring and thick lines for the controller button symbols.
+void Disc(int cx, int cy, int r, uint32_t color) {
+    RoundRect(cx - r, cy - r, 2 * r + 1, 2 * r + 1, r, color);
+}
+void Ring(int cx, int cy, int r, int thick, uint32_t color) {
+    for (int y = -r; y <= r; y++)
+        for (int x = -r; x <= r; x++) {
+            const float d = std::sqrt(float(x * x + y * y));
+            const float c = std::min(float(r) + 0.5f - d, d - float(r - thick) + 0.5f);
+            if (c > 0 && cy + y >= 0 && cy + y < kHeight && cx + x >= 0 && cx + x < kWidth) {
+                uint32_t& p = g_frame[(cy + y) * kWidth + cx + x];
+                p = Blend(p, color, c >= 1 ? 255 : uint32_t(c * 255));
+            }
+        }
+}
+void Line(int x0, int y0, int x1, int y1, int thick, uint32_t color) {
+    const int steps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
+    for (int i = 0; i <= steps; i++) {
+        const int x = x0 + (x1 - x0) * i / (steps ? steps : 1), y = y0 + (y1 - y0) * i / (steps ? steps : 1);
+        Disc(x, y, thick / 2, color);
+    }
+}
+
+enum class Button { Cross, Circle, Triangle, Square };
+
+// A PS4 face button symbol in a dark disc; returns the x after it.
+int DrawButton(int x, int y, Button b) {
+    const int r = 20, cx = x + r, cy = y + r;
+    Disc(cx, cy, r, Rgb(10, 13, 24));
+    switch (b) {
+    case Button::Cross:
+        Line(cx - 8, cy - 8, cx + 8, cy + 8, 4, kCrossBlue);
+        Line(cx - 8, cy + 8, cx + 8, cy - 8, 4, kCrossBlue);
+        break;
+    case Button::Circle:
+        Ring(cx, cy, 11, 4, kCircleRed);
+        break;
+    case Button::Triangle:
+        Line(cx, cy - 10, cx - 10, cy + 7, 4, kTriangleGreen);
+        Line(cx, cy - 10, cx + 10, cy + 7, 4, kTriangleGreen);
+        Line(cx - 10, cy + 7, cx + 10, cy + 7, 4, kTriangleGreen);
+        break;
+    case Button::Square:
+        Line(cx - 8, cy - 8, cx + 8, cy - 8, 4, kSquarePink);
+        Line(cx + 8, cy - 8, cx + 8, cy + 8, 4, kSquarePink);
+        Line(cx + 8, cy + 8, cx - 8, cy + 8, 4, kSquarePink);
+        Line(cx - 8, cy + 8, cx - 8, cy - 8, 4, kSquarePink);
+        break;
+    }
+    return x + 2 * r + 10;
+}
+
+// A shoulder/menu button label (L1, R1) as a key cap; returns the x after it.
+// The logo and the app's name at the top left; returns where they end.
+int DrawBrand() {
+    constexpr int kLogoX = 80, kLogoY = 34;
+    for (int y = 0; y < kLogoSize; y++)
+        for (int x = 0; x < kLogoSize; x++) {
+            const uint32_t p = kLogoPixels[y * kLogoSize + x];
+            uint32_t& dst = g_frame[(kLogoY + y) * kWidth + kLogoX + x];
+            dst = Blend(dst, p, p >> 24);
+        }
+    const int name_x = kLogoX + kLogoSize + 20;
+    DrawText(kTitleFont, name_x, 28, "Switch Emu", kWhite);
+    const int x = name_x + TextWidth(kTitleFont, "Switch Emu") + 14;
+    DrawText(kBold, x, 56, "for PS4", kAccent);
+    return x + TextWidth(kBold, "for PS4");
+}
+
+int DrawPill(int x, int y, const char* label) {
+    const int w = TextWidth(kBold, label) + 24;
+    RoundRect(x, y, w, 40, 10, Rgb(10, 13, 24));
+    DrawText(kBold, x + 12, y + (40 - kBoldFontHeight) / 2, label, kText);
+    return x + w + 10;
+}
+
+int Hint(int x, int y, const char* text) {
+    return DrawText(kRegular, x, y + (40 - kStatusFontHeight) / 2, text, kText) + 40;
+}
+
+uint32_t TileColor(const char* title) {
+    static const uint32_t kColors[] = {Rgb(231, 76, 60), Rgb(52, 152, 219), Rgb(46, 204, 113), Rgb(155, 89, 182),
+                                       Rgb(241, 196, 15), Rgb(230, 126, 34), Rgb(26, 188, 156), Rgb(236, 64, 122)};
+    uint32_t h = 2166136261u;
+    for (; *title; title++)
+        h = (h ^ uint8_t(*title)) * 16777619u;
+    return kColors[h % (sizeof(kColors) / sizeof(kColors[0]))];
+}
+
+// Box-filtered downscale of a kLauncherIconSize icon to size x size.
+uint32_t* ScaleIcon(const uint32_t* icon, int size) {
+    auto* out = static_cast<uint32_t*>(malloc(size_t(size) * size * 4));
+    if (!out)
+        return nullptr;
+    for (int y = 0; y < size; y++) {
+        const int y0 = y * kLauncherIconSize / size, y1 = std::max(y0 + 1, (y + 1) * kLauncherIconSize / size);
+        for (int x = 0; x < size; x++) {
+            const int x0 = x * kLauncherIconSize / size, x1 = std::max(x0 + 1, (x + 1) * kLauncherIconSize / size);
+            uint32_t r = 0, g = 0, b = 0, n = 0;
+            for (int sy = y0; sy < y1; sy++)
+                for (int sx = x0; sx < x1; sx++) {
+                    const uint32_t p = icon[sy * kLauncherIconSize + sx];
+                    r += R(p), g += G(p), b += B(p), n++;
+                }
+            out[y * size + x] = Rgb(uint8_t(r / n), uint8_t(g / n), uint8_t(b / n));
+        }
+    }
+    return out;
+}
+
+uint32_t AverageColor(const uint32_t* icon) {
+    uint64_t r = 0, g = 0, b = 0;
+    for (int i = 0; i < kLauncherIconSize * kLauncherIconSize; i += 7)
+        r += R(icon[i]), g += G(icon[i]), b += B(icon[i]);
+    const uint64_t n = (kLauncherIconSize * kLauncherIconSize + 6) / 7;
+    return Rgb(uint8_t(r / n), uint8_t(g / n), uint8_t(b / n));
+}
+
+// Icon (or initials tile) with rounded corners.
+void DrawCardImage(GameEntry& g, int x, int y, int size) {
+    constexpr int kRadius = 18;
+    const uint32_t* pixels = nullptr;
+    if (g.icon) {
+        uint32_t*& cached = size >= kCardBig ? g.big : g.small;
+        if (!cached)
+            cached = ScaleIcon(g.icon, size >= kCardBig ? kCardBig : kCardSize);
+        pixels = cached;
+        size = size >= kCardBig ? kCardBig : kCardSize;
+    }
+    if (!pixels) {
+        RoundRect(x, y, size, size, kRadius, g.accent);
+        // A light sheen and the initials of the first two words.
+        for (int i = 0; i < size / 2; i++)
+            FillBlend(x + kRadius, y + i, size - 2 * kRadius, 1, kWhite, uint32_t(18 * (size / 2 - i) / (size / 2)));
+        char initials[3] = {0, 0, 0};
+        int n = 0;
+        bool word_start = true;
+        for (const char* p = g.title; *p && n < 2; p++) {
+            const bool alnum = (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9');
+            if (alnum && word_start)
+                initials[n++] = (*p >= 'a' && *p <= 'z') ? char(*p - 32) : *p;
+            word_start = !alnum;
+        }
+        const Font& f = size >= 280 ? kTitleFont : kBold;
+        DrawText(f, x + (size - TextWidth(f, initials)) / 2, y + (size - f.height) / 2, initials, kWhite, x + size);
+        return;
+    }
+    for (int row = 0; row < size; row++) {
+        const int py = y + row;
+        if (py < 0 || py >= kHeight)
+            continue;
+        const bool corner_row = row < kRadius || row >= size - kRadius;
+        uint32_t* dst = g_frame + size_t(py) * kWidth;
+        for (int col = 0; col < size; col++) {
+            const int px = x + col;
+            if (px < 0 || px >= kWidth)
+                continue;
+            const uint32_t c = pixels[row * size + col];
+            if (corner_row && (col < kRadius || col >= size - kRadius)) {
+                const uint32_t a = RoundCoverage(px, py, x, y, size, size, kRadius);
+                if (a)
+                    dst[px] = Blend(dst[px], c, a);
+            } else {
+                dst[px] = c;
+            }
+        }
+    }
+}
+
+// Kept for the loading screen: a card with a shadow, outlined when selected.
+void DrawCard(GameEntry& g, int x, int y, int size, bool selected) {
+    Shadow(x, y, size, size, 18);
+    if (selected)
+        RoundRect(x - 6, y - 6, size + 12, size + 12, 24, kWhite);
+    DrawCardImage(g, x, y, size);
+}
+void DrawCard(const GameEntry& g, int x, int y, int size, bool selected) {
+    GameEntry copy = g;
+    copy.small = copy.big = nullptr; // a temporary: don't cache into it
+    if (copy.icon && size != kCardSize && size != kCardBig) {
+        // Arbitrary size (loading screen): nearest-neighbour from the source icon.
+        Shadow(x, y, size, size, 22);
+        if (selected)
+            RoundRect(x - 6, y - 6, size + 12, size + 12, 28, kWhite);
+        for (int row = 0; row < size; row++)
+            for (int col = 0; col < size; col++) {
+                const int px = x + col, py = y + row;
+                if (px < 0 || px >= kWidth || py < 0 || py >= kHeight)
+                    continue;
+                const uint32_t a = RoundCoverage(px, py, x, y, size, size, 22);
+                const uint32_t c = copy.icon[(row * kLauncherIconSize / size) * kLauncherIconSize + col * kLauncherIconSize / size];
+                if (a)
+                    g_frame[py * kWidth + px] = Blend(g_frame[py * kWidth + px], c, a);
+            }
+        return;
+    }
+    DrawCard(copy, x, y, size, selected);
+    free(copy.small);
+    free(copy.big);
+}
+
+// Text shortened with "..." to fit max_w.
+void Ellipsize(const Font& f, char* text, size_t size, int max_w) {
+    if (TextWidth(f, text) <= max_w)
+        return;
+    size_t n = strlen(text);
+    while (n > 0) {
+        text[--n] = 0;
+        if (TextWidth(f, text) + TextWidth(f, "...") <= max_w)
+            break;
+    }
+    strncat(text, "...", size - strlen(text) - 1);
+}
+
+// An on/off switch, right-aligned at x_right.
+void Toggle(int x_right, int y, bool on, bool selected) {
+    constexpr int kW = 66, kH = 36;
+    const int x = x_right - kW;
+    RoundRect(x, y, kW, kH, kH / 2, on ? kAccent : Rgb(58, 66, 88));
+    Disc(on ? x + kW - kH / 2 : x + kH / 2, y + kH / 2, kH / 2 - 4, selected || on ? kWhite : Rgb(200, 205, 215));
+}
+
+void DrawToast(double now) {
+    char text[kLineLen];
+    CopyText(text, sizeof(text), g_toast);
+    if (!text[0] || now >= g_toast_until)
+        return;
+    const double left = g_toast_until - now;
+    const uint32_t alpha = left < 0.4 ? uint32_t(left / 0.4 * 230) : 230;
+    const int w = TextWidth(kBold, text) + 70, h = 60, x = (kWidth - w) / 2, y = 112;
+    if (alpha > 200)
+        Shadow(x, y, w, h, h / 2);
+    RoundRect(x, y, w, h, h / 2, Rgb(236, 240, 248), alpha);
+    DrawText(kBold, x + 35, y + (h - kBoldFontHeight) / 2, text, Rgb(14, 20, 34));
+}
+
+void DrawLauncher() {
+    const double now = Elapsed();
+    const float dt = g_anim.last > 0 ? float(std::min(now - g_anim.last, 0.1)) : 1.0f;
+    g_anim.last = now;
+    const float k = 1.0f - std::exp(-dt * 16.0f); // easing toward targets
+    bool moving = false;
+
+    Lock();
+    const int tab = g_tab, game_sel = g_game_sel, setting_sel = g_setting_sel, game_count = g_game_count,
+              setting_count = g_setting_count, install_count = g_install_count;
+    const bool has_pad = g_has_pad, scope_switchable = g_scope_switchable;
+    char scope[kLineLen], setup[kLineLen];
+    CopyText(scope, sizeof(scope), g_scope);
+    CopyText(setup, sizeof(setup), g_setup);
+    const uint32_t accent = game_count > 0 && tab == kLauncherGames ? g_games[game_sel].accent : kAccent;
+    Unlock();
+
+    // Background tint follows the selected game.
+    moving |= Approach(g_anim.tint_r, R(accent), k);
+    moving |= Approach(g_anim.tint_g, G(accent), k);
+    moving |= Approach(g_anim.tint_b, B(accent), k);
+    DrawBackground();
+
+    const auto draw_header = [&] {
+        const int brand_end = DrawBrand();
+        {
+            const char* tabs[] = {"Games", "Settings"};
+            int tx = std::max(470, brand_end + 48);
+            const int px = DrawPill(tx, 48, "L1");
+            tx = px + 6;
+            int xs[2], ws[2];
+            const int seg_x = tx, seg_y = 44, seg_h = 48;
+            int total = 0;
+            for (int i = 0; i < 2; i++)
+                ws[i] = TextWidth(kBold, tabs[i]) + 48, total += ws[i];
+            RoundRect(seg_x, seg_y, total + 8, seg_h, seg_h / 2, Rgb(10, 13, 24), 200);
+            int cx = seg_x + 4;
+            for (int i = 0; i < 2; i++)
+                xs[i] = cx, cx += ws[i];
+            if (g_anim.tab_x < 0)
+                g_anim.tab_x = float(xs[tab]), g_anim.tab_w = float(ws[tab]);
+            moving |= Approach(g_anim.tab_x, float(xs[tab]), k);
+            moving |= Approach(g_anim.tab_w, float(ws[tab]), k);
+            RoundRect(int(g_anim.tab_x), seg_y + 4, int(g_anim.tab_w), seg_h - 8, (seg_h - 8) / 2, Rgb(236, 240, 248));
+            for (int i = 0; i < 2; i++)
+                DrawText(kBold, xs[i] + 24, seg_y + (seg_h - kBoldFontHeight) / 2, tabs[i], i == tab ? Rgb(14, 20, 34) : kText);
+            DrawPill(seg_x + total + 18, 48, "R1");
+        }
+        const time_t clock_now = time(nullptr);
+        if (const tm* local = localtime(&clock_now)) {
+            char clock_text[16];
+            snprintf(clock_text, sizeof(clock_text), "%d:%02d", local->tm_hour, local->tm_min);
+            DrawText(kBold, kWidth - 80 - TextWidth(kBold, clock_text), 54, clock_text, kText);
+        }
+    };
+    if (tab == kLauncherGames) {
+        if (game_count == 0) {
+            DrawText(kTitleFont, 100, 340, "No games yet", kWhite);
+            DrawText(100, 450, "Copy games (.nsp, .xci) or homebrew (.nro) to /data/switch-emu/games over FTP,", kText);
+            DrawText(100, 492, "then restart the app. Keys go in /data/switch-emu/keys, firmware in", kText);
+            DrawText(100, 534, "/data/switch-emu/nand/system/Contents/registered.", kText);
+        } else {
+            constexpr int kCols = kLauncherColumns, kGapX = 62, kTitleH = 44, kGapY = 24, kTop = 140, kRows = 3,
+                          kRowH = kCardSize + kTitleH + kGapY, kLeft = 100;
+            const int rows = (game_count + kCols - 1) / kCols;
+            const int sel_row = game_sel / kCols, sel_col = game_sel % kCols;
+            const int first_row = rows <= kRows ? 0 : std::clamp(sel_row - 1, 0, rows - kRows);
+            moving |= Approach(g_anim.grid_scroll, float(first_row * kRowH), k);
+            const int scroll = int(g_anim.grid_scroll);
+            // Selection ring target.
+            const float ring_x = float(kLeft + sel_col * (kCardSize + kGapX) - (kCardBig - kCardSize) / 2);
+            const float ring_y = float(kTop + sel_row * kRowH - (kCardBig - kCardSize) / 2);
+            if (g_anim.ring_x < 0)
+                g_anim.ring_x = ring_x, g_anim.ring_y = ring_y;
+            moving |= Approach(g_anim.ring_x, ring_x, k);
+            moving |= Approach(g_anim.ring_y, ring_y, k);
+            const int clip_top = kTop - 24, clip_bottom = kTop + kRows * kRowH - 10;
+            Lock();
+            for (int i = 0; i < game_count; i++) {
+                const int r = i / kCols, c = i % kCols;
+                const int x = kLeft + c * (kCardSize + kGapX), y = kTop + r * kRowH - scroll;
+                if (y + kCardSize + kTitleH < clip_top || y > clip_bottom)
+                    continue;
+                const bool sel = i == game_sel;
+                if (sel)
+                    continue; // drawn last, larger, on top
+                Shadow(x, y, kCardSize, kCardSize, 18);
+                DrawCardImage(g_games[i], x, y, kCardSize);
+                char title[96];
+                CopyText(title, sizeof(title), g_games[i].title);
+                Ellipsize(kRegular, title, sizeof(title), kCardSize + kGapX - 14);
+                DrawText(kRegular, x, y + kCardSize + 12, title, kDim, x + kCardSize + kGapX);
+            }
+            // The selected card: larger, with a ring that glides to it.
+            GameEntry& g = g_games[game_sel];
+            const int sx = int(g_anim.ring_x), sy = int(g_anim.ring_y) - scroll;
+            Shadow(sx, sy, kCardBig, kCardBig, 22);
+            RoundRect(sx - 7, sy - 7, kCardBig + 14, kCardBig + 14, 28, kWhite);
+            RoundRect(sx - 3, sy - 3, kCardBig + 6, kCardBig + 6, 24, Rgb(14, 20, 34));
+            DrawCardImage(g, sx, sy, kCardBig);
+            char title[96];
+            CopyText(title, sizeof(title), g.title);
+            Ellipsize(kBold, title, sizeof(title), kCardBig + kGapX / 2 - 8);
+            DrawText(kBold, sx, sy + kCardBig + 10, title, kWhite, sx + kCardBig + kGapX);
+            char detail[128];
+            CopyText(detail, sizeof(detail), g.detail);
+            char full_title[96];
+            CopyText(full_title, sizeof(full_title), g.title);
+            Unlock();
+            // Clip what scrolled past the grid's top and bottom.
+            RepaintBackground(0, kTop - 22);
+            RepaintBackground(clip_bottom + 8, 850);
+            if (first_row > 0)
+                DrawText(kBold, kWidth - 64, kTop + 60, "^", kDim);
+            if (first_row + kRows < rows)
+                DrawText(kBold, kWidth - 64, kTop + (kRows - 1) * kRowH + 80, "v", kDim);
+            // Info bar: the selected game's full title and details.
+            RoundRect(80, 850, kWidth - 160, 64, 20, Rgb(10, 13, 24), 150);
+            DrawText(kBold, 108, 850 + (64 - kBoldFontHeight) / 2, full_title, kWhite, kWidth / 2);
+            DrawText(kRegular, 108 + TextWidth(kBold, full_title) + 26, 850 + (64 - kStatusFontHeight) / 2, detail, kDim,
+                     kWidth - 260);
+            char count_text[48];
+            snprintf(count_text, sizeof(count_text), "%d of %d", game_sel + 1, game_count);
+            DrawText(kWidth - 108 - TextWidth(kRegular, count_text), 850 + (64 - kStatusFontHeight) / 2, count_text,
+                     kDim);
+        }
+        int hx = 100;
+        const int hy = 936;
+        if (game_count > 0) {
+            hx = DrawButton(hx, hy, Button::Cross);
+            hx = Hint(hx, hy, "Play");
+            hx = DrawButton(hx, hy, Button::Square);
+            hx = Hint(hx, hy, "Game settings");
+        }
+        if (install_count > 0) {
+            hx = DrawButton(hx, hy, Button::Triangle);
+            char text[64];
+            snprintf(text, sizeof(text), "Install %d update/DLC file%s", install_count, install_count == 1 ? "" : "s");
+            hx = Hint(hx, hy, text);
+        }
+        hx = DrawPill(hx, hy, "R1");
+        Hint(hx, hy, "Settings");
+    } else {
+        // Settings: grouped rows on the left, the selected row's help on the right.
+        constexpr int kRowH = 56, kGroupH = 50, kListX = 100, kListW = 1000, kTop = 236, kBottom = 892;
+        // Scope chip.
+        DrawText(kRegular, kListX, 132, "Settings for", kDim);
+        {
+            const int cx = kListX + TextWidth(kRegular, "Settings for") + 16;
+            const int w = TextWidth(kBold, scope) + 36;
+            RoundRect(cx, 124, w, 46, 23, Rgb(236, 240, 248));
+            DrawText(kBold, cx + 18, 124 + (46 - kBoldFontHeight) / 2, scope, Rgb(14, 20, 34));
+        }
+        // Layout: y of each row (with group headings) in list space.
+        int ys[kMaxSettings], total = 0;
+        char last_group[32] = "";
+        Lock();
+        for (int i = 0; i < setting_count; i++) {
+            if (g_settings[i].group[0] && strcmp(g_settings[i].group, last_group) != 0) {
+                total += kGroupH;
+                memcpy(last_group, g_settings[i].group, sizeof(last_group));
+            }
+            ys[i] = total;
+            total += kRowH;
+        }
+        const int view = kBottom - kTop;
+        const int target = setting_count == 0 ? 0
+                                               : std::clamp(ys[setting_sel] - view / 2 + kRowH, 0, std::max(0, total - view));
+        moving |= Approach(g_anim.list_scroll, float(target), k);
+        const int scroll = int(g_anim.list_scroll);
+        last_group[0] = 0;
+        for (int i = 0; i < setting_count; i++) {
+            const SettingEntry& e = g_settings[i];
+            const int y = kTop + ys[i] - scroll;
+            if (e.group[0] && strcmp(e.group, last_group) != 0) {
+                memcpy(last_group, e.group, sizeof(last_group));
+                const int gy = y - kGroupH + 14;
+                if (gy > kTop - 30 && gy < kBottom)
+                    DrawText(kBold, kListX + 4, gy, e.group, kAccent);
+            }
+            if (y < kTop - 10 || y + kRowH > kBottom + 10)
+                continue;
+            const bool sel = i == setting_sel;
+            if (sel)
+                RoundRect(kListX - 10, y, kListW + 20, kRowH - 6, 16, Rgb(236, 240, 248), 34);
+            if (sel)
+                RoundRect(kListX - 10, y + 10, 6, kRowH - 26, 3, kAccent);
+            DrawText(kRegular, kListX + 22, y + (kRowH - 6 - kStatusFontHeight) / 2, e.label, sel ? kWhite : kText);
+            const int vr = kListX + kListW - 20;
+            if (e.kind == kSettingToggle) {
+                Toggle(vr, y + (kRowH - 6 - 36) / 2, strcmp(e.value, "On") == 0, sel);
+            } else {
+                char value[110];
+                if (e.kind == kSettingChoice)
+                    snprintf(value, sizeof(value), "<   %s   >", e.value);
+                else
+                    snprintf(value, sizeof(value), "%s", e.value);
+                DrawText(kBold, vr - TextWidth(kBold, value), y + (kRowH - 6 - kBoldFontHeight) / 2, value,
+                         sel ? kWhite : (e.kind == kSettingAction ? kAccent : Rgb(170, 200, 240)));
+            }
+        }
+        SettingEntry selected{};
+        if (setting_sel >= 0 && setting_sel < setting_count)
+            selected = g_settings[setting_sel];
+        Unlock();
+        // Clip what scrolled past the list's top and bottom, then the scope chip again.
+        RepaintBackground(0, kTop - 6);
+        RepaintBackground(kBottom, kHeight);
+        DrawText(kRegular, kListX, 132, "Settings for", kDim);
+        {
+            const int cx = kListX + TextWidth(kRegular, "Settings for") + 16;
+            const int w = TextWidth(kBold, scope) + 36;
+            RoundRect(cx, 124, w, 46, 23, Rgb(236, 240, 248));
+            DrawText(kBold, cx + 18, 124 + (46 - kBoldFontHeight) / 2, scope, Rgb(14, 20, 34));
+        }
+        // Help card.
+        const int px = 1180, pw = kWidth - px - 80, py = kTop;
+        Shadow(px, py, pw, 330, 24);
+        RoundRect(px, py, pw, 330, 24, kCard);
+        if (selected.group[0])
+            DrawText(kRegular, px + 32, py + 26, selected.group, kAccent);
+        DrawText(kBold, px + 32, py + 26 + kStatusFontHeight + 4, selected.label, kWhite, px + pw - 20);
+        int y = py + 26 + kStatusFontHeight + kBoldFontHeight + 24;
+        const char* p = selected.help;
+        char line[kLineLen];
+        while (*p && y < py + 310) {
+            int len = 0, last_space = -1;
+            while (p[len] && len < kLineLen - 1) {
+                line[len] = p[len];
+                line[len + 1] = 0;
+                if (TextWidth(kRegular, line) > pw - 64)
+                    break;
+                if (p[len] == ' ')
+                    last_space = len;
+                len++;
+            }
+            if (p[len] && last_space > 0)
+                len = last_space + 1;
+            memcpy(line, p, size_t(len));
+            line[len] = 0;
+            DrawText(px + 32, y, line, kText, px + pw - 20);
+            y += kStatusFontHeight + 4;
+            p += len;
+        }
+        int hx = 100;
+        const int hy = 936;
+        hx = DrawButton(hx, hy, Button::Cross);
+        hx = Hint(hx, hy, "Change");
+        if (scope_switchable) {
+            hx = DrawButton(hx, hy, Button::Square);
+            hx = Hint(hx, hy, "All games / this game");
+        }
+        hx = DrawButton(hx, hy, Button::Circle);
+        hx = Hint(hx, hy, "Back");
+        hx = DrawPill(hx, hy, "L1");
+        Hint(hx, hy, "Games");
+    }
+
+    draw_header();
+    DrawToast(now);
+    moving |= g_toast[0] && now < g_toast_until;
+
+    // Footer.
+    DrawText(100, kHeight - 66, setup, kDim, kWidth / 2 + 300);
+    const char* right = has_pad ? "Close the app with the PS button" : "Connect a controller";
+    DrawText(kWidth - 80 - TextWidth(kRegular, right), kHeight - 66, right, has_pad ? kDim : kBad);
+    g_animating = moving;
+}
+
+// Loading screen (drawn into the Vulkan swap chain's first image until the game's first frame).
+char g_loading_title[96] = "";
+const uint32_t* g_loading_icon = nullptr;
+
+void DrawLoading(const char* progress) {
+    GameEntry g{};
+    CopyText(g.title, sizeof(g.title), g_loading_title[0] ? g_loading_title : "Starting");
+    g.icon = g_loading_icon;
+    const uint32_t accent = g.icon ? AverageColor(g.icon) : TileColor(g.title);
+    DrawBackground(accent);
+    DrawBrand();
+    constexpr int kIcon = 360, kX = 140, kY = 300;
+    g.accent = accent;
+    DrawCard(static_cast<const GameEntry&>(g), kX, kY, kIcon, false);
+    const int tx = kX + kIcon + 90;
+    DrawText(kTitleFont, tx, kY + 24, g.title, kWhite, kWidth - 80);
+    DrawText(kBold, tx, kY + 24 + kTitleFontHeight + 18, progress, kText, kWidth - 80);
+    // Progress bar: "... <done> of <total>" in the text gives the fill; otherwise a moving segment.
+    const int bx = tx, by = kY + 24 + kTitleFontHeight + 18 + kBoldFontHeight + 22, bw = kWidth - 120 - tx, bh = 12;
+    RoundRect(bx, by, bw, bh, bh / 2, Rgb(255, 255, 255), 36);
+    int done = 0, total = 0;
+    const char* of = strstr(progress, " of ");
+    if (of) {
+        const char* p = of;
+        while (p > progress && p[-1] >= '0' && p[-1] <= '9')
+            p--;
+        done = atoi(p);
+        total = atoi(of + 4);
+    }
+    if (total > 0) {
+        const int fill = std::max(bh, int(int64_t(bw) * std::min(done, total) / total));
+        RoundRect(bx, by, fill, bh, bh / 2, kAccent);
+    } else {
+        static int step = 0;
+        step++;
+        const int seg = bw / 4, x = bx + (step * 37) % (bw + seg) - seg;
+        const int x0 = std::max(x, bx), x1 = std::min(x + seg, bx + bw);
+        if (x1 > x0)
+            RoundRect(x0, by, x1 - x0, bh, bh / 2, kAccent);
+    }
+    DrawText(tx, by + 46, "The first start of a game builds its shaders and can take a minute or two.", kDim,
+             kWidth - 80);
+    DrawText(tx, by + 46 + kStatusFontHeight + 6, "Later starts load them from the shader cache and are faster.",
+             kDim, kWidth - 80);
+}
+
+// In-game Home menu (yuzu_cmd): drawn over a darkened copy of the game's last frame.
+uint32_t* g_pause_bg = nullptr;
+
+void DrawPause(const Ps4HomeMenu& m) {
+    if (g_pause_bg)
+        memcpy(g_frame, g_pause_bg, kFrameBytes);
+    else
+        DrawBackground();
+    constexpr int kW = 820, kH = 610;
+    const int x = (kWidth - kW) / 2, y = (kHeight - kH) / 2;
+    Shadow(x, y, kW, kH, 32);
+    RoundRect(x, y, kW, kH, 32, kCard, 245);
+    DrawText(kTitleFont, x + 50, y + 34, m.title ? m.title : "Paused", kWhite, x + kW - 40);
+    DrawText(x + 50, y + 34 + kTitleFontHeight + 4, m.stats ? m.stats : "", kDim, x + kW - 40);
+    const int list_y = y + 34 + kTitleFontHeight + kStatusFontHeight + 36;
+    for (int i = 0; i < m.count; i++) {
+        const int ry = list_y + i * 72;
+        const bool sel = i == m.selected;
+        if (sel)
+            RoundRect(x + 30, ry, kW - 60, 60, 18, Rgb(236, 240, 248));
+        DrawText(kBold, x + 60, ry + (60 - kBoldFontHeight) / 2, m.items[i], sel ? Rgb(14, 20, 34) : kText, x + kW - 40);
+    }
+    int hx = x + 50;
+    const int hy = y + kH - 74;
+    hx = DrawButton(hx, hy, Button::Cross);
+    hx = Hint(hx, hy, "Select");
+    hx = DrawButton(hx, hy, Button::Circle);
+    Hint(hx, hy, "Resume");
+}
+
+void DrawFrame(int tick) {
+    if (g_launcher_on) {
+        DrawLauncher();
+        return;
+    }
+    const int line_h = kStatusFontHeight + 2;
+    FillRect(0, 0, kWidth, kHeight, kBackground);
+    FillRect(0, 0, kWidth, 6, kAccent);
+
+    char stage[kLineLen], title[64];
+    Lock();
+    CopyText(stage, sizeof(stage), g_stage);
+    CopyText(title, sizeof(title), g_title);
+    Unlock();
+
+    // Header: title, stage with a spinner, elapsed time.
+    DrawText(60, 40, title, kAccent);
+    static const char* const kSpinner[] = {"|", "/", "-", "\\"};
+    const double t = Elapsed();
+    char header[256];
+    snprintf(header, sizeof(header), "%s  %s", g_crashed ? "!" : kSpinner[tick % 4], stage);
+    DrawText(60, 40 + line_h + 8, header, g_crashed ? kBad : kText);
+    char clock_text[48];
+    snprintf(clock_text, sizeof(clock_text), "running %d:%02d", int(t) / 60, int(t) % 60);
+    DrawText(kWidth - 320, 40, clock_text, kDim);
+
+    // Watched file (e.g. benchmark results) on the right.
+    const int panel_x = 1120, panel_y = 170, panel_w = kWidth - panel_x - 60, panel_h = kHeight - panel_y - 110;
+    FillRect(panel_x, panel_y, panel_w, panel_h, kPanel);
+    char path[256], heading[64];
+    Lock();
+    CopyText(path, sizeof(path), g_watch_path);
+    CopyText(heading, sizeof(heading), g_watch_heading);
+    Unlock();
+    int y = panel_y + 20;
+    DrawText(panel_x + 24, y, heading[0] ? heading : "Output", kAccent, panel_x + panel_w - 20);
+    y += line_h + 10;
+    PollWatchedFile(path);
+    if (g_watch_count == 0)
+        DrawText(panel_x + 24, y, "(nothing yet)", kDim, panel_x + panel_w - 20);
+    for (int i = 0; i < g_watch_count && i < kWatchLines && y < panel_y + panel_h - line_h; i++) {
+        const char* text = g_watch_lines[i];
+        const uint32_t color = strncmp(text, "done", 4) == 0   ? kGood
+                               : strncmp(text, "end ", 4) == 0 ? kText
+                                                               : kDim;
+        DrawText(panel_x + 24, y, text, color, panel_x + panel_w - 20);
+        y += line_h;
+    }
+
+    // Menu on the left (instead of the log) while one is shown.
+    Lock();
+    const int menu_count = g_menu_count;
+    char menu[kMenuLines][kLineLen];
+    memcpy(menu, g_menu, sizeof(menu));
+    Unlock();
+    if (menu_count > 0) {
+        for (int i = 0; i < menu_count; i++) {
+            const bool selected = strncmp(menu[i], "> ", 2) == 0;
+            if (selected)
+                FillRect(48, 170 + i * line_h - 2, panel_x - 90, line_h, kPanel);
+            DrawText(60, 170 + i * line_h, menu[i], selected ? kAccent : (menu[i][0] == ' ' ? kDim : kText),
+                     panel_x - 30);
+        }
+        DrawText(60, kHeight - 70, "D-pad: choose   Cross: change / start   Results: /data/switch-emu/logs/bench-results.txt",
+                 kDim);
+        return;
+    }
+
+    // Recent trace lines on the left, newest at the bottom.
+    const int log_top = 170, log_bottom = kHeight - 110;
+    const int visible = (log_bottom - log_top) / line_h;
+    Lock();
+    const int count = g_line_count < kLines ? g_line_count : kLines;
+    const int first = count > visible ? count - visible : 0;
+    char lines[kLines][kLineLen];
+    for (int i = first; i < count; i++) {
+        const int index = (g_line_count - count + i) % kLines;
+        memcpy(lines[i - first], g_lines[index], kLineLen);
+    }
+    Unlock();
+    for (int i = 0; i < count - first; i++)
+        DrawText(60, log_top + i * line_h, lines[i], kDim, panel_x - 30);
+
+    // Footer.
+    DrawText(60, kHeight - 70,
+             g_crashed ? "The emulator crashed - crash.log is in /data/switch-emu/logs/"
+                       : "Logs: /data/switch-emu/logs/boot-trace.log   Close the app with the PS button.",
+             g_crashed ? kBad : kDim);
+}
+
+// --- VideoOut ----------------------------------------------------------------------------------
+
+void* ThreadMain(void*) {
+    const int32_t handle = sceVideoOutOpen(kUserIdSystem, kBusMain, 0, nullptr);
+    if (handle < 0) {
+        fprintf(stderr, "[status] sceVideoOutOpen failed: %#x\n", unsigned(handle));
+        g_running = false;
+        g_ready = true;
+        return nullptr;
+    }
+    off_t phys = 0;
+    void* mapped = nullptr;
+    const size_t size = kFrameAligned * kBuffers;
+    if (sceKernelAllocateDirectMemory(0, off_t(sceKernelGetDirectMemorySize()), size, 2u << 20, kWcGarlic, &phys) != 0 ||
+        sceKernelMapDirectMemory(&mapped, size, kProtCpuGpuRw, 0, phys, 2u << 20) != 0) {
+        fprintf(stderr, "[status] framebuffer allocation failed\n");
+        sceVideoOutClose(handle);
+        g_running = false;
+        g_ready = true;
+        return nullptr;
+    }
+    void* buffers[kBuffers];
+    for (int i = 0; i < kBuffers; i++)
+        buffers[i] = static_cast<char*>(mapped) + kFrameAligned * i;
+    BufferAttribute attr{};
+    attr.format = int32_t(0x80002200); // A8B8G8R8_SRGB
+    attr.tmode = 1;                    // linear
+    attr.aspect = 0;                   // 16:9
+    attr.width = kWidth;
+    attr.height = kHeight;
+    attr.pixel_pitch = kWidth;
+    const int32_t set = sceVideoOutRegisterBuffers(handle, 0, buffers, kBuffers, &attr);
+    sceVideoOutSetFlipRate(handle, 0);
+    g_ready = true;
+
+    g_frame = static_cast<uint32_t*>(malloc(kFrameBytes));
+    int current = 0;
+    for (int tick = 0; !g_stop && g_frame; tick++) {
+        DrawFrame(tick);
+        while (sceVideoOutIsFlipPending(handle) > 0)
+            usleep(1000);
+        memcpy(buffers[current], g_frame, kFrameBytes);
+        sceVideoOutSubmitFlip(handle, current, kFlipVsync, tick);
+        current = (current + 1) % kBuffers;
+        // A few frames a second, or at once when the launcher changed (button presses).
+        if (g_launcher_on && g_animating) {
+            usleep(16 * 1000); // something moves: ~60 Hz
+            continue;
+        }
+        const int seen = g_dirty.load();
+        for (int waited = 0; waited < 250 && g_dirty.load() == seen && !g_stop; waited += 8)
+            usleep(8 * 1000);
+    }
+
+    while (sceVideoOutIsFlipPending(handle) > 0)
+        usleep(1000);
+    if (set >= 0)
+        sceVideoOutUnregisterBuffers(handle, set);
+    sceVideoOutClose(handle);
+    sceKernelMunmap(mapped, size);
+    sceKernelReleaseDirectMemory(phys, size);
+    free(g_frame);
+    g_frame = nullptr;
+    return nullptr;
+}
+
+} // namespace
+
+extern "C" {
+
+void ps4_status_push(const char* line) {
+    Lock();
+    CopyText(g_lines[g_line_count % kLines], kLineLen, line);
+    g_line_count++;
+    Unlock();
+}
+
+void ps4_status_set_stage(const char* stage) {
+    Lock();
+    CopyText(g_stage, sizeof(g_stage), stage);
+    Unlock();
+}
+
+// Shows the given file's lines on the right (re-read as it grows). Switching files starts over.
+void ps4_status_watch_file(const char* path, const char* heading) {
+    Lock();
+    CopyText(g_watch_path, sizeof(g_watch_path), path);
+    CopyText(g_watch_heading, sizeof(g_watch_heading), heading);
+    g_watch_count = 0;
+    g_begin_name[0] = 0;
+    Unlock();
+}
+
+// Shows (count > 0) or hides (count == 0) the menu.
+void ps4_status_set_menu(const char* const* lines, int count) {
+    Lock();
+    g_menu_count = count < kMenuLines ? count : kMenuLines;
+    for (int i = 0; i < g_menu_count; i++)
+        CopyText(g_menu[i], kLineLen, lines[i]);
+    Unlock();
+}
+
+// Copies the watched file's lines as shown (with real-time annotations), newline separated.
+int ps4_status_copy_watch(char* out, int size) {
+    int used = 0;
+    Lock();
+    for (int i = 0; i < g_watch_count && i < kWatchLines && used + kLineLen + 2 < size; i++)
+        used += snprintf(out + used, size - used, "%s\n", g_watch_lines[i]);
+    Unlock();
+    if (size > 0)
+        out[used < size ? used : size - 1] = 0;
+    return used;
+}
+
+void ps4_launcher_set_games(const Ps4LauncherGame* games, int count) {
+    Lock();
+    for (int i = 0; i < g_game_count; i++) { // scaled icons of the previous list
+        free(g_games[i].small);
+        free(g_games[i].big);
+        g_games[i].small = g_games[i].big = nullptr;
+    }
+    g_game_count = count < kMaxGames ? count : kMaxGames;
+    for (int i = 0; i < g_game_count; i++) {
+        CopyText(g_games[i].title, sizeof(g_games[i].title), games[i].title);
+        CopyText(g_games[i].detail, sizeof(g_games[i].detail), games[i].detail);
+        g_games[i].icon = games[i].icon;
+        g_games[i].accent = games[i].icon ? AverageColor(games[i].icon) : TileColor(g_games[i].title);
+    }
+    Unlock();
+    g_dirty++;
+}
+
+void ps4_launcher_set_settings(const Ps4LauncherSetting* settings, int count) {
+    SettingEntry fresh[kMaxSettings]{};
+    const int n = count < kMaxSettings ? count : kMaxSettings;
+    for (int i = 0; i < n; i++) {
+        CopyText(fresh[i].label, sizeof(fresh[i].label), settings[i].label);
+        CopyText(fresh[i].value, sizeof(fresh[i].value), settings[i].value);
+        CopyText(fresh[i].help, sizeof(fresh[i].help), settings[i].help);
+        CopyText(fresh[i].group, sizeof(fresh[i].group), settings[i].group);
+        fresh[i].kind = settings[i].kind;
+    }
+    Lock();
+    // The menu sends these on every poll: only a change needs a redraw.
+    const bool changed = n != g_setting_count || memcmp(fresh, g_settings, sizeof(SettingEntry) * size_t(n)) != 0;
+    if (changed) {
+        g_setting_count = n;
+        memcpy(g_settings, fresh, sizeof(SettingEntry) * size_t(n));
+    }
+    Unlock();
+    if (changed)
+        g_dirty++;
+}
+
+void ps4_launcher_set_state(int tab, int game, int setting) {
+    Lock();
+    const bool changed = tab != g_tab || game != g_game_sel || setting != g_setting_sel;
+    g_tab = tab;
+    g_game_sel = game;
+    g_setting_sel = setting;
+    Unlock();
+    if (changed)
+        g_dirty++;
+}
+
+void ps4_launcher_set_info(const char* setup, int install_count, bool has_pad) {
+    char text[kLineLen];
+    CopyText(text, sizeof(text), setup);
+    Lock();
+    const bool changed = strcmp(text, g_setup) != 0 || install_count != g_install_count || has_pad != g_has_pad;
+    memcpy(g_setup, text, sizeof(g_setup));
+    g_install_count = install_count;
+    g_has_pad = has_pad;
+    Unlock();
+    if (changed)
+        g_dirty++;
+}
+
+void ps4_launcher_set_scope(const char* text, bool switchable) {
+    char fresh[kLineLen];
+    CopyText(fresh, sizeof(fresh), text);
+    Lock();
+    const bool changed = strcmp(fresh, g_scope) != 0 || switchable != g_scope_switchable;
+    memcpy(g_scope, fresh, sizeof(g_scope));
+    g_scope_switchable = switchable;
+    Unlock();
+    if (changed)
+        g_dirty++;
+}
+
+void ps4_launcher_toast(const char* text) {
+    Lock();
+    CopyText(g_toast, sizeof(g_toast), text);
+    g_toast_until = Elapsed() + 2.5;
+    Unlock();
+    g_dirty++;
+}
+
+void ps4_launcher_show(bool on) {
+    g_launcher_on = on;
+    g_dirty++;
+}
+
+const char* ps4_launcher_loading_title() {
+    return g_loading_title;
+}
+
+void ps4_launcher_set_loading(const char* title, const uint32_t* icon) {
+    CopyText(g_loading_title, sizeof(g_loading_title), title);
+    g_loading_icon = icon;
+}
+
+// Draws the loading screen into dst (1920x1080, pitch in pixels). Called from the Vulkan swap
+// chain's thread while the status thread is stopped.
+void ps4_status_render_loading(uint32_t* dst, int pitch, const char* progress) {
+    static uint32_t* frame = nullptr;
+    if (!frame)
+        frame = static_cast<uint32_t*>(malloc(kFrameBytes));
+    if (!frame || !dst)
+        return;
+    uint32_t* const saved = g_frame;
+    g_frame = frame;
+    DrawLoading(progress ? progress : "");
+    g_frame = saved;
+    for (int y = 0; y < kHeight; y++)
+        memcpy(dst + size_t(y) * size_t(pitch), frame + size_t(y) * kWidth, size_t(kWidth) * 4);
+}
+
+// Home menu: keeps a darkened copy of src (the game's frame; read once - GPU memory is slow to
+// read from the CPU) when capture is set, then draws the menu into dst.
+void ps4_status_draw_home(uint32_t* dst, const uint32_t* src, int pitch, const Ps4HomeMenu* menu, bool capture) {
+    static uint32_t* frame = nullptr;
+    if (!frame)
+        frame = static_cast<uint32_t*>(malloc(kFrameBytes));
+    if (!g_pause_bg)
+        g_pause_bg = static_cast<uint32_t*>(malloc(kFrameBytes));
+    if (!frame || !dst || !menu)
+        return;
+    if (capture && src && g_pause_bg) {
+        for (int y = 0; y < kHeight; y++) {
+            const uint32_t* row = src + size_t(y) * size_t(pitch);
+            uint32_t* out = g_pause_bg + size_t(y) * kWidth;
+            memcpy(out, row, size_t(kWidth) * 4);
+            for (int x = 0; x < kWidth; x++) // darken to ~35%
+                out[x] = 0xFF000000u | ((out[x] >> 2) & 0x003F3F3Fu) | ((out[x] >> 3) & 0x001F1F1Fu);
+        }
+    }
+    uint32_t* const saved = g_frame;
+    g_frame = frame;
+    DrawPause(*menu);
+    g_frame = saved;
+    for (int y = 0; y < kHeight; y++)
+        memcpy(dst + size_t(y) * size_t(pitch), frame + size_t(y) * kWidth, size_t(kWidth) * 4);
+}
+
+// Performance overlay: rendered into a w x h panel (top-left of a scratch frame, then copied out).
+void ps4_status_render_overlay(uint32_t* dst, int w, int h, const Ps4OverlayStats* st) {
+    static uint32_t* frame = nullptr;
+    if (!frame)
+        frame = static_cast<uint32_t*>(malloc(kFrameBytes));
+    if (!frame || !dst || !st || w > kWidth || h > kHeight)
+        return;
+    uint32_t* const saved = g_frame;
+    g_frame = frame;
+    FillRect(0, 0, w, h, Rgb(10, 13, 24));
+    const uint32_t fps_color = st->fps >= 55 ? Rgb(110, 220, 140) : st->fps >= 30 ? Rgb(250, 205, 90) : kBad;
+    FillRect(0, 0, 6, h, fps_color);
+    char line[96];
+    snprintf(line, sizeof(line), "%.0f", st->fps);
+    if (st->mode == kOverlayFps) {
+        const int x = 22;
+        const int after = DrawText(kTitleFont, x, (h - kTitleFontHeight) / 2, line, fps_color);
+        DrawText(kBold, after + 10, (h - kBoldFontHeight) / 2 + 6, "FPS", kDim);
+    } else {
+        int y = 8;
+        const int after = DrawText(kTitleFont, 22, y, line, fps_color);
+        DrawText(kBold, after + 10, y + 24, "FPS", kDim);
+        y += kTitleFontHeight + 2;
+        const auto row = [&](const char* label, const char* value, uint32_t color) {
+            DrawText(kRegular, 22, y, label, kDim);
+            DrawText(kBold, w - 20 - TextWidth(kBold, value), y - 2, value, color);
+            y += kStatusFontHeight + 3;
+        };
+        snprintf(line, sizeof(line), "%.1f ms", st->frame_ms);
+        row("Frame time", line, kText);
+        snprintf(line, sizeof(line), "%.1f ms", st->worst_ms);
+        row("Worst frame", line, st->worst_ms > 50 ? kBad : kText);
+        snprintf(line, sizeof(line), "%.0f%%", st->gpu_wait * 100);
+        row("Waiting for GPU", line, st->gpu_wait > 0.3f ? Rgb(250, 205, 90) : kText);
+        snprintf(line, sizeof(line), "%d", st->new_shaders);
+        row("New shaders", line, kText);
+        snprintf(line, sizeof(line), "%d MB", st->gpu_free_mb);
+        row("GPU memory free", line, st->gpu_free_mb < 128 ? kBad : kText);
+    }
+    g_frame = saved;
+    for (int y = 0; y < h; y++)
+        memcpy(dst + size_t(y) * size_t(w), frame + size_t(y) * kWidth, size_t(w) * 4);
+}
+
+void ps4_status_crashed() {
+    g_crashed = true;
+}
+
+void ps4_status_start(const char* title) {
+    if (g_running.exchange(true))
+        return;
+    Lock();
+    CopyText(g_title, sizeof(g_title), title);
+    Unlock();
+    clock_gettime(CLOCK_MONOTONIC, &g_start);
+    g_stop = false;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 512 * 1024);
+    g_ready = false;
+    if (pthread_create(&g_thread, &attr, ThreadMain, nullptr) != 0) {
+        g_running = false;
+        g_ready = true;
+    }
+    pthread_attr_destroy(&attr);
+    // Hold VideoOut before anything else (SDL) can open it.
+    for (int i = 0; i < 2000 && !g_ready; i++)
+        usleep(1000);
+}
+
+// Closes VideoOut so a renderer can open it.
+void ps4_status_stop() {
+    if (!g_running)
+        return;
+    g_stop = true;
+    pthread_join(g_thread, nullptr);
+    g_running = false;
+}
+
+} // extern "C"

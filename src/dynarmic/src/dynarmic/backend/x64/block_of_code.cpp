@@ -27,6 +27,7 @@
 #include "common/assert.h"
 #include "dynarmic/mcl/bit.hpp"
 #include "dynarmic/backend/x64/xbyak.h"
+#include "dynarmic/common/ps4_exec_allocator.h"
 
 #include "dynarmic/backend/x64/a32_jitstate.h"
 #include "dynarmic/backend/x64/abi.h"
@@ -149,7 +150,11 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
 #else
         , nullptr //Allow RWE
 #endif
+#ifdef __OPENORBIS__
+        , &Dynarmic::Common::PS4ExecAllocator::Get())
+#else
         , nullptr)
+#endif
     , constant_pool(*this, CONSTANT_POOL_SIZE)
     , jsi(jsi)
     , cb(std::move(cb))

@@ -187,7 +187,11 @@ bool IsFastmemEnabled() {
         return bool(values.cpuopt_fastmem);
     else if (values.cpu_accuracy.GetValue() == CpuAccuracy::Unsafe)
         return bool(values.cpuopt_unsafe_host_mmu);
-#if defined(__unix__)
+#if defined(__OPENORBIS__)
+    // 16 KiB host pages: HostMemory's PS4 arena maps what lines up and leaves the rest to the
+    // slow path (and stays off - no arena - if it can't be set up).
+    return true;
+#elif defined(__unix__)
     // TODO: Support this since only 4kb systems support host MMU right now
     return getpagesize() == 4096;
 #else

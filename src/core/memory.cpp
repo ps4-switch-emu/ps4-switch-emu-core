@@ -34,6 +34,10 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
 
+#ifdef __OPENORBIS__
+extern "C" __attribute__((weak)) void ps4_boot_trace(const char* stage); // externals/ps4sup/crashlog.cpp
+#endif
+
 namespace Core::Memory {
 
 static inline bool AddressSpaceContains(const Common::PageTable& table, const Common::ProcessAddress addr, const std::size_t size) {
@@ -55,6 +59,16 @@ struct Memory::Impl {
         } else {
             current_page_table->fastmem_arena = nullptr;
         }
+#ifdef __OPENORBIS__
+        if (ps4_boot_trace) {
+            char line[160];
+            snprintf(line, sizeof(line), "memory: page table for %s process, fastmem %s, arena %p",
+                     process.IsApplication() ? "application" : "system",
+                     Settings::IsFastmemEnabled() ? "enabled" : "disabled",
+                     static_cast<void*>(current_page_table->fastmem_arena));
+            ps4_boot_trace(line);
+        }
+#endif
 
 #ifdef __ANDROID__
         heap_tracker.emplace(system.DeviceMemory().buffer);
@@ -74,6 +88,13 @@ struct Memory::Impl {
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, target,
                  Common::PageType::Memory);
 
+        if (getenv("EDEN_LOG_MAPS")) {
+            // Diagnostics (PS4 fastmem bring-up): guest -> backing mappings and their 16 KiB congruence.
+            const u64 host = GetInteger(target) - DramMemoryMap::Base;
+            fprintf(stderr, "MAP guest %#llx -> backing %#llx size %#llx perm %u %s\n",
+                    (unsigned long long)GetInteger(base), (unsigned long long)host, (unsigned long long)size,
+                    unsigned(perms), ((GetInteger(base) ^ host) & 0x3FFF) == 0 ? "congruent" : "NOT-congruent");
+        }
         if (current_page_table->fastmem_arena) {
             host_buffer->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
         }

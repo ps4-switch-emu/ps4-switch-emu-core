@@ -26,6 +26,11 @@
 EmuWindow_SDL3::EmuWindow_SDL3(InputCommon::InputSubsystem* input_subsystem_, Core::System& system_)
     : input_subsystem{input_subsystem_}, system{system_} {
     input_subsystem->Initialize();
+#ifdef __OPENORBIS__
+    // SDL's PS4 video driver would open VideoOut itself; Eden presents through its own VideoOut
+    // swap chain (vk_swapchain.cpp) and the status screen. SDL only provides input here.
+    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
+#endif
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO))
         LOG_CRITICAL(Frontend, "SDL_INIT_VIDEO: {}", SDL_GetError());
     if (!SDL_InitSubSystem(SDL_INIT_JOYSTICK))
@@ -128,6 +133,11 @@ bool EmuWindow_SDL3::IsShown() const {
 }
 
 void EmuWindow_SDL3::OnResize() {
+#ifdef __OPENORBIS__
+    // The TV output (VideoOut) is 1920x1080; there is no SDL window to measure.
+    UpdateCurrentFramebufferLayout(1920, 1080);
+    return;
+#endif
     int width, height;
     SDL_GetWindowSizeInPixels(render_window, &width, &height);
     UpdateCurrentFramebufferLayout(width, height);

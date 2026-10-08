@@ -78,7 +78,7 @@ endif()
 
 if (OPENORBIS)
     target_link_libraries(yuzu-cmd
-        PRIVATE vulkan_radeon
+        PRIVATE --whole-archive ${PS4_MESA_LIBS} --no-whole-archive
         PRIVATE SceVideoOut SceAudioOut ScePad SceSystemService SceGnmDriver
         PRIVATE ps4sup)
     create_ps4_eboot(yuzu-cmd eden-cli IV0000-BREW00090_00-EDENEMULAT000000)

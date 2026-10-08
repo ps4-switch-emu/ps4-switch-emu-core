@@ -159,7 +159,7 @@ index 4a870f6..69ca1db 100644
  
 -#if defined(__SIZEOF_WCHAR_T__)
 +#if defined(SDL_PLATFORM_PS4)
-+#define SDL_SIZEOF_WCHAR_T 2
++#define SDL_SIZEOF_WCHAR_T __SIZEOF_WCHAR_T__
 +#elif defined(__SIZEOF_WCHAR_T__)
  #define SDL_SIZEOF_WCHAR_T __SIZEOF_WCHAR_T__
  #elif defined(SDL_PLATFORM_NGAGE)

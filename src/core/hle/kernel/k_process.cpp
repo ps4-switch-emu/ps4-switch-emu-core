@@ -312,7 +312,13 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
     // Setup page table.
     {
         const auto as_type = params.flags & Svc::CreateProcessFlag::AddressSpaceMask;
+#ifdef __OPENORBIS__
+        // No ASLR on the PS4: the regions stay at the bottom of the address space, inside the
+        // fastmem arena (the PS4 won't reserve the whole 512 GiB guest space).
+        const bool enable_aslr = false;
+#else
         const bool enable_aslr = True(params.flags & Svc::CreateProcessFlag::EnableAslr);
+#endif
         const bool enable_das_merge =
             False(params.flags & Svc::CreateProcessFlag::DisableDeviceAddressSpaceMerge);
         R_TRY(m_page_table.Initialize(as_type, enable_aslr, enable_das_merge, !enable_aslr, pool,
@@ -414,7 +420,13 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
     // Setup page table.
     {
         const auto as_type = params.flags & Svc::CreateProcessFlag::AddressSpaceMask;
+#ifdef __OPENORBIS__
+        // No ASLR on the PS4: the regions stay at the bottom of the address space, inside the
+        // fastmem arena (the PS4 won't reserve the whole 512 GiB guest space).
+        const bool enable_aslr = false;
+#else
         const bool enable_aslr = True(params.flags & Svc::CreateProcessFlag::EnableAslr);
+#endif
         const bool enable_das_merge =
             False(params.flags & Svc::CreateProcessFlag::DisableDeviceAddressSpaceMerge);
         R_TRY(m_page_table.Initialize(as_type, enable_aslr, enable_das_merge, !enable_aslr, pool,

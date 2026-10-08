@@ -13,14 +13,18 @@
 #endif
 
 #ifdef __OPENORBIS__
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <vector>
+extern "C" __attribute__((weak)) void ps4_boot_trace(const char* stage); // externals/ps4sup/crashlog.cpp
 #include <ranges>
 #include <csignal>
 #include <fcntl.h>
 #include <boost/container/static_vector.hpp>
 #include <orbis/SystemService.h>
 #include <orbis/libkernel.h>
-typedef void (*SceKernelExceptionHandler)(int32_t, void*);
-extern "C" int32_t sceKernelInstallExceptionHandler(int32_t signum, SceKernelExceptionHandler handler);
 #endif
 
 #include "common/alignment.h"
@@ -37,9 +41,6 @@ extern "C" int32_t sceKernelInstallExceptionHandler(int32_t signum, SceKernelExc
 #   ifndef MAP_VOID
 #       define MAP_VOID 0x100
 #   endif
-// sigaction(2) has a motherfucking bug on musl where the thing isnt even properly prefixed
-#   undef sa_sigaction
-#   define sa_sigaction __sa_handler.__sa_sigaction
 #endif
 
 namespace Common {
@@ -190,31 +191,68 @@ struct Ucontext {
 
 static boost::container::static_vector<std::pair<void*, size_t>, 16> swap_regions;
 static std::mutex evil_swap_mutex;
-extern "C" int sceKernelRemoveExceptionHandler(s32 sig_num);
-static void SwapHandler(int sig, void* raw_context) {
-    std::unique_lock lk{evil_swap_mutex};
-    auto& mctx = ((Orbis::Ucontext*)raw_context)->uc_mcontext;
-    if (auto const it = std::ranges::find_if(swap_regions, [addr = mctx.mc_addr](auto const& e) {
-        return uintptr_t(addr) >= uintptr_t(e.first) && uintptr_t(addr) < uintptr_t(e.first) + e.second;
-    }); it != swap_regions.end()) {
-        size_t const page_size = Orbis::ORBIS_PAGE_SIZE * 128; //128K
-        size_t const page_mask = ~(page_size - 1);
-        // should replace the existing mapping... ugh
-        void* aligned_addr = reinterpret_cast<void*>(uintptr_t(mctx.mc_addr) & page_mask);
-        void* res = mmap(aligned_addr, page_size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
-        if (res == MAP_FAILED) {
-            LOG_ERROR(HW_Memory, "{:#x},{} @ {}:{:#x}", mctx.mc_addr, aligned_addr, it->first, it->second);
-            sceKernelRemoveExceptionHandler(SIGSEGV); // to not catch the next signal
-        } else {
-            LOG_DEBUG(HW_Memory, "{:#x},{} @ {}:{:#x}", mctx.mc_addr, aligned_addr, it->first, it->second);
+static struct sigaction g_prev_segv, g_prev_bus;
+static unsigned swap_traced; // trace only the first few unhandled faults
+// Direct-memory large vectors: {mapping, direct memory offset, size}, to release them again.
+struct DmemRegion {
+    void* base;
+    off_t offset;
+    size_t size;
+};
+static std::vector<DmemRegion> dmem_regions;
+
+// Faults inside a "void" region get a 2 MiB page mapped in on demand; any other fault goes to the
+// handler installed before ours (the PS4 crash logger, externals/ps4sup/crashlog.cpp).
+// A plain sigaction handler (the libc-overlay headers give the PS4 kernel's FreeBSD layout), as
+// DolphinPS4 uses on retail consoles, instead of sceKernelInstallExceptionHandler.
+extern "C" bool ps4_dram_fault(uintptr_t address); // common/host_memory.cpp
+
+static void SwapHandler(int sig, siginfo_t* info, void* raw_context) {
+    const uintptr_t addr = uintptr_t(info->si_addr);
+    if (ps4_dram_fault(addr))
+        return; // emulated DRAM chunk committed: retry the access
+    {
+        std::unique_lock lk{evil_swap_mutex};
+        if (auto const it = std::ranges::find_if(swap_regions, [addr](auto const& e) {
+            return addr >= uintptr_t(e.first) && addr < uintptr_t(e.first) + e.second;
+        }); it != swap_regions.end()) {
+            size_t const page_size = Orbis::ORBIS_PAGE_SIZE * 128;
+            void* aligned_addr = reinterpret_cast<void*>(addr & ~(page_size - 1));
+            void* res = mmap(aligned_addr, page_size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (res != MAP_FAILED)
+                return; // retry the access
+            if (ps4_boot_trace && swap_traced++ < 16) {
+                char line[160];
+                snprintf(line, sizeof(line), "swap: fault at %#lx in void region %p+%#zx, mapping 2 MiB failed (errno %d)",
+                         (unsigned long)addr, it->first, it->second, errno);
+                ps4_boot_trace(line);
+            }
+        } else if (ps4_boot_trace && swap_traced++ < 16) {
+            char line[512];
+            int n = snprintf(line, sizeof(line), "swap: fault at %#lx (signal %d) outside the %zu void regions:", (unsigned long)addr,
+                             sig, swap_regions.size());
+            for (auto const& e : swap_regions)
+                n += snprintf(line + n, sizeof(line) - size_t(n), " %p+%#zx", e.first, e.second);
+            ps4_boot_trace(line);
         }
+    }
+    // Not ours (or the page couldn't be mapped): chain.
+    const struct sigaction& prev = sig == SIGSEGV ? g_prev_segv : g_prev_bus;
+    if ((prev.sa_flags & SA_SIGINFO) && prev.sa_sigaction) {
+        prev.sa_sigaction(sig, info, raw_context);
+    } else if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN && prev.sa_handler) {
+        prev.sa_handler(sig);
     } else {
-        LOG_ERROR(HW_Memory, "fault in addr {:#x} at {:#x}", mctx.mc_addr, mctx.mc_rip); // print caller address
-        sceKernelRemoveExceptionHandler(SIGSEGV); // to not catch the next signal
+        signal(sig, SIG_DFL); // returning re-faults with the default action
     }
 }
 void InitSwap() noexcept {
-    sceKernelInstallExceptionHandler(SIGSEGV, &SwapHandler);
+    struct sigaction sa{};
+    sa.sa_sigaction = SwapHandler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_prev_segv);
+    sigaction(SIGBUS, &sa, &g_prev_bus);
 }
 #else
 void InitSwap() noexcept {}
@@ -244,7 +282,9 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
 #elif defined(__OPENORBIS__)
     bool use_void_mem = true;
     void* base = nullptr;
-    if (size < 4294967296ull) {
+    // Direct memory is what RADV allocates from too: only small vectors get it. Big sparse
+    // ones (the 1 GiB CPU page table) are backed on demand, 2 MiB at a time.
+    if (size <= 128ull << 20) {
         size_t align = Orbis::ORBIS_PAGE_SIZE;
         off_t offset;
         int32_t res;
@@ -252,6 +292,14 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
         if ((res = sceKernelAllocateDirectMemory(0, ORBIS_KERNEL_MAIN_DMEM_SIZE, size, align, ORBIS_KERNEL_WB_ONION, &offset)) == 0) {
             if ((res = sceKernelMapDirectMemory(&base, size, ORBIS_KERNEL_PROT_CPU_READ | ORBIS_KERNEL_PROT_CPU_WRITE, 0, offset, size)) == 0) {
                 if ((res = sceKernelMprotect(base, size, VM_PROT_ALL)) == 0 && base != nullptr) {
+                    // Direct memory is handed out with whatever the last user left in it (seen on
+                    // hardware: VideoOut pixels in DeviceMemoryManager's compressed_device_addr,
+                    // read back as a multi-address chain id). Every caller expects zeroed pages.
+                    std::memset(base, 0, size);
+                    {
+                        std::scoped_lock lk{evil_swap_mutex};
+                        dmem_regions.push_back({base, offset, size});
+                    }
                     LOG_WARNING(HW_Memory, "Using DMem for {} bytes area @ {}", size, base);
                     use_void_mem = false; //Memory properly mapped
                 } else {
@@ -270,7 +318,14 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
         base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_VOID | MAP_PRIVATE, -1, 0);
         LOG_WARNING(HW_Memory, "Using VoidMem for {} bytes area @ {}", size, base);
         ASSERT(base != MAP_FAILED);
+        ASSERT_MSG(swap_regions.size() < swap_regions.capacity(), "too many void regions");
         swap_regions.emplace_back(base, size);
+    }
+    if (ps4_boot_trace) {
+        char line[160];
+        snprintf(line, sizeof(line), "large vector: %zu KiB from %s at %p", size >> 10, use_void_mem ? "void memory" : "direct memory",
+                 base);
+        ps4_boot_trace(line);
     }
 #else
     void* base = mmap(nullptr, size, PROT_READ, MAP_ANON | MAP_PRIVATE | MAP_NOCORE, -1, 0);
@@ -290,13 +345,26 @@ void FreeMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept {
 #ifdef _WIN32
     ASSERT(VirtualFree(base, 0, MEM_RELEASE));
 #elif defined(__OPENORBIS__)
+    std::scoped_lock lk{evil_swap_mutex};
     if (auto const it = std::ranges::find_if(swap_regions, [=](auto const& e) {
         return uintptr_t(base) >= uintptr_t(e.first) && uintptr_t(base) < uintptr_t(e.first) + e.second;
     }); it != swap_regions.end()) {
         int rc = munmap(base, size);
         ASSERT(rc == 0);
+        swap_regions.erase(it);
+    } else if (auto const dm = std::ranges::find_if(dmem_regions, [=](auto const& e) {
+        return e.base == base;
+    }); dm != dmem_regions.end()) {
+        // Unmap, then release by direct memory offset (not by address: that released nothing
+        // and leaked every freed vector, 8 MiB per guest program on hardware).
+        munmap(dm->base, dm->size);
+        const int rc = sceKernelReleaseDirectMemory(dm->offset, dm->size);
+        if (rc != 0)
+            LOG_ERROR(HW_Memory, "{:#x} = sceKernelReleaseDirectMemory({:#x}, {:#x})", u32(rc),
+                      dm->offset, dm->size);
+        dmem_regions.erase(dm);
     } else {
-        sceKernelCheckedReleaseDirectMemory(off_t(base), size_t(size));
+        LOG_ERROR(HW_Memory, "FreeMemoryPages: {} was not allocated here", base);
     }
 #else
     ASSERT(munmap(base, size) == 0);

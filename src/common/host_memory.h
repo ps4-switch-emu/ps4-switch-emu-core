@@ -54,6 +54,13 @@ public:
 
     void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value);
 
+    /// Bytes of guest address space the fastmem arena covers (0 = no arena). On the PS4 this can
+    /// be less than the guest address space.
+    [[nodiscard]] size_t FastmemArenaSize() const noexcept;
+
+    /// PS4: writes the fastmem arena's statistics to the boot trace (no-op elsewhere).
+    void LogFastmemStats(const char* when);
+
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;
     }
@@ -72,8 +79,16 @@ public:
         return address >= virtual_base && address < virtual_base + virtual_size;
     }
 
+#if defined(__OPENORBIS__)
+    // Direct-memory backing and the 16 KiB-page fastmem arena (host_memory.cpp); public for the
+    // fault hook ps4_dram_fault.
+    class PS4Arena;
+#endif
+
 private:
-#if !(defined(__OPENORBIS__) || defined(__managarm__))
+#if defined(__OPENORBIS__)
+    std::unique_ptr<PS4Arena> ps4_arena;
+#elif !defined(__managarm__)
     // Low level handler for the platform dependent memory routines
     class Impl;
     std::unique_ptr<Impl> impl;

@@ -5,6 +5,15 @@
 # SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 -->
+
+> [!IMPORTANT]
+> **This is an unofficial fork, not Eden.** It is the emulator core of
+> [ps4-switch-emu](https://github.com/ps4-switch-emu/ps4-switch-emu), a port of Eden to jailbroken
+> PS4 consoles. It was made with AI assistance, which the Eden project does not allow, so it is
+> not affiliated with or endorsed by the Eden team. **Do not report problems with it to Eden**:
+> use this project's issue tracker. The PS4 changes are on branch `main`, on top of Eden's
+> `eden-orbis-ps4` branch; everything below is Eden's original README.
+
 <!-- lang: en-GB -->
 
 <h1 align="center">

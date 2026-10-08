@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <fstream>
 #include <iostream>
@@ -47,6 +48,11 @@
 
 #ifdef __ANDROID__
 #include "../../android/app/src/main/jni/android_settings.h"
+#endif
+
+#ifdef __OPENORBIS__
+extern "C" __attribute__((weak)) void ps4_boot_trace(const char* stage);
+extern std::atomic<unsigned long long> ps4_pipelines_built; // externals/ps4sup/stub.cpp
 #endif
 
 namespace Vulkan {
@@ -756,7 +762,23 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     const auto [pair, is_new]{graphics_cache.try_emplace(graphics_key)};
     auto& pipeline{pair->second};
     if (is_new) {
+#ifdef __OPENORBIS__
+        // In-game shader builds stall the frame: trace the slow ones (lag spikes).
+        const auto start = std::chrono::steady_clock::now();
         pipeline = CreateGraphicsPipeline();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        static u32 s_built = 0;
+        ++s_built;
+        ps4_pipelines_built.fetch_add(1, std::memory_order_relaxed);
+        if (ms >= 30 && ps4_boot_trace) {
+            char line[128];
+            std::snprintf(line, sizeof(line), "shader: new pipeline #%u built in %lld ms%s", s_built, (long long)ms,
+                          use_asynchronous_shaders ? " (async)" : "");
+            ps4_boot_trace(line);
+        }
+#else
+        pipeline = CreateGraphicsPipeline();
+#endif
     }
     if (!pipeline) {
         return nullptr;
@@ -791,6 +813,28 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     bool build_in_parallel) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
+#ifdef __OPENORBIS__
+    // Geometry shaders hang/kill the PS4 GPU through RADV-on-GNM (its ES->GS ring overruns into
+    // the next buffer; DolphinPS4 hit the same). Skip such draws (a null pipeline makes the
+    // rasterizer skip them) instead of losing the whole session.
+    // Tessellation goes the same way: its factor and off-chip rings are kernel-owned state that
+    // nothing sets up through GNM (deko3d's tessellation example died silently at its first draw).
+    const auto uses = [&key](Maxwell::ShaderType type) {
+        return key.unique_hashes[static_cast<size_t>(type)] != 0;
+    };
+    if (uses(Maxwell::ShaderType::Geometry)) {
+        static bool s_logged = false;
+        if (!std::exchange(s_logged, true))
+            LOG_WARNING(Render_Vulkan, "PS4: skipping draws that use a geometry shader");
+        return nullptr;
+    }
+    if (uses(Maxwell::ShaderType::TessellationInit) || uses(Maxwell::ShaderType::Tessellation)) {
+        static bool s_logged = false;
+        if (!std::exchange(s_logged, true))
+            LOG_WARNING(Render_Vulkan, "PS4: skipping draws that use tessellation");
+        return nullptr;
+    }
+#endif
     size_t env_index{0};
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     const bool uses_vertex_a{key.unique_hashes[0] != 0};

@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/scope_exit.h"
+#ifdef __OPENORBIS__
+#include <sys/stat.h>
+#endif
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_hardware_timer.h"
@@ -33,6 +36,7 @@ Result CreateThread(Core::System& system, Handle* out_handle, u64 entry_point, u
     // Adjust core id, if it's the default magic.
     auto& kernel = system.Kernel();
     auto& process = GetCurrentProcess(kernel);
+    const bool default_core = core_id == IdealCoreUseProcessValue;
     if (core_id == IdealCoreUseProcessValue) {
         core_id = process.GetIdealCoreId();
     }
@@ -67,6 +71,23 @@ Result CreateThread(Core::System& system, Handle* out_handle, u64 entry_point, u
 
     // Commit the thread reservation.
     thread_reservation.Commit();
+
+#ifdef __OPENORBIS__
+    // Launcher option "Spread game threads" (/data/switch-emu/spread-threads): a thread created on
+    // the process's default core may also run on the process's other cores, so the scheduler
+    // moves it to an idle one. Games put their main loop and helpers (e.g. a 2D game's
+    // music decoding) on the same default core; the PS4 has less headroom than a Switch and
+    // every helper burst became a lag spike while the other cores sat idle.
+    static const bool s_spread = [] {
+        struct stat st;
+        return stat("/data/switch-emu/spread-threads", &st) == 0;
+    }();
+    if (s_spread && default_core) {
+        void(thread->SetCoreMask(kernel, core_id, process.GetCoreMask()));
+    }
+#else
+    (void)default_core;
+#endif
 
     // Clone the current fpu status to the new thread.
     thread->CloneFpuStatus(system.Kernel());

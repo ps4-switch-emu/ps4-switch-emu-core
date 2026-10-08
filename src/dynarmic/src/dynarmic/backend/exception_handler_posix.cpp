@@ -66,10 +66,6 @@ public:
         auto const stack_size = std::max<size_t>(SIGSTKSZ, 2 * 1024 * 1024);
         signal_stack_memory = std::make_unique<uint8_t[]>(stack_size);
 
-#ifdef __OPENORBIS__
-        fmt::print(stderr, "no fastmem on PS4\n");
-        supports_fast_mem = false;
-#else
         stack_t signal_stack{};
         signal_stack.ss_sp = signal_stack_memory.get();
         signal_stack.ss_size = stack_size;
@@ -90,13 +86,13 @@ public:
             supports_fast_mem = false;
             return;
         }
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__OPENORBIS__)
+        // The PS4's FreeBSD kernel may report protection faults as SIGBUS.
         if (sigaction(SIGBUS, &sa, &old_sa_bus) != 0) {
             fmt::print(stderr, "POSIX SigHandler: could not set SIGBUS handler\n");
             supports_fast_mem = false;
             return;
         }
-#   endif
 #endif
     }
 
@@ -125,8 +121,19 @@ void SigHandler::RegisterHandler() {
     }
 }
 
+#ifdef __OPENORBIS__
+// Eden's common/host_memory.cpp: commits emulated DRAM on first touch. Checked before the JIT
+// lookup below, which takes every fault in JIT code for a fastmem access - inline page-table
+// accesses from JIT code reach uncommitted DRAM too.
+extern "C" bool ps4_dram_fault(uintptr_t address);
+#endif
+
 void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
     DEBUG_ASSERT(sig == SIGSEGV || sig == SIGBUS);
+#ifdef __OPENORBIS__
+    if (ps4_dram_fault(reinterpret_cast<uintptr_t>(info->si_addr)))
+        return;
+#endif
     CTX_DECLARE(raw_context);
     {
         std::shared_lock guard(sig_handler->code_block_infos_mutex);
@@ -148,11 +155,13 @@ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
             return;
         }
     }
+#ifndef __OPENORBIS__
+    // (PS4: faults in the on-demand "void" regions come through here all the time; the next
+    // handler deals with them, and the crash logger reports real crashes.)
     LOG_ERROR(Core, "Unhandled {} at {:#018x}\n", sig == SIGSEGV ? "SIGSEGV" : "SIGBUS", CTX_PC);
+#endif
 
-#ifdef __OPENORBIS__
-    // No fastmem
-#else
+    {
     struct sigaction* retry_sa = sig == SIGSEGV ? &sig_handler->old_sa_segv : &sig_handler->old_sa_bus;
     if (retry_sa->sa_flags & SA_SIGINFO) {
         retry_sa->sa_sigaction(sig, info, raw_context);
@@ -166,7 +175,7 @@ void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {
         return;
     }
     retry_sa->sa_handler(sig);
-#endif
+    }
 }
 
 }  // anonymous namespace

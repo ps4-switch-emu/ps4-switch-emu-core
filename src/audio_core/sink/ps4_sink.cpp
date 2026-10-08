@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <span>
+#include <chrono>
 #include <stop_token>
+#include <thread>
 #include <vector>
 
 #include <orbis/AudioOut.h>
@@ -34,28 +36,40 @@ struct PS4SinkStream final : public SinkStream {
         device_channels = device_channels_;
 
         constexpr size_t PREFERRED_SAMPLE_COUNT = 1024;
+        if (type == StreamType::In) {
+            // No microphone: feed the audio system silence at the output rate, without taking one
+            // of the console's audio output ports.
+            audio_thread = std::jthread([this](std::stop_token stop_token) {
+                std::array<s16, PREFERRED_SAMPLE_COUNT * MaxChannels> buffer{};
+                while (!stop_token.stop_requested()) {
+                    if (!paused) {
+                        std::fill(buffer.begin(), buffer.end(), s16(0));
+                        this->ProcessAudioIn(buffer, PREFERRED_SAMPLE_COUNT);
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(1'000'000 * PREFERRED_SAMPLE_COUNT /
+                                                                          TargetSampleRate));
+                }
+            });
+            return;
+        }
         auto const param = (device_channels > 1 ? ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO : ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_MONO);
         audio_dev = sceAudioOutOpen(ORBIS_USER_SERVICE_USER_ID_SYSTEM, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, PREFERRED_SAMPLE_COUNT, TargetSampleRate, param);
         if (audio_dev > 0) {
             audio_thread = std::jthread([=, this](std::stop_token stop_token) {
                 std::array<s16, PREFERRED_SAMPLE_COUNT * MaxChannels> buffer;
+                unsigned errors = 0;
                 while (!stop_token.stop_requested()) {
-                    if (this->type == StreamType::In) {
-                        this->ProcessAudioIn(buffer, PREFERRED_SAMPLE_COUNT);
-                        (void)buffer; // TODO: microphone support
-                    } else {
-                        int err = 0;
-                        std::fill(buffer.begin(), buffer.end(), 0);
+                    std::fill(buffer.begin(), buffer.end(), s16(0));
+                    if (!paused)
                         this->ProcessAudioOutAndRender(buffer, PREFERRED_SAMPLE_COUNT);
-                        sceAudioOutOutput(audio_dev, nullptr);
-                        if ((err = sceAudioOutOutput(audio_dev, buffer.data())) < 0)
-                            LOG_ERROR(Service_Audio, "{}", err);
-                    }
-                    // Wait for pause, we don't really have a native pause
-                    // so this is the best i can do
-                    while (paused && !stop_token.stop_requested())
-                        asm volatile ("pause"); //dont shootup cpu usage to 100%
+                    // Queues the block and returns once the port can take the next one, which
+                    // paces this loop at the output rate. (Waiting for the previous block first,
+                    // with a null output, left a gap after every block.) Silence while paused
+                    // keeps the pacing without spinning a core.
+                    if (const int err = sceAudioOutOutput(audio_dev, buffer.data()); err < 0 && errors++ < 8)
+                        LOG_ERROR(Service_Audio, "sceAudioOutOutput: {:#x}", u32(err));
                 }
+                sceAudioOutOutput(audio_dev, nullptr); // let the last block finish
                 sceAudioOutClose(audio_dev);
             });
         } else {
@@ -78,13 +92,13 @@ struct PS4SinkStream final : public SinkStream {
     }
 
     void Start(bool resume = false) override {
-        if (audio_dev > 0 && paused) {
+        if (audio_thread.joinable() && paused) {
             paused = false;
         }
     }
 
     void Stop() override {
-        if (audio_dev > 0 && !paused) {
+        if (audio_thread.joinable() && !paused) {
             SignalPause();
         }
     }

@@ -503,7 +503,15 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 #endif
 }
 
+#ifdef __OPENORBIS__
+extern "C" __attribute__((weak)) void ps4_sampler_register_thread(const char* name); // externals/ps4sup/sampler.cpp
+#endif
+
 void SetCurrentThreadName(const char* name) {
+#ifdef __OPENORBIS__
+    if (ps4_sampler_register_thread)
+        ps4_sampler_register_thread(name);
+#endif
 #ifdef _MSC_VER
     // Sets the debugger-visible name of the current thread.
     if (auto pf = (decltype(&SetThreadDescription))(void*)GetProcAddress(GetModuleHandle(TEXT("KernelBase.dll")), "SetThreadDescription"); pf)

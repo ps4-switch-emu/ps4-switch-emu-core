@@ -34,6 +34,14 @@
 #include <sys/shm.h>
 #elif defined(__OPENORBIS__)
 #include <orbis/libkernel.h>
+#include <sys/stat.h>
+#include <atomic>
+#include <cstdarg>
+#include <ctime>
+#include <cstring>
+#include <vector>
+#include <cstdio>
+#include <unordered_map>
 #endif
 
 // FreeBSD
@@ -51,6 +59,7 @@
 
 #endif // ^^^ POSIX ^^^
 
+#include <algorithm>
 #include <mutex>
 #include <random>
 
@@ -704,11 +713,491 @@ private:
 
 #endif // ^^^ POSIX ^^^
 
+#ifdef __OPENORBIS__
+extern "C" __attribute__((weak)) void ps4_boot_trace(const char* stage); // externals/ps4sup/crashlog.cpp
+extern "C" int32_t sceKernelEnableDmemAliasing(); // libkernel; not in the OpenOrbis headers
+
+/// Emulated DRAM and fastmem on the PS4.
+///
+/// Backing: direct memory (the ~4.5 GiB pool the GPU also uses); anonymous mappings top out
+/// around 1 GiB and only ~384 MiB of flexible memory is free (seen on hardware). The 4 GiB backing
+/// range is only reserved: 2 MiB chunks of direct memory are allocated and mapped into it the
+/// first time something touches them (ps4_dram_fault, called first by dynarmic's and the swap
+/// fault handlers) or a fastmem mapping needs them. Backing all 4 GiB up front left ~500 MiB for
+/// RADV and ran it out of memory in deko3d's examples.
+///
+/// Fastmem: the guest address space is a reserved virtual range; guest mappings become direct
+/// memory mappings of the backing into it (direct memory aliasing). The PS4 maps memory in 16 KiB
+/// pages, guest pages are 4 KiB: a 16 KiB block is mapped only when its four guest pages map four
+/// consecutive, 16 KiB aligned backing pages with the same permissions - the usual case. Any other
+/// block stays unmapped; dynarmic's fault handler then sends those accesses down the slow path
+/// (the page table), which handles them correctly. Read-only guest pages (rasterizer-cached
+/// memory) are mapped read-only, so writes fault and take the slow path too.
+class HostMemory::PS4Arena {
+public:
+    static constexpr size_t GuestPage = 0x1000, HostPage = 0x4000, Sub = HostPage / GuestPage;
+    static constexpr int32_t ProtRead = 0x1, ProtReadWrite = 0x3, MapFixed = 0x10, WbOnion = 0;
+
+    PS4Arena(size_t backing_size, size_t virtual_size) {
+        constexpr size_t Align = 0x200000;
+        backing_size = (backing_size + Align - 1) & ~(Align - 1);
+        const size_t total = sceKernelGetDirectMemorySize();
+        off_t largest_at = 0;
+        size_t largest = 0;
+        // <orbis/libkernel.h> declares the two outputs as values; they are pointers.
+        using AvailableFn = int32_t (*)(off_t, off_t, size_t, off_t*, size_t*);
+        reinterpret_cast<AvailableFn>(&sceKernelAvailableDirectMemorySize)(0, off_t(total), Align, &largest_at, &largest);
+        Trace("host memory: %zu MiB emulated DRAM; direct memory %zu MiB total, largest free %zu MiB",
+              backing_size >> 20, total >> 20, largest >> 20);
+
+        // Mapping the same direct memory twice (backing + fastmem view) needs aliasing enabled.
+        const int32_t alias = sceKernelEnableDmemAliasing();
+        // Above where libkernel places its own objects (DolphinPS4: 0x200000000 collided).
+        void* addr = reinterpret_cast<void*>(0x2000000000ULL);
+        int32_t result = sceKernelReserveVirtualRange(&addr, backing_size, MapFixed, Align);
+        Trace("host memory: backing range %s (%#x) at %p, committed in %zu KiB chunks on use, aliasing %#x",
+              result == 0 ? "reserved" : "FAILED", unsigned(result), addr, Chunk >> 10, unsigned(alias));
+        if (result != 0) {
+            ASSERT_MSG(false, "Could not reserve {} MiB for emulated DRAM", backing_size >> 20);
+            return;
+        }
+        backing_base = static_cast<u8*>(addr);
+        backing_bytes = backing_size;
+        chunk_phys.assign(backing_size / Chunk, -1);
+        g_dram.store(this);
+        MeasureBandwidth();
+
+        struct stat st;
+        if (stat("/data/switch-emu/no-fastmem", &st) == 0) {
+            Trace("fastmem: off (/data/switch-emu/no-fastmem)");
+            return;
+        }
+        if (alias != 0) {
+            Trace("fastmem: off (no direct memory aliasing)");
+            return;
+        }
+        // The whole 39-bit guest space (512 GiB) is refused (0x8002000c on hardware): take the
+        // largest power of two the kernel gives. dynarmic then bounds-checks against it and sends
+        // accesses above it down the slow path (ArmDynarmic64/32 set fastmem_address_space_bits).
+        for (size_t size = virtual_size; size >= (size_t(8) << 30); size /= 2) {
+            void* reserved = nullptr;
+            result = sceKernelReserveVirtualRange(&reserved, size, 0, Align);
+            if (result == 0) {
+                virtual_base = static_cast<u8*>(reserved);
+                arena_size = size;
+                reserved_bytes = size;
+                break;
+            }
+        }
+        // One call tops out at 16 GiB, but reservations right after it may work: grow the arena
+        // while they do (the JIT's window is the largest power of two that fits), so more of
+        // the guest space (the kernel map region starts at 12 GiB) gets fastmem.
+        if (virtual_base) {
+            const size_t step = arena_size;
+            while (reserved_bytes + step <= virtual_size) {
+                // A hint, not MAP_FIXED: a fixed reservation would replace whatever is mapped there.
+                void* const want = virtual_base + reserved_bytes;
+                void* next = want;
+                if (sceKernelReserveVirtualRange(&next, step, 0, Align) != 0)
+                    break;
+                if (next != want) { // placed elsewhere: give it back, stop growing
+                    sceKernelMunmap(next, step);
+                    break;
+                }
+                reserved_bytes += step;
+            }
+            while (arena_size * 2 <= reserved_bytes)
+                arena_size *= 2;
+        }
+        Trace("fastmem: %s %zu GiB arena at %p (%zu GiB reserved, guest space %zu GiB)",
+              virtual_base ? "reserved" : "could not reserve", arena_size >> 30, static_cast<void*>(virtual_base),
+              reserved_bytes >> 30, virtual_size >> 30);
+    }
+
+    ~PS4Arena() {
+        // Eden re-creates DeviceMemory when core settings change (e.g. multi-core): give the
+        // direct memory back, or the next 4 GiB allocation fails.
+        if (virtual_base)
+            sceKernelMunmap(virtual_base, reserved_bytes);
+        if (backing_base) {
+            g_dram.store(nullptr);
+            sceKernelMunmap(backing_base, backing_bytes);
+            for (const off_t chunk : chunk_phys)
+                if (chunk >= 0)
+                    sceKernelReleaseDirectMemory(chunk, Chunk);
+        }
+    }
+
+    /// ClearBackingRegion: zero-filling a chunk nobody has touched yet is a no-op (it's zeroed
+    /// when committed). The kernel clears every heap it hands out - libnx homebrew takes nearly
+    /// all free memory as heap - which otherwise committed ~3 GiB at once on hardware.
+    void Clear(size_t offset, size_t length, u32 fill_value) {
+        while (length != 0) {
+            const size_t chunk = offset / Chunk;
+            const size_t n = std::min(length, (chunk + 1) * Chunk - offset);
+            bool skip = false;
+            if (fill_value == 0) {
+                std::scoped_lock lk{commit_mutex};
+                skip = chunk_phys[chunk] < 0;
+            }
+            if (!skip)
+                std::memset(backing_base + offset, int(fill_value), n);
+            offset += n;
+            length -= n;
+        }
+    }
+
+    /// Fault on the backing range: commit the chunk and retry. False for any other address.
+    bool HandleFault(uintptr_t address) {
+        const uintptr_t offset = address - uintptr_t(backing_base);
+        if (!backing_base || offset >= backing_bytes)
+            return false;
+        return Commit(offset / Chunk) >= 0;
+    }
+
+    u8* backing_base{};
+    u8* virtual_base{};
+
+    void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
+        std::scoped_lock lk{mutex};
+        if (logged_maps < 24) {
+            logged_maps++;
+            Trace("fastmem: map guest %#zx -> backing %#zx, %zu KiB, perm %u (%s)", virtual_offset, host_offset,
+                  length >> 10, unsigned(perms),
+                  ((virtual_offset ^ host_offset) & (HostPage - 1)) == 0 ? "16K-congruent" : "NOT congruent");
+        }
+        if (!Clip(virtual_offset, length))
+            return;
+        for (size_t i = 0; i < length; i += GuestPage) {
+            Block& b = blocks[(virtual_offset + i) / HostPage];
+            const size_t sub = ((virtual_offset + i) / GuestPage) % Sub;
+            b.page[sub] = u32((host_offset + i) / GuestPage) + 1;
+            b.perm[sub] = u8(perms);
+        }
+        Update(virtual_offset, length);
+    }
+
+    void Unmap(size_t virtual_offset, size_t length) {
+        std::scoped_lock lk{mutex};
+        if (!Clip(virtual_offset, length))
+            return;
+        for (size_t i = 0; i < length; i += GuestPage) {
+            const auto it = blocks.find((virtual_offset + i) / HostPage);
+            if (it != blocks.end())
+                it->second.page[((virtual_offset + i) / GuestPage) % Sub] = 0;
+        }
+        Update(virtual_offset, length);
+    }
+
+    void Protect(size_t virtual_offset, size_t length, MemoryPermission perms) {
+        std::scoped_lock lk{mutex};
+        if (!Clip(virtual_offset, length))
+            return;
+        for (size_t i = 0; i < length; i += GuestPage) {
+            const auto it = blocks.find((virtual_offset + i) / HostPage);
+            if (it != blocks.end())
+                it->second.perm[((virtual_offset + i) / GuestPage) % Sub] = u8(perms);
+        }
+        Update(virtual_offset, length);
+    }
+
+    size_t ArenaSize() const {
+        return arena_size;
+    }
+
+private:
+    /// Limits a guest range to the arena; false when nothing of it is inside.
+    bool Clip(size_t offset, size_t& length) const {
+        if (offset >= arena_size)
+            return false;
+        length = std::min(length, arena_size - offset);
+        return length != 0;
+    }
+
+    struct Block {
+        u32 page[Sub]{};   ///< backing 4 KiB page index + 1 per guest page; 0 = unmapped
+        u8 perm[Sub]{};    ///< MemoryPermission per guest page
+        u32 applied_page{}; ///< first backing page index + 1 currently mapped here; 0 = none
+        u8 applied_prot{};
+    };
+
+    /// What a block should be: the backing page index + 1 of its first guest page and the
+    /// protection, or {0, 0} when it can't be mapped as one 16 KiB host page.
+    static std::pair<u32, u8> Desired(const Block& b) {
+        if (b.page[0] == 0 || (b.page[0] - 1) % Sub != 0)
+            return {0, 0};
+        const u8 perm = b.perm[0];
+        for (size_t i = 1; i < Sub; i++) {
+            if (b.page[i] != b.page[0] + i || b.perm[i] != perm)
+                return {0, 0};
+        }
+        const bool read = (perm & u8(MemoryPermission::Read)) != 0;
+        const bool write = (perm & u8(MemoryPermission::Write)) != 0;
+        if (!read)
+            return {0, 0};
+        return {b.page[0], u8(write ? ProtReadWrite : ProtRead)};
+    }
+
+    /// Brings the host mappings of the blocks covering [offset, offset + length) in line with
+    /// their guest pages. Consecutive blocks needing the same action become one kernel call.
+    void Update(size_t offset, size_t length) {
+        enum class Action { None, Map, Unmap, Protect };
+        const u64 first = offset / HostPage, last = (offset + length - 1) / HostPage;
+        Action run_action = Action::None;
+        u64 run_start = 0, run_count = 0;
+        u32 run_page = 0;
+        u8 run_prot = 0;
+        const auto flush = [&] {
+            if (run_count == 0)
+                return;
+            void* addr = virtual_base + run_start * HostPage;
+            const size_t size = run_count * HostPage;
+            int32_t r = 0;
+            switch (run_action) {
+            case Action::Map: {
+                // Replace whatever is there (the arena's reservation or an older mapping).
+                sceKernelMunmap(addr, size);
+                void* target = addr;
+                const size_t host_offset = size_t(run_page - 1) * GuestPage;
+                const off_t chunk = Commit(host_offset / Chunk);
+                r = chunk < 0 ? -1
+                              : sceKernelMapDirectMemory(&target, size, run_prot, MapFixed,
+                                                         chunk + off_t(host_offset % Chunk), HostPage);
+                break;
+            }
+            case Action::Unmap: {
+                sceKernelMunmap(addr, size);
+                // Keep the hole reserved so nothing else gets mapped inside the arena.
+                void* hole = addr;
+                r = sceKernelReserveVirtualRange(&hole, size, MapFixed, HostPage);
+                break;
+            }
+            case Action::Protect:
+                r = sceKernelMprotect(addr, size, run_prot);
+                break;
+            case Action::None:
+                break;
+            }
+            if (r != 0 && failures++ < 16)
+                Trace("fastmem: action %d on %zu KiB at %p failed (%#x)", int(run_action), size >> 10, addr, unsigned(r));
+            calls++;
+            run_count = 0;
+        };
+        for (u64 index = first; index <= last; index++) {
+            const auto it = blocks.find(index);
+            if (it == blocks.end()) {
+                flush();
+                continue;
+            }
+            Block& b = it->second;
+            const auto [page, prot] = Desired(b);
+            Action action = Action::None;
+            if (page == 0 && b.applied_page != 0)
+                action = Action::Unmap;
+            else if (page != 0 && page != b.applied_page)
+                action = Action::Map;
+            else if (page != 0 && prot != b.applied_prot)
+                action = Action::Protect;
+            if (action == Action::None) {
+                flush();
+            } else {
+                const bool extends = run_count != 0 && action == run_action && index == run_start + run_count &&
+                                     (action == Action::Unmap ||
+                                      (prot == run_prot && (action == Action::Protect ||
+                                                            (page == run_page + run_count * Sub &&
+                                                             ChunkOf(page) == ChunkOf(run_page)))));
+                if (!extends) {
+                    flush();
+                    run_action = action;
+                    run_start = index;
+                    run_page = page;
+                    run_prot = prot;
+                }
+                run_count++;
+                if (b.applied_page == 0 && page != 0)
+                    mapped_blocks++;
+                else if (b.applied_page != 0 && page == 0)
+                    mapped_blocks--;
+                b.applied_page = page;
+                b.applied_prot = prot;
+            }
+            if (b.applied_page == 0 && b.page[0] == 0 && b.page[1] == 0 && b.page[2] == 0 && b.page[3] == 0)
+                blocks.erase(it);
+        }
+        flush();
+        if (++updates % 4096 == 0)
+            Trace("fastmem: %llu updates, %llu kernel calls, %llu blocks (%llu MiB) mapped, %zu tracked",
+                  (unsigned long long)updates, (unsigned long long)calls, (unsigned long long)mapped_blocks,
+                  (unsigned long long)(mapped_blocks * HostPage >> 20), blocks.size());
+    }
+
+public:
+    /// Summary for the boot trace, with why tracked blocks aren't mapped.
+    void Report(const char* when) {
+        std::scoped_lock lk{mutex};
+        size_t incomplete = 0, misaligned = 0, mixed = 0, no_read = 0;
+        for (const auto& [index, b] : blocks) {
+            if (b.applied_page != 0)
+                continue;
+            bool complete = true, contiguous = true, same = true;
+            for (size_t i = 0; i < Sub; i++) {
+                complete &= b.page[i] != 0;
+                contiguous &= i == 0 || b.page[i] == b.page[0] + i;
+                same &= b.perm[i] == b.perm[0];
+            }
+            if (!complete)
+                incomplete++;
+            else if (!contiguous || (b.page[0] - 1) % Sub != 0)
+                misaligned++;
+            else if (!same)
+                mixed++;
+            else
+                no_read++;
+        }
+        Trace("fastmem (%s): %llu updates, %llu kernel calls, %llu blocks (%llu MiB) mapped, %zu tracked; "
+              "unmapped: %zu incomplete, %zu misaligned, %zu mixed perms, %zu no read",
+              when, (unsigned long long)updates, (unsigned long long)calls, (unsigned long long)mapped_blocks,
+              (unsigned long long)(mapped_blocks * HostPage >> 20), blocks.size(), incomplete, misaligned, mixed,
+              no_read);
+    }
+
+private:
+    __attribute__((format(printf, 1, 2))) static void Trace(const char* fmt, ...) {
+        char line[256];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(line, sizeof(line), fmt, args);
+        va_end(args);
+        LOG_INFO(HW_Memory, "{}", line);
+        if (ps4_boot_trace)
+            ps4_boot_trace(line);
+    }
+
+    static constexpr size_t Chunk = 0x200000;
+
+    /// MB/s copying `bytes` from src to dst a few times (both already mapped).
+    static double CopySpeed(u8* dst, const u8* src, size_t bytes) {
+        timespec t0, t1;
+        std::memcpy(dst, src, bytes); // warm up / fault in
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        constexpr int kRounds = 8;
+        for (int i = 0; i < kRounds; i++)
+            std::memcpy(dst, src, bytes);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double seconds = double(t1.tv_sec - t0.tv_sec) + double(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        return seconds > 0 ? double(bytes) * kRounds / seconds / 1e6 : 0;
+    }
+
+    /// Guest memory copies ran ~60x slower than on a PC (vs ~5x for integer code). Times host
+    /// copies in each kind of memory Eden uses, to see whether the emulated DRAM is the slow part:
+    /// flexible memory (malloc), fresh direct memory, the DRAM backing, and a second (aliased)
+    /// mapping of it as fastmem uses.
+    void MeasureBandwidth() {
+        constexpr size_t kBytes = 4u << 20;
+        u8* flex = static_cast<u8*>(std::malloc(kBytes * 2));
+        double flex_speed = 0, direct_speed = 0, backing_speed = 0, alias_speed = 0, mixed_speed = 0;
+        if (flex)
+            flex_speed = CopySpeed(flex + kBytes, flex, kBytes);
+        off_t phys = 0;
+        void* direct = nullptr;
+        if (sceKernelAllocateDirectMemory(0, off_t(sceKernelGetDirectMemorySize()), kBytes * 2, Chunk, WbOnion, &phys) == 0) {
+            if (sceKernelMapDirectMemory(&direct, kBytes * 2, ProtReadWrite, 0, phys, Chunk) == 0) {
+                auto* d = static_cast<u8*>(direct);
+                direct_speed = CopySpeed(d + kBytes, d, kBytes);
+                sceKernelMunmap(direct, kBytes * 2);
+            }
+            sceKernelReleaseDirectMemory(phys, kBytes * 2);
+        }
+        // The backing's first chunks (committed now; the guest gets them anyway).
+        const off_t c0 = Commit(0), c1 = Commit(1), c2 = Commit(2);
+        if (c0 >= 0 && c1 >= 0 && c2 >= 0) {
+            backing_speed = CopySpeed(backing_base + 2 * Chunk, backing_base, 2 * Chunk);
+            if (flex)
+                mixed_speed = CopySpeed(flex, backing_base, 2 * Chunk);
+            void* alias = nullptr;
+            if (sceKernelMapDirectMemory(&alias, Chunk, ProtReadWrite, 0, c0, Chunk) == 0) {
+                alias_speed = CopySpeed(backing_base + 2 * Chunk, static_cast<u8*>(alias), Chunk);
+                sceKernelMunmap(alias, Chunk);
+            }
+        }
+        std::free(flex);
+        Trace("host memory: copy speed MB/s - flexible %.0f, direct %.0f, DRAM backing %.0f, backing->flexible %.0f, "
+              "aliased view %.0f",
+              flex_speed, direct_speed, backing_speed, mixed_speed, alias_speed);
+    }
+
+    static size_t ChunkOf(u32 page) {
+        return size_t(page - 1) * GuestPage / Chunk;
+    }
+
+    /// Direct memory offset of a backing chunk, allocating, mapping and zeroing it on first use;
+    /// -1 when direct memory is exhausted. Safe in a signal handler: nothing here touches
+    /// uncommitted backing, so the thread holding the lock never faults into it.
+    off_t Commit(size_t chunk) {
+        std::scoped_lock lk{commit_mutex};
+        if (chunk_phys[chunk] >= 0)
+            return chunk_phys[chunk];
+        off_t phys = 0;
+        int32_t r = sceKernelAllocateDirectMemory(0, off_t(sceKernelGetDirectMemorySize()), Chunk, Chunk,
+                                                  WbOnion, &phys);
+        void* addr = backing_base + chunk * Chunk;
+        if (r == 0) {
+            sceKernelMunmap(addr, Chunk); // the reservation
+            void* target = addr;
+            r = sceKernelMapDirectMemory(&target, Chunk, ProtReadWrite, MapFixed, phys, Chunk);
+            if (r != 0) {
+                sceKernelReleaseDirectMemory(phys, Chunk);
+                void* hole = addr;
+                sceKernelReserveVirtualRange(&hole, Chunk, MapFixed, Chunk);
+            }
+        }
+        if (r != 0) {
+            if (commit_failures++ < 8)
+                Trace("host memory: committing DRAM chunk at %p failed (%#x), %zu MiB committed", addr, unsigned(r),
+                      committed_chunks * Chunk >> 20);
+            return -1;
+        }
+        std::memset(addr, 0, Chunk); // fresh DRAM reads as zero, as with Eden's memfd backing
+        chunk_phys[chunk] = phys;
+        if (++committed_chunks % 128 == 0)
+            Trace("host memory: %zu MiB of emulated DRAM committed", committed_chunks * Chunk >> 20);
+        return phys;
+    }
+
+public:
+    static inline std::atomic<PS4Arena*> g_dram{};
+
+private:
+    std::mutex commit_mutex;
+    std::vector<off_t> chunk_phys; ///< direct memory offset per backing chunk; -1 = not committed
+    size_t committed_chunks{};
+    unsigned commit_failures{};
+    size_t reserved_bytes{}; ///< fastmem reservation (arena_size rounded down to a power of two)
+    size_t backing_bytes{};
+    size_t arena_size{};
+    std::mutex mutex;
+    std::unordered_map<u64, Block> blocks;
+    u64 updates{}, calls{}, mapped_blocks{}, failures{};
+    int logged_maps{};
+};
+
+/// Called first by the SIGSEGV/SIGBUS handlers (dynarmic's, sparse_large_vector's swap handler):
+/// true when the fault was on uncommitted emulated DRAM, now committed - retry the access.
+extern "C" bool ps4_dram_fault(uintptr_t address) {
+    HostMemory::PS4Arena* const arena = HostMemory::PS4Arena::g_dram.load();
+    return arena && arena->HandleFault(address);
+}
+#endif
+
 HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     : backing_size(backing_size_)
     , virtual_size(virtual_size_)
 {
-#if defined(__OPENORBIS__) || defined(__managarm__)
+#if defined(__OPENORBIS__)
+    ps4_arena = std::make_unique<PS4Arena>(backing_size, virtual_size);
+    backing_base = ps4_arena->backing_base;
+    virtual_base = ps4_arena->virtual_base;
+#elif defined(__managarm__)
     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
     backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     virtual_base = nullptr;
@@ -750,7 +1239,10 @@ HostMemory::HostMemory(HostMemory&&) noexcept = default;
 HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
 
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
-#if !(defined(__OPENORBIS__) || defined(__managarm__))
+#if defined(__OPENORBIS__)
+    if (ps4_arena && virtual_base && length != 0)
+        ps4_arena->Map(virtual_offset, host_offset, length, perms);
+#elif !defined(__managarm__)
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(host_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
@@ -764,7 +1256,10 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
 }
 
 void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap) {
-#if !(defined(__OPENORBIS__) || defined(__managarm__))
+#if defined(__OPENORBIS__)
+    if (ps4_arena && virtual_base && length != 0)
+        ps4_arena->Unmap(virtual_offset, length);
+#elif !defined(__managarm__)
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
     ASSERT(virtual_offset + length <= virtual_size);
@@ -776,7 +1271,10 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
 }
 
 void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission perm) {
-#if !(defined(__OPENORBIS__) || defined(__managarm__))
+#if defined(__OPENORBIS__)
+    if (ps4_arena && virtual_base && length != 0)
+        ps4_arena->Protect(virtual_offset, length, perm);
+#elif !defined(__managarm__)
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
     ASSERT(virtual_offset + length <= virtual_size);
@@ -790,7 +1288,28 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 #endif
 }
 
+size_t HostMemory::FastmemArenaSize() const noexcept {
+#ifdef __OPENORBIS__
+    return ps4_arena && virtual_base ? ps4_arena->ArenaSize() : 0;
+#else
+    return virtual_base ? virtual_size : 0;
+#endif
+}
+
+void HostMemory::LogFastmemStats([[maybe_unused]] const char* when) {
+#ifdef __OPENORBIS__
+    if (ps4_arena && virtual_base)
+        ps4_arena->Report(when);
+#endif
+}
+
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+#ifdef __OPENORBIS__
+    if (ps4_arena) {
+        ps4_arena->Clear(physical_offset, length, fill_value);
+        return;
+    }
+#endif
     std::memset(backing_base + physical_offset, fill_value, length);
 }
 

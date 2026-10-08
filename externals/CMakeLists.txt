@@ -256,8 +256,13 @@ add_library(bc_decoder bc_decoder/bc_decoder.cpp)
 target_include_directories(bc_decoder PUBLIC ./bc_decoder)
 
 if (OPENORBIS)
-    add_library(ps4sup ps4sup/emutls.c ps4sup/stub.cpp)
+    add_library(ps4sup ps4sup/emutls.c ps4sup/stub.cpp ps4sup/crashlog.cpp ps4sup/status_screen.cpp ps4sup/ps4_menu.cpp ps4sup/sampler.cpp
+        ps4sup/dps4/ps4_runtime.cpp ps4sup/dps4/ps4_dlmalloc.c ps4sup/dps4/ps4_string.c)
     target_include_directories(ps4sup PUBLIC ./ps4sup)
+    # The heap (malloc wrappers) uses thread_local; with emulated TLS those are allocated through
+    # malloc itself and would recurse. Native TLS, as DolphinPS4 runs it on hardware.
+    set_source_files_properties(ps4sup/dps4/ps4_runtime.cpp ps4sup/dps4/ps4_dlmalloc.c
+        ps4sup/crashlog.cpp PROPERTIES COMPILE_OPTIONS "-fno-emulated-tls")
 endif()
 
 if (NOT TARGET RenderDoc::API)
