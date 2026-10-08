@@ -241,9 +241,11 @@ struct GameEntry {
     char detail[128];
     const uint32_t* icon;
     uint32_t accent; // the icon's average colour (or the tile colour)
-    // Icon scaled (box filter) to kCardSize and kCardBig, made on first use.
+    // The icon scaled (box filter) to the two sizes in use (a card and the selected card, in either
+    // layout), made on first use.
     uint32_t* small = nullptr;
     uint32_t* big = nullptr;
+    int small_size = 0, big_size = 0;
 };
 GameEntry g_games[kMaxGames];
 int g_game_count = 0;
@@ -259,6 +261,7 @@ int g_setting_count = 0;
 int g_tab = 0, g_game_sel = 0, g_setting_sel = 0, g_install_count = 0;
 char g_scope[kLineLen] = "All games";
 bool g_scope_switchable = false;
+int g_layout = kLayoutGrid, g_shortcut = -1;
 bool g_has_pad = true;
 char g_toast[kLineLen] = "";
 double g_toast_until = 0;
@@ -283,6 +286,7 @@ struct Anim {
     float grid_scroll = 0, list_scroll = 0;       // pixels
     float tint_r = 30, tint_g = 60, tint_b = 120; // background tint
     float tab_x = -1, tab_w = 0;                  // tab underline
+    float row_scroll = 0;                         // row layout: pixels
     double last = 0;
 } g_anim;
 
@@ -510,6 +514,29 @@ uint32_t* ScaleIcon(const uint32_t* icon, int size) {
     auto* out = static_cast<uint32_t*>(malloc(size_t(size) * size * 4));
     if (!out)
         return nullptr;
+    if (size > kLauncherIconSize) { // enlarging (the row layout's tiles): bilinear
+        constexpr int kMax = kLauncherIconSize - 1;
+        for (int y = 0; y < size; y++) {
+            const float fy = std::clamp((float(y) + 0.5f) * kLauncherIconSize / size - 0.5f, 0.0f, float(kMax));
+            const int y0 = int(fy), y1 = std::min(y0 + 1, kMax);
+            const float ty = fy - float(y0);
+            for (int x = 0; x < size; x++) {
+                const float fx = std::clamp((float(x) + 0.5f) * kLauncherIconSize / size - 0.5f, 0.0f, float(kMax));
+                const int x0 = int(fx), x1 = std::min(x0 + 1, kMax);
+                const float tx = fx - float(x0);
+                const uint32_t p00 = icon[y0 * kLauncherIconSize + x0], p01 = icon[y0 * kLauncherIconSize + x1],
+                               p10 = icon[y1 * kLauncherIconSize + x0], p11 = icon[y1 * kLauncherIconSize + x1];
+                const auto mix = [&](uint32_t c00, uint32_t c01, uint32_t c10, uint32_t c11) {
+                    const float top = float(c00) + (float(c01) - float(c00)) * tx;
+                    const float bottom = float(c10) + (float(c11) - float(c10)) * tx;
+                    return uint8_t(top + (bottom - top) * ty + 0.5f);
+                };
+                out[y * size + x] = Rgb(mix(R(p00), R(p01), R(p10), R(p11)), mix(G(p00), G(p01), G(p10), G(p11)),
+                                        mix(B(p00), B(p01), B(p10), B(p11)));
+            }
+        }
+        return out;
+    }
     for (int y = 0; y < size; y++) {
         const int y0 = y * kLauncherIconSize / size, y1 = std::max(y0 + 1, (y + 1) * kLauncherIconSize / size);
         for (int x = 0; x < size; x++) {
@@ -539,11 +566,16 @@ void DrawCardImage(GameEntry& g, int x, int y, int size) {
     constexpr int kRadius = 18;
     const uint32_t* pixels = nullptr;
     if (g.icon) {
-        uint32_t*& cached = size >= kCardBig ? g.big : g.small;
-        if (!cached)
-            cached = ScaleIcon(g.icon, size >= kCardBig ? kCardBig : kCardSize);
-        pixels = cached;
-        size = size >= kCardBig ? kCardBig : kCardSize;
+        // Reuse a copy of this size; otherwise replace the smaller-or-equal slot's copy (a layout
+        // change or a card becoming selected rescales once).
+        if (g.small_size != size && g.big_size != size) {
+            const bool use_small = size < g.big_size;
+            uint32_t*& slot = use_small ? g.small : g.big;
+            free(slot);
+            slot = ScaleIcon(g.icon, size);
+            (use_small ? g.small_size : g.big_size) = slot ? size : 0;
+        }
+        pixels = g.small_size == size ? g.small : g.big;
     }
     if (!pixels) {
         RoundRect(x, y, size, size, kRadius, g.accent);
@@ -595,6 +627,7 @@ void DrawCard(GameEntry& g, int x, int y, int size, bool selected) {
 void DrawCard(const GameEntry& g, int x, int y, int size, bool selected) {
     GameEntry copy = g;
     copy.small = copy.big = nullptr; // a temporary: don't cache into it
+    copy.small_size = copy.big_size = 0;
     if (copy.icon && size != kCardSize && size != kCardBig) {
         // Arbitrary size (loading screen): nearest-neighbour from the source icon.
         Shadow(x, y, size, size, 22);
@@ -652,6 +685,107 @@ void DrawToast(double now) {
     DrawText(kBold, x + 35, y + (h - kBoldFontHeight) / 2, text, Rgb(14, 20, 34));
 }
 
+// Row layout of the games tab: one row of large tiles that scrolls sideways, the selected game's
+// title above it, and round shortcuts below. Returns true while animating.
+bool DrawGameRow(int game_sel, int game_count, int shortcut, float k) {
+    constexpr int kTile = 300, kBig = 340, kGap = 30, kPitch = kTile + kGap, kLeft = 100, kTop = 250;
+    constexpr int kVisible = (kWidth - 2 * kLeft + kGap) / kPitch;
+    bool moving = false;
+    // Scrolls only when the selection would leave the screen, by as little as needed.
+    static int first = 0;
+    const int max_first = std::max(0, game_count - kVisible);
+    if (game_sel < first)
+        first = game_sel;
+    if (game_sel > first + kVisible - 1)
+        first = game_sel - kVisible + 1;
+    first = std::clamp(first, 0, max_first);
+    const float target = float(first * kPitch);
+    moving |= Approach(g_anim.row_scroll, target, k);
+    const float sel_x = float(kLeft + game_sel * kPitch - (kBig - kTile) / 2);
+    if (g_anim.ring_x < 0)
+        g_anim.ring_x = sel_x;
+    moving |= Approach(g_anim.ring_x, sel_x, k);
+    const int scroll = int(g_anim.row_scroll);
+    const bool on_games = shortcut < 0;
+
+    Lock();
+    for (int i = 0; i < game_count; i++) {
+        const int x = kLeft + i * kPitch - scroll;
+        if (i == game_sel || x < kLeft - kGap || x > kWidth)
+            continue; // the edge of the screen shows there is more to the right; the left stays clear
+        Shadow(x, kTop, kTile, kTile, 22);
+        DrawCardImage(g_games[i], x, kTop, kTile);
+    }
+    GameEntry& g = g_games[game_sel];
+    const int sx = int(g_anim.ring_x) - scroll, sy = kTop - (kBig - kTile) / 2;
+    Shadow(sx, sy, kBig, kBig, 26);
+    if (on_games) {
+        RoundRect(sx - 9, sy - 9, kBig + 18, kBig + 18, 32, kAccent);
+        RoundRect(sx - 4, sy - 4, kBig + 8, kBig + 8, 27, Rgb(14, 20, 34));
+    }
+    DrawCardImage(g, sx, sy, kBig);
+    char title[96], detail[128];
+    CopyText(title, sizeof(title), g.title);
+    CopyText(detail, sizeof(detail), g.detail);
+    Unlock();
+    // The selected game's title above it, kept on screen.
+    Ellipsize(kBold, title, sizeof(title), 900);
+    const int tw = TextWidth(kBold, title);
+    const int tx = std::clamp(sx + kBig / 2 - tw / 2, kLeft, kWidth - kLeft - tw);
+    DrawText(kBold, tx, sy - 62, title, on_games ? kAccent : kDim);
+
+    // Shortcuts: round buttons, centred, with the selected one's name under it.
+    static const char* const kNames[kShortcutCount] = {"Settings", "Install updates and DLC", "Back up saves"};
+    constexpr int kR = 46, kStep = 136, kY = 730;
+    const int x0 = kWidth / 2 - (kShortcutCount - 1) * kStep / 2;
+    for (int i = 0; i < kShortcutCount; i++) {
+        const int cx = x0 + i * kStep;
+        const bool sel = i == shortcut;
+        if (sel)
+            Disc(cx, kY, kR + 8, kAccent);
+        Disc(cx, kY, kR, sel ? Rgb(48, 62, 96) : Rgb(30, 40, 64));
+        const uint32_t ink = sel ? kWhite : Rgb(190, 202, 225);
+        switch (i) {
+        case kShortcutSettings: // a gear
+            for (int t = 0; t < 8; t++) {
+                const float a = float(t) * 3.14159265f / 4;
+                Disc(cx + int(std::cos(a) * 20), kY + int(std::sin(a) * 20), 6, ink);
+            }
+            Disc(cx, kY, 19, ink);
+            Disc(cx, kY, 8, sel ? Rgb(48, 62, 96) : Rgb(30, 40, 64));
+            break;
+        case kShortcutInstall: // an arrow into a tray
+            Line(cx, kY - 24, cx, kY + 8, 6, ink);
+            Line(cx - 13, kY - 5, cx, kY + 9, 6, ink);
+            Line(cx + 13, kY - 5, cx, kY + 9, 6, ink);
+            Line(cx - 22, kY + 22, cx + 22, kY + 22, 6, ink);
+            break;
+        default: { // a save card
+            const uint32_t bg = sel ? Rgb(48, 62, 96) : Rgb(30, 40, 64);
+            RoundRect(cx - 21, kY - 24, 42, 48, 7, ink);
+            RoundRect(cx - 13, kY - 24, 24, 15, 3, bg);
+            RoundRect(cx - 13, kY + 4, 26, 14, 3, bg);
+            break;
+        }
+        }
+    }
+    if (!on_games) {
+        const char* name = kNames[std::clamp(shortcut, 0, kShortcutCount - 1)];
+        DrawText(kBold, x0 + shortcut * kStep - TextWidth(kBold, name) / 2, kY + kR + 22, name, kWhite);
+    }
+
+    // Info bar: the selected game's details.
+    if (on_games) {
+        RoundRect(80, 850, kWidth - 160, 64, 20, Rgb(10, 13, 24), 150);
+        DrawText(kRegular, 108, 850 + (64 - kStatusFontHeight) / 2, detail, kDim, kWidth - 260);
+        char count_text[48];
+        snprintf(count_text, sizeof(count_text), "%d of %d", game_sel + 1, game_count);
+        DrawText(kWidth - 108 - TextWidth(kRegular, count_text), 850 + (64 - kStatusFontHeight) / 2, count_text,
+                 kDim);
+    }
+    return moving;
+}
+
 void DrawLauncher() {
     const double now = Elapsed();
     const float dt = g_anim.last > 0 ? float(std::min(now - g_anim.last, 0.1)) : 1.0f;
@@ -663,6 +797,7 @@ void DrawLauncher() {
     const int tab = g_tab, game_sel = g_game_sel, setting_sel = g_setting_sel, game_count = g_game_count,
               setting_count = g_setting_count, install_count = g_install_count;
     const bool has_pad = g_has_pad, scope_switchable = g_scope_switchable;
+    const int layout = g_layout, shortcut = g_shortcut;
     char scope[kLineLen];
     CopyText(scope, sizeof(scope), g_scope);
     const uint32_t accent = game_count > 0 && tab == kLauncherGames ? g_games[game_sel].accent : kAccent;
@@ -712,6 +847,8 @@ void DrawLauncher() {
             DrawText(100, 450, "Copy games (.nsp, .xci) or homebrew (.nro) to /data/switch-emu/games over FTP,", kText);
             DrawText(100, 492, "then restart the app. Keys go in /data/switch-emu/keys, firmware in", kText);
             DrawText(100, 534, "/data/switch-emu/nand/system/Contents/registered.", kText);
+        } else if (layout == kLayoutRow) {
+            moving |= DrawGameRow(game_sel, game_count, shortcut, k);
         } else {
             constexpr int kCols = kLauncherColumns, kGapX = 62, kTitleH = 44, kGapY = 24, kTop = 140, kRows = 3,
                           kRowH = kCardSize + kTitleH + kGapY, kLeft = 100;
@@ -779,7 +916,12 @@ void DrawLauncher() {
         }
         int hx = 100;
         const int hy = 936;
-        if (game_count > 0) {
+        if (game_count > 0 && layout == kLayoutRow && shortcut >= 0) {
+            hx = DrawButton(hx, hy, Button::Cross);
+            hx = Hint(hx, hy, "Open");
+            hx = DrawButton(hx, hy, Button::Circle);
+            hx = Hint(hx, hy, "Back to games");
+        } else if (game_count > 0) {
             hx = DrawButton(hx, hy, Button::Cross);
             hx = Hint(hx, hy, "Play");
             hx = DrawButton(hx, hy, Button::Square);
@@ -1204,6 +1346,7 @@ void ps4_launcher_set_games(const Ps4LauncherGame* games, int count) {
         free(g_games[i].small);
         free(g_games[i].big);
         g_games[i].small = g_games[i].big = nullptr;
+        g_games[i].small_size = g_games[i].big_size = 0;
     }
     g_game_count = count < kMaxGames ? count : kMaxGames;
     for (int i = 0; i < g_game_count; i++) {
@@ -1233,6 +1376,16 @@ void ps4_launcher_set_settings(const Ps4LauncherSetting* settings, int count) {
         g_setting_count = n;
         memcpy(g_settings, fresh, sizeof(SettingEntry) * size_t(n));
     }
+    Unlock();
+    if (changed)
+        g_dirty++;
+}
+
+void ps4_launcher_set_layout(int layout, int shortcut) {
+    Lock();
+    const bool changed = layout != g_layout || shortcut != g_shortcut;
+    g_layout = layout;
+    g_shortcut = shortcut;
     Unlock();
     if (changed)
         g_dirty++;

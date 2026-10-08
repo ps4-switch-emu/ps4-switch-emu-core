@@ -112,6 +112,87 @@ extern "C" int ps4_overlay_mode();
 extern "C" void ps4_swapchain_show_loading(const char* progress); // vk_swapchain.cpp
 #define PS4_STAGE(...) ps4_status_set_stage(fmt::format(__VA_ARGS__).c_str())
 
+// The launcher's library: a game's real title and icon, read from its file into
+// /data/switch-emu/titles/<file>.txt and .jpg (what ps4_menu.cpp shows).
+static void PS4CacheTitle(Core::System& system, const std::string& filepath) {
+    const auto file = system.GetFilesystem()->OpenFile(filepath, FileSys::OpenMode::Read);
+    if (!file)
+        return;
+    const auto loader = Loader::GetLoader(system, file);
+    if (!loader)
+        return;
+    const std::string base = filepath.substr(filepath.rfind('/') + 1);
+    mkdir("/data/switch-emu/titles", 0777);
+    std::string title;
+    if (loader->ReadTitle(title) == Loader::ResultStatus::Success && !title.empty()) {
+        if (FILE* f = fopen(("/data/switch-emu/titles/" + base + ".txt").c_str(), "w")) {
+            fputs(title.c_str(), f);
+            fclose(f);
+        }
+    }
+    std::vector<u8> icon;
+    if (loader->ReadIcon(icon) == Loader::ResultStatus::Success && !icon.empty()) {
+        if (FILE* f = fopen(("/data/switch-emu/titles/" + base + ".jpg").c_str(), "wb")) {
+            fwrite(icon.data(), 1, icon.size(), f);
+            fclose(f);
+        }
+    }
+    PS4_TRACE("library: {}: \"{}\", icon {} bytes", base, title, icon.size());
+}
+
+// Before the launcher: reads the title and icon of every game (.nsp, .xci) not read yet, so the
+// library shows them before a game's first start. Reading a file runs behind a marker
+// (titles/<file>.scanning); if it crashed the app, the next start marks that file .unreadable and
+// skips it from then on.
+static void PS4ScanLibrary(Core::System& system) {
+    constexpr const char* kGames = "/data/switch-emu/games/";
+    constexpr const char* kTitles = "/data/switch-emu/titles/";
+    struct stat st;
+    if (stat("/data/switch-emu/keys/prod.keys", &st) != 0)
+        return; // .nsp and .xci can't be read without the keys
+    std::vector<std::string> todo;
+    if (DIR* dir = opendir(kGames)) {
+        while (dirent* entry = readdir(dir)) {
+            const std::string name = entry->d_name;
+            if (name.size() < 5)
+                continue;
+            std::string ext = name.substr(name.size() - 4);
+            for (char& c : ext)
+                c = char(tolower(c));
+            if (ext != ".nsp" && ext != ".xci")
+                continue;
+            const std::string base = kTitles + name;
+            if (stat((base + ".scanning").c_str(), &st) == 0) {
+                rename((base + ".scanning").c_str(), (base + ".unreadable").c_str());
+                PS4_TRACE("library: {} crashed the app while being read; skipped from now on", name);
+                continue;
+            }
+            if (stat((base + ".txt").c_str(), &st) != 0 && stat((base + ".unreadable").c_str(), &st) != 0)
+                todo.push_back(name);
+        }
+        closedir(dir);
+    }
+    if (todo.empty())
+        return;
+    std::sort(todo.begin(), todo.end());
+    mkdir(kTitles, 0777);
+    system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+    system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
+    system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
+    for (size_t i = 0; i < todo.size(); i++) {
+        PS4_STAGE("Reading game info ({} of {})", i + 1, todo.size());
+        const std::string marker = kTitles + todo[i] + ".scanning";
+        if (FILE* f = fopen(marker.c_str(), "w"))
+            fclose(f);
+        try {
+            PS4CacheTitle(system, kGames + todo[i]);
+        } catch (const std::exception& e) {
+            PS4_TRACE("library: {}: {}", todo[i], e.what());
+        }
+        remove(marker.c_str());
+    }
+}
+
 // Menu "Install updates/DLC": installs every .nsp in /data/switch-emu/install into the emulated user
 // NAND (Eden applies updates and DLC from there when the base game starts), moves the installed
 // files to /data/switch-emu/install/installed/, then restarts to the menu. Doesn't return.
@@ -348,7 +429,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     }
     Common::InitSwap();
     PS4_TRACE("main: swap handler installed");
-    // Options menu (or the next run of a benchmark suite); sets the switch files read below.
+    // Titles and icons for games added since the last start, then the launcher (or the next run
+    // of a benchmark suite); the launcher sets the switch files read below.
+    PS4ScanLibrary(state->system);
     ps4_menu_run();
 #endif
 
@@ -650,29 +733,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     PS4_TRACE("main: load result {}", int(load_result));
 #ifdef __OPENORBIS__
     if (load_result == Core::SystemResultStatus::Success) {
-        // The launcher's library: remember this game's real title and icon
-        // (/data/switch-emu/titles/<file>.txt and .jpg).
-        if (const auto file = state->system.GetFilesystem()->OpenFile(filepath, FileSys::OpenMode::Read)) {
-            if (const auto loader = Loader::GetLoader(state->system, file)) {
-                const std::string base = filepath.substr(filepath.rfind('/') + 1);
-                mkdir("/data/switch-emu/titles", 0777);
-                std::string title;
-                if (loader->ReadTitle(title) == Loader::ResultStatus::Success && !title.empty()) {
-                    if (FILE* f = fopen(("/data/switch-emu/titles/" + base + ".txt").c_str(), "w")) {
-                        fputs(title.c_str(), f);
-                        fclose(f);
-                    }
-                }
-                std::vector<u8> icon;
-                if (loader->ReadIcon(icon) == Loader::ResultStatus::Success && !icon.empty()) {
-                    if (FILE* f = fopen(("/data/switch-emu/titles/" + base + ".jpg").c_str(), "wb")) {
-                        fwrite(icon.data(), 1, icon.size(), f);
-                        fclose(f);
-                    }
-                }
-                PS4_TRACE("library: \"{}\", icon {} bytes", title, icon.size());
-            }
-        }
+        // The launcher's library: remember this game's real title and icon.
+        PS4CacheTitle(state->system, filepath);
         // Saves live per user and title: show which user is active and whether this game has saved
         // before (so a missing save after a restart can be told apart from a changed user).
         const auto user = state->system.GetProfileManager().GetUser(Settings::values.current_user.GetValue());

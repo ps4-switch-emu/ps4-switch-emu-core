@@ -404,6 +404,26 @@ struct Options {
     int overlay_corner = 1; ///< Ps4OverlayCorner (top right)
 };
 
+// /data/switch-emu/launcher.txt: the games tab's layout (Ps4LauncherLayout), for all games.
+constexpr const char* kLauncherFile = "/data/switch-emu/launcher.txt";
+
+int ReadLayout() {
+    int layout = kLayoutGrid;
+    if (FILE* f = fopen(kLauncherFile, "r")) {
+        if (fscanf(f, "layout %d", &layout) != 1)
+            layout = kLayoutGrid;
+        fclose(f);
+    }
+    return std::clamp(layout, 0, 1);
+}
+
+void SaveLayout(int layout) {
+    if (FILE* f = fopen(kLauncherFile, "w")) {
+        fprintf(f, "layout %d\n", layout);
+        fclose(f);
+    }
+}
+
 // /data/switch-emu/overlay.txt: "<mode> <corner>" for yuzu_cmd's performance overlay.
 int ReadOverlay(int field) {
     int mode = 0, corner = 1;
@@ -821,7 +841,9 @@ void ps4_menu_run() {
     ps4_launcher_show(true);
 
     enum Row { kGraphics, kMode, kResolution, kGpuAccuracy, kButtons, kSpread, kMulticore, kFastmem, kAccuracy, kAsync, kProfiler, kBenchmarks, kInstall,
-               kBackup, kUseGlobal, kOverlay, kOverlayCorner, kKeys, kFirmware };
+               kBackup, kUseGlobal, kOverlay, kOverlayCorner, kKeys, kFirmware, kLayout };
+    int layout = ReadLayout();
+    int shortcut = -1; // row layout: the selected shortcut below the games (-1: a game)
     static const char* const kOverlayModes[] = {"Off", "FPS", "Detailed"};
     static const char* const kCorners[] = {"Top left", "Top right", "Bottom left", "Bottom right"};
     std::string backup_value = "Back up now";
@@ -848,6 +870,8 @@ void ps4_menu_run() {
         Options& o = game_scope ? game_opts : global;
         std::vector<int> ids = {kGraphics, kMode, kResolution, kGpuAccuracy, kButtons, kSpread, kMulticore, kFastmem,
                                 kAccuracy, kAsync, kOverlay, kOverlayCorner, kProfiler};
+        if (!game_scope) // the launcher's own setting, for all games
+            ids.insert(ids.begin() + 4, kLayout);
         if (game_scope)
             ids.push_back(kUseGlobal);
         else
@@ -948,6 +972,11 @@ void ps4_menu_run() {
                                     "Copies all save data to /data/switch-emu/save-backups/<date and time>. To "
                                     "restore, copy a backup's folders back into /data/switch-emu/nand/user/save."});
                 break;
+            case kLayout:
+                settings.push_back({"Games layout", layout == kLayoutRow ? "Console row" : "Grid",
+                                    "Grid shows 24 games at a time. Console row shows one row of large tiles "
+                                    "with shortcuts below (Down to reach them), like a console's home screen."});
+                break;
             case kKeys:
                 settings.push_back({"Keys", keys_value,
                                     "prod.keys and title.keys, dumped from your own Switch, go in "
@@ -970,7 +999,7 @@ void ps4_menu_run() {
         // Sections and how each value is drawn.
         for (size_t j = 0; j < ids.size(); j++) {
             switch (ids[j]) {
-            case kGraphics: case kMode: case kResolution: case kGpuAccuracy:
+            case kGraphics: case kMode: case kResolution: case kGpuAccuracy: case kLayout:
                 settings[j].group = "Display";
                 settings[j].kind = kSettingChoice;
                 break;
@@ -1010,6 +1039,7 @@ void ps4_menu_run() {
         }
         ps4_launcher_set_settings(settings.data(), int(settings.size()));
         ps4_launcher_set_state(tab, game, row);
+        ps4_launcher_set_layout(layout, shortcut);
         ps4_launcher_set_info(install_count, pad.Ok());
         std::string scope = "All games";
         if (game_scope)
@@ -1017,13 +1047,53 @@ void ps4_menu_run() {
         ps4_launcher_set_scope(scope.c_str(), !games.empty());
 
         const uint32_t pressed = pad.Pressed();
-        const int old_tab = tab, old_game = game, old_row = row;
+        const int old_tab = tab, old_game = game, old_row = row, old_shortcut = shortcut;
         const bool old_scope = game_scope;
         if (pressed & (kL1 | kR1))
             tab = (pressed & kR1) ? kLauncherSettings : kLauncherGames;
         if (tab == kLauncherGames) {
             const int count = int(games.size());
-            if (count > 0) {
+            if (count > 0 && layout == kLayoutRow && shortcut >= 0) {
+                // The shortcuts below the row of games.
+                if ((pressed & kLeft) && shortcut > 0)
+                    shortcut--;
+                if ((pressed & kRight) && shortcut + 1 < kShortcutCount)
+                    shortcut++;
+                if (pressed & (kUp | kCircle))
+                    shortcut = -1;
+                if (pressed & kCross) {
+                    if (shortcut == kShortcutSettings) {
+                        tab = kLauncherSettings;
+                        shortcut = -1;
+                    } else if (shortcut == kShortcutInstall) {
+                        if (install_count > 0) {
+                            start_install = true;
+                            break;
+                        }
+                        ps4_launcher_toast("Nothing to install: put update/DLC .nsp files in /data/switch-emu/install");
+                    } else {
+                        backup_value = BackUpSaves();
+                        ps4_launcher_toast(("Save backup: " + backup_value).c_str());
+                    }
+                }
+            } else if (count > 0 && layout == kLayoutRow) {
+                // One row of games; Down goes to the shortcuts.
+                if ((pressed & kLeft) && game > 0)
+                    game--;
+                if ((pressed & kRight) && game + 1 < count)
+                    game++;
+                if (pressed & kDown)
+                    shortcut = 0;
+                if (pressed & (kCross | kOptions)) {
+                    start_game = true;
+                    break;
+                }
+                if (pressed & kSquare) { // this game's settings
+                    tab = kLauncherSettings;
+                    game_scope = true;
+                    row = 0;
+                }
+            } else if (count > 0) {
                 // Grid of kLauncherColumns per row (status_screen.cpp draws it).
                 if ((pressed & kLeft) && game > 0)
                     game--;
@@ -1061,6 +1131,10 @@ void ps4_menu_run() {
             }
             if (pressed & (kCross | kLeft | kRight)) {
                 switch (ids[size_t(row)]) {
+                case kLayout:
+                    layout = layout == kLayoutRow ? kLayoutGrid : kLayoutRow;
+                    SaveLayout(layout);
+                    break;
                 case kGraphics:
                     o.graphics = !o.graphics;
                     break;
@@ -1149,7 +1223,10 @@ void ps4_menu_run() {
             sounds.Play(MenuSounds::kBack);
         else if (tab == kLauncherSettings && old_tab == tab && (pressed & (kCross | kLeft | kRight)))
             sounds.Play(MenuSounds::kConfirm);
-        else if (tab != old_tab || game != old_game || row != old_row || game_scope != old_scope)
+        else if (tab == kLauncherGames && old_shortcut >= 0 && (pressed & kCross))
+            sounds.Play(MenuSounds::kConfirm);
+        else if (tab != old_tab || game != old_game || row != old_row || game_scope != old_scope ||
+                 shortcut != old_shortcut)
             sounds.Play(MenuSounds::kMove);
         usleep(16 * 1000);
     }

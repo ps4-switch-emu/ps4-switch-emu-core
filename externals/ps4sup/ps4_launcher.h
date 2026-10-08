@@ -52,10 +52,17 @@ constexpr int kOverlayFpsW = 190, kOverlayFpsH = 70, kOverlayDetailW = 430, kOve
 
 enum Ps4LauncherTab { kLauncherGames = 0, kLauncherSettings = 1 };
 
+// Games tab: a grid, or one row of large tiles with round shortcuts below (console style).
+enum Ps4LauncherLayout { kLayoutGrid = 0, kLayoutRow = 1 };
+// The row layout's shortcuts, left to right.
+enum Ps4LauncherShortcut { kShortcutSettings = 0, kShortcutInstall = 1, kShortcutBackup = 2, kShortcutCount = 3 };
+
 extern "C" {
 void ps4_launcher_set_games(const Ps4LauncherGame* games, int count);
 void ps4_launcher_set_settings(const Ps4LauncherSetting* settings, int count);
 void ps4_launcher_set_state(int tab, int game, int setting);
+// The games tab's layout and, in the row layout, the selected shortcut (-1: the games row).
+void ps4_launcher_set_layout(int layout, int shortcut);
 // The button hints' install count, and whether a controller is connected (else a warning).
 void ps4_launcher_set_info(int install_count, bool has_pad);
 void ps4_launcher_show(bool on);
