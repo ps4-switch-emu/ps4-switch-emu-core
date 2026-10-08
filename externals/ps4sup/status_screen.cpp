@@ -165,13 +165,16 @@ void FillRect(int x, int y, int w, int h, uint32_t color) {
             g_frame[row * kWidth + col] = color;
 }
 
-uint32_t Blend(uint32_t dst, uint32_t src, uint32_t alpha) {
-    uint32_t out = 0xFF000000u;
-    for (int shift = 0; shift < 24; shift += 8) {
-        const uint32_t d = (dst >> shift) & 0xFF, s = (src >> shift) & 0xFF;
-        out |= ((s * alpha + d * (255 - alpha)) / 255) << shift;
-    }
-    return out;
+// d toward s by a/256, all channels at once (packed: red+blue, then green).
+inline uint32_t Lerp(uint32_t d, uint32_t s, uint32_t a) {
+    const uint32_t rb = (((s & 0xFF00FFu) * a + (d & 0xFF00FFu) * (256 - a)) >> 8) & 0xFF00FFu;
+    const uint32_t g = (((s & 0x00FF00u) * a + (d & 0x00FF00u) * (256 - a)) >> 8) & 0x00FF00u;
+    return 0xFF000000u | rb | g;
+}
+
+// src over dst with alpha 0..255.
+inline uint32_t Blend(uint32_t dst, uint32_t src, uint32_t alpha) {
+    return Lerp(dst, src, alpha + (alpha >> 7)); // 0..255 -> 0..256
 }
 
 struct Font {
@@ -237,6 +240,8 @@ double Elapsed() {
 
 constexpr int kMaxGames = 128, kMaxSettings = 24;
 constexpr int kCardSize = 160, kCardBig = 180; // icon sizes kept scaled per game (normal, selected)
+constexpr int kRowTile = 300, kRowBig = 340;    // the row layout's cards (normal, selected)
+constexpr int kLoadingCard = 360;               // the loading screen's card
 struct GameEntry {
     char title[96];
     char detail[128];
@@ -319,13 +324,6 @@ bool ApproachUnit(float& v, float target, float k) {
 float Ease(float t) {
     t = std::clamp(t, 0.0f, 1.0f);
     return t * t * (3.0f - 2.0f * t);
-}
-
-// d toward s by a/256 (packed pixels, fast enough for whole-frame cross-fades).
-inline uint32_t Lerp(uint32_t d, uint32_t s, uint32_t a) {
-    const uint32_t rb = (((s & 0xFF00FFu) * a + (d & 0xFF00FFu) * (256 - a)) >> 8) & 0xFF00FFu;
-    const uint32_t g = (((s & 0x00FF00u) * a + (d & 0x00FF00u) * (256 - a)) >> 8) & 0x00FF00u;
-    return 0xFF000000u | rb | g;
 }
 
 // Blends the saved frame over rows y0.. of the current one (a = 256: all the saved frame).
@@ -452,6 +450,12 @@ const ShadowMask& GetShadowMask(int w, int h, int r) {
 }
 
 void Shadow(int x, int y, int w, int h, int r) {
+    // A card between its resting sizes (growing, shrinking, the launch zoom): the shadow of the
+    // nearest multiple of 20, centred, so a handful of masks serve every size in between.
+    if (w == h && w != kCardSize && w != kCardBig && w != kRowTile && w != kRowBig && w != kLoadingCard) {
+        const int q = std::max(20, (w + 10) / 20 * 20);
+        x += (w - q) / 2, y += (h - q) / 2, w = h = q;
+    }
     const ShadowMask& m = GetShadowMask(w, h, r);
     const int mw = w + 2 * kShadowPad, mh = h + 2 * kShadowPad + kShadowDrop;
     const int ox = x - kShadowPad, oy = y - kShadowPad;
@@ -619,6 +623,36 @@ uint32_t AverageColor(const uint32_t* icon) {
 void DrawCardImage(GameEntry& g, int x, int y, int size) {
     constexpr int kRadius = 18;
     const uint32_t* pixels = nullptr;
+    if (g.icon && size != kCardSize && size != kCardBig && size != kRowTile && size != kRowBig &&
+        size != kLoadingCard && g.small_size != size && g.big_size != size) {
+        // A size in between (a card growing or shrinking): each pixel straight from the icon,
+        // no scaled copy (one a frame would cost far more than the drawing).
+        int src_x[kLoadingCard];
+        for (int col = 0; col < size && col < kLoadingCard; col++)
+            src_x[col] = col * kLauncherIconSize / size;
+        for (int row = 0; row < size; row++) {
+            const int py = y + row;
+            if (py < 0 || py >= kHeight)
+                continue;
+            const uint32_t* src = g.icon + (row * kLauncherIconSize / size) * kLauncherIconSize;
+            const bool corner_row = row < kRadius || row >= size - kRadius;
+            uint32_t* dst = g_frame + size_t(py) * kWidth;
+            for (int col = 0; col < size && col < kLoadingCard; col++) {
+                const int px = x + col;
+                if (px < 0 || px >= kWidth)
+                    continue;
+                const uint32_t c = 0xFF000000u | src[src_x[col]];
+                if (corner_row && (col < kRadius || col >= size - kRadius)) {
+                    const uint32_t a = RoundCoverage(px, py, x, y, size, size, kRadius);
+                    if (a)
+                        dst[px] = Blend(dst[px], c, a);
+                } else {
+                    dst[px] = c;
+                }
+            }
+        }
+        return;
+    }
     if (g.icon) {
         // Reuse a copy of this size; otherwise replace the smaller-or-equal slot's copy (a layout
         // change or a card becoming selected rescales once).
@@ -649,24 +683,32 @@ void DrawCardImage(GameEntry& g, int x, int y, int size) {
         DrawText(f, x + (size - TextWidth(f, initials)) / 2, y + (size - f.height) / 2, initials, kWhite, x + size);
         return;
     }
+    // Rows straight across (clipped to the screen); only the rounded corners blend.
+    const int col0 = std::max(0, -x), col1 = std::min(size, kWidth - x);
+    if (col0 >= col1)
+        return;
     for (int row = 0; row < size; row++) {
         const int py = y + row;
         if (py < 0 || py >= kHeight)
             continue;
-        const bool corner_row = row < kRadius || row >= size - kRadius;
         uint32_t* dst = g_frame + size_t(py) * kWidth;
-        for (int col = 0; col < size; col++) {
+        const uint32_t* src = pixels + size_t(row) * size;
+        if (row >= kRadius && row < size - kRadius) {
+            memcpy(dst + x + col0, src + col0, size_t(col1 - col0) * 4);
+            continue;
+        }
+        const int mid0 = std::max(col0, kRadius), mid1 = std::min(col1, size - kRadius);
+        if (mid0 < mid1)
+            memcpy(dst + x + mid0, src + mid0, size_t(mid1 - mid0) * 4);
+        for (int col = col0; col < col1; col++) {
+            if (col == mid0 && mid0 < mid1)
+                col = mid1;
+            if (col >= col1)
+                break;
             const int px = x + col;
-            if (px < 0 || px >= kWidth)
-                continue;
-            const uint32_t c = pixels[row * size + col];
-            if (corner_row && (col < kRadius || col >= size - kRadius)) {
-                const uint32_t a = RoundCoverage(px, py, x, y, size, size, kRadius);
-                if (a)
-                    dst[px] = Blend(dst[px], c, a);
-            } else {
-                dst[px] = c;
-            }
+            const uint32_t a = RoundCoverage(px, py, x, y, size, size, kRadius);
+            if (a)
+                dst[px] = Blend(dst[px], src[col], a);
         }
     }
 }
@@ -744,7 +786,7 @@ void DrawToast(double now) {
 // Row layout of the games tab: one row of large tiles that scrolls sideways, the selected game's
 // title above it, and round shortcuts below. Returns true while animating.
 bool DrawGameRow(int game_sel, int game_count, int shortcut, float k) {
-    constexpr int kTile = 300, kBig = 340, kGap = 30, kPitch = kTile + kGap, kLeft = 100, kTop = 250;
+    constexpr int kTile = kRowTile, kBig = kRowBig, kGap = 30, kPitch = kTile + kGap, kLeft = 100, kTop = 250;
     constexpr int kVisible = (kWidth - 2 * kLeft + kGap) / kPitch;
     bool moving = false;
     // Scrolls only when the selection would leave the screen, by as little as needed.
