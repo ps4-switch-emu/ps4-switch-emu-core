@@ -102,11 +102,18 @@ int CountInstallFiles() {
     return count;
 }
 
-// What commercial games need from the user's own Switch, for the menu's setup line.
-std::string SetupStatus() {
+// What commercial games need from the user's own Switch, for Settings > Setup.
+struct Setup {
+    bool prod_keys = false, title_keys = false;
+    int firmware_files = 0;
+    bool Ready() const { return prod_keys && firmware_files > 0; }
+};
+
+Setup CheckSetup() {
+    Setup s;
     struct stat st;
-    const bool prod = stat("/data/switch-emu/keys/prod.keys", &st) == 0;
-    const bool title = stat("/data/switch-emu/keys/title.keys", &st) == 0;
+    s.prod_keys = stat("/data/switch-emu/keys/prod.keys", &st) == 0;
+    s.title_keys = stat("/data/switch-emu/keys/title.keys", &st) == 0;
     int ncas = 0;
     if (DIR* dir = opendir("/data/switch-emu/nand/system/Contents/registered")) {
         while (dirent* entry = readdir(dir)) {
@@ -116,10 +123,8 @@ std::string SetupStatus() {
         }
         closedir(dir);
     }
-    char line[200];
-    snprintf(line, sizeof(line), "Setup:  prod.keys %s,  title.keys %s,  firmware %s (%d files)",
-             prod ? "found" : "MISSING", title ? "found" : "missing", ncas > 0 ? "installed" : "MISSING", ncas);
-    return line;
+    s.firmware_files = ncas;
+    return s;
 }
 
 // Library entries: the real title once the game has run (Eden saves it, with the icon, to
@@ -806,14 +811,17 @@ void ps4_menu_run() {
     Pad pad;
     MenuSounds sounds;
     remove(kBackToMenu);
-    const std::string setup = SetupStatus();
+    Setup setup = CheckSetup();
     const int install_count = CountInstallFiles();
     remove("/data/switch-emu/install-now");
-    ps4_launcher_set_info(setup.c_str(), install_count, pad.Ok());
+    ps4_launcher_set_info(install_count, pad.Ok());
+    if (!setup.Ready())
+        ps4_launcher_toast(setup.prod_keys ? "Firmware missing - see Settings > Setup"
+                                           : "Keys missing - see Settings > Setup");
     ps4_launcher_show(true);
 
     enum Row { kGraphics, kMode, kResolution, kGpuAccuracy, kButtons, kSpread, kMulticore, kFastmem, kAccuracy, kAsync, kProfiler, kBenchmarks, kInstall,
-               kBackup, kUseGlobal, kOverlay, kOverlayCorner };
+               kBackup, kUseGlobal, kOverlay, kOverlayCorner, kKeys, kFirmware };
     static const char* const kOverlayModes[] = {"Off", "FPS", "Detailed"};
     static const char* const kCorners[] = {"Top left", "Top right", "Bottom left", "Bottom right"};
     std::string backup_value = "Back up now";
@@ -843,7 +851,17 @@ void ps4_menu_run() {
         if (game_scope)
             ids.push_back(kUseGlobal);
         else
-            ids.insert(ids.end(), {kBenchmarks, kInstall, kBackup});
+            ids.insert(ids.end(), {kBenchmarks, kInstall, kBackup, kKeys, kFirmware});
+        char keys_value[48], firmware_value[48];
+        snprintf(keys_value, sizeof(keys_value), "%s",
+                 setup.prod_keys && setup.title_keys ? "Found"
+                 : setup.prod_keys                   ? "title.keys missing"
+                 : setup.title_keys                  ? "prod.keys missing"
+                                                     : "Missing");
+        if (setup.firmware_files > 0)
+            snprintf(firmware_value, sizeof(firmware_value), "Installed (%d files)", setup.firmware_files);
+        else
+            snprintf(firmware_value, sizeof(firmware_value), "Missing");
         if (row >= int(ids.size()))
             row = int(ids.size()) - 1;
         std::vector<Ps4LauncherSetting> settings;
@@ -930,6 +948,18 @@ void ps4_menu_run() {
                                     "Copies all save data to /data/switch-emu/save-backups/<date and time>. To "
                                     "restore, copy a backup's folders back into /data/switch-emu/nand/user/save."});
                 break;
+            case kKeys:
+                settings.push_back({"Keys", keys_value,
+                                    "prod.keys and title.keys, dumped from your own Switch, go in "
+                                    "/data/switch-emu/keys. Dump them after updating the Switch to the firmware "
+                                    "you use here. Cross checks again."});
+                break;
+            case kFirmware:
+                settings.push_back({"Firmware", firmware_value,
+                                    "The Switch firmware dumped from your own console: copy its .nca files, loose, "
+                                    "into the folder nand/system/Contents/registered inside /data/switch-emu. Cross "
+                                    "checks again."});
+                break;
             case kUseGlobal:
                 settings.push_back({"Use the settings for all games", game_has_opts ? "Reset" : "In use",
                                     "Removes this game's own settings; it then follows the settings for all "
@@ -968,6 +998,10 @@ void ps4_menu_run() {
                 settings[j].group = "Tools";
                 settings[j].kind = kSettingAction;
                 break;
+            case kKeys: case kFirmware:
+                settings[j].group = "Setup";
+                settings[j].kind = kSettingText;
+                break;
             case kUseGlobal:
                 settings[j].group = "This game";
                 settings[j].kind = kSettingAction;
@@ -976,7 +1010,7 @@ void ps4_menu_run() {
         }
         ps4_launcher_set_settings(settings.data(), int(settings.size()));
         ps4_launcher_set_state(tab, game, row);
-        ps4_launcher_set_info(setup.c_str(), install_count, pad.Ok());
+        ps4_launcher_set_info(install_count, pad.Ok());
         std::string scope = "All games";
         if (game_scope)
             scope = titles[size_t(game)] + (game_has_opts ? "  (own settings)" : "  (uses all-games settings)");
@@ -1076,6 +1110,12 @@ void ps4_menu_run() {
                     if (pressed & kCross) {
                         backup_value = BackUpSaves();
                         ps4_launcher_toast(("Save backup: " + backup_value).c_str());
+                    }
+                    break;
+                case kKeys: case kFirmware:
+                    if (pressed & kCross) {
+                        setup = CheckSetup();
+                        ps4_launcher_toast(setup.Ready() ? "Keys and firmware found" : "Still missing - see the help text");
                     }
                     break;
                 case kUseGlobal:

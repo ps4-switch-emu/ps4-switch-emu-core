@@ -260,7 +260,6 @@ int g_tab = 0, g_game_sel = 0, g_setting_sel = 0, g_install_count = 0;
 char g_scope[kLineLen] = "All games";
 bool g_scope_switchable = false;
 bool g_has_pad = true;
-char g_setup[kLineLen] = "";
 char g_toast[kLineLen] = "";
 double g_toast_until = 0;
 std::atomic<bool> g_launcher_on{false};
@@ -664,9 +663,8 @@ void DrawLauncher() {
     const int tab = g_tab, game_sel = g_game_sel, setting_sel = g_setting_sel, game_count = g_game_count,
               setting_count = g_setting_count, install_count = g_install_count;
     const bool has_pad = g_has_pad, scope_switchable = g_scope_switchable;
-    char scope[kLineLen], setup[kLineLen];
+    char scope[kLineLen];
     CopyText(scope, sizeof(scope), g_scope);
-    CopyText(setup, sizeof(setup), g_setup);
     const uint32_t accent = game_count > 0 && tab == kLauncherGames ? g_games[game_sel].accent : kAccent;
     Unlock();
 
@@ -915,10 +913,8 @@ void DrawLauncher() {
     DrawToast(now);
     moving |= g_toast[0] && now < g_toast_until;
 
-    // Footer.
-    DrawText(100, kHeight - 66, setup, kDim, kWidth / 2 + 300);
-    const char* right = has_pad ? "Close the app with the PS button" : "Connect a controller";
-    DrawText(kWidth - 80 - TextWidth(kRegular, right), kHeight - 66, right, has_pad ? kDim : kBad);
+    if (!has_pad)
+        DrawText(kWidth - 80 - TextWidth(kRegular, "Connect a controller"), kHeight - 66, "Connect a controller", kBad);
     g_animating = moving;
 }
 
@@ -1253,12 +1249,9 @@ void ps4_launcher_set_state(int tab, int game, int setting) {
         g_dirty++;
 }
 
-void ps4_launcher_set_info(const char* setup, int install_count, bool has_pad) {
-    char text[kLineLen];
-    CopyText(text, sizeof(text), setup);
+void ps4_launcher_set_info(int install_count, bool has_pad) {
     Lock();
-    const bool changed = strcmp(text, g_setup) != 0 || install_count != g_install_count || has_pad != g_has_pad;
-    memcpy(g_setup, text, sizeof(g_setup));
+    const bool changed = install_count != g_install_count || has_pad != g_has_pad;
     g_install_count = install_count;
     g_has_pad = has_pad;
     Unlock();

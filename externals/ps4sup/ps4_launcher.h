@@ -56,8 +56,8 @@ extern "C" {
 void ps4_launcher_set_games(const Ps4LauncherGame* games, int count);
 void ps4_launcher_set_settings(const Ps4LauncherSetting* settings, int count);
 void ps4_launcher_set_state(int tab, int game, int setting);
-// Bottom line (keys / firmware status) and the button hints' install count.
-void ps4_launcher_set_info(const char* setup, int install_count, bool has_pad);
+// The button hints' install count, and whether a controller is connected (else a warning).
+void ps4_launcher_set_info(int install_count, bool has_pad);
 void ps4_launcher_show(bool on);
 // A short message shown at the bottom for a few seconds (e.g. "Backup complete").
 void ps4_launcher_toast(const char* text);
