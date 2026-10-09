@@ -438,6 +438,7 @@ struct Options {
     bool spread_threads = false; ///< default-core guest threads may run on any of the game's cores
     int overlay = 0;        ///< performance overlay: Ps4OverlayMode
     int overlay_corner = 1; ///< Ps4OverlayCorner (top right)
+    bool pin_threads = false; ///< busiest threads each on a PS4 core of their own (common/thread.cpp)
 };
 
 // /data/switch-emu/launcher.txt: the games tab's layout (Ps4LauncherLayout), for all games.
@@ -476,7 +477,7 @@ Options ReadOptions() {
             !FileExists("null-renderer"), FileExists("profile"), FileExists("async-shaders"),
             FileExists("handheld"), FileExists("res-050") ? 2 : FileExists("res-075") ? 1 : 0,
             FileExists("gpu-high"), FileExists("cross-is-a"), FileExists("spread-threads"), ReadOverlay(0),
-            ReadOverlay(1)};
+            ReadOverlay(1), FileExists("pin-threads")};
 }
 
 void WriteOptions(const Options& o) {
@@ -492,6 +493,7 @@ void WriteOptions(const Options& o) {
     SetFile("gpu-high", o.gpu_high);
     SetFile("cross-is-a", o.cross_is_a);
     SetFile("spread-threads", o.spread_threads);
+    SetFile("pin-threads", o.pin_threads);
     if (FILE* f = fopen("/data/switch-emu/overlay.txt", "w")) {
         fprintf(f, "%d %d\n", o.overlay, o.overlay_corner);
         fclose(f);
@@ -522,6 +524,7 @@ bool LoadOptionsFile(const std::string& path, Options& o) {
         else if (k == "gpu_high") o.gpu_high = value;
         else if (k == "cross_is_a") o.cross_is_a = value;
         else if (k == "spread_threads") o.spread_threads = value;
+        else if (k == "pin_threads") o.pin_threads = value;
         else if (k == "overlay") o.overlay = std::clamp(value, 0, 2);
         else if (k == "overlay_corner") o.overlay_corner = std::clamp(value, 0, 3);
     }
@@ -532,9 +535,10 @@ bool LoadOptionsFile(const std::string& path, Options& o) {
 void SaveOptionsFile(const std::string& path, const Options& o) {
     if (FILE* f = fopen(path.c_str(), "w")) {
         fprintf(f, "multicore=%d\nfastmem=%d\ncpu_unsafe=%d\ngraphics=%d\nprofile=%d\nasync_shaders=%d\nhandheld=%d\n"
-                   "resolution=%d\ngpu_high=%d\ncross_is_a=%d\nspread_threads=%d\noverlay=%d\noverlay_corner=%d\n",
+                   "resolution=%d\ngpu_high=%d\ncross_is_a=%d\nspread_threads=%d\noverlay=%d\noverlay_corner=%d\n"
+                   "pin_threads=%d\n",
                 o.multicore, o.fastmem, o.cpu_unsafe, o.graphics, o.profile, o.async_shaders, o.handheld, o.resolution,
-                o.gpu_high, o.cross_is_a, o.spread_threads, o.overlay, o.overlay_corner);
+                o.gpu_high, o.cross_is_a, o.spread_threads, o.overlay, o.overlay_corner, o.pin_threads);
         fclose(f);
     }
 }
@@ -903,7 +907,7 @@ void ps4_menu_run() {
                                            : "Keys missing - see Settings > Setup");
     ps4_launcher_show(true);
 
-    enum Row { kGraphics, kMode, kResolution, kGpuAccuracy, kButtons, kSpread, kMulticore, kFastmem, kAccuracy, kAsync, kProfiler, kBenchmarks, kInstall,
+    enum Row { kGraphics, kMode, kResolution, kGpuAccuracy, kButtons, kSpread, kPin, kMulticore, kFastmem, kAccuracy, kAsync, kProfiler, kBenchmarks, kInstall,
                kBackup, kUseGlobal, kOverlay, kOverlayCorner, kKeys, kFirmware, kLayout, kAppVersion, kPs4Firmware };
     const std::string app_version = AppVersion(), ps4_firmware = Ps4Firmware();
     int layout = ReadLayout();
@@ -932,7 +936,7 @@ void ps4_menu_run() {
         if (games.empty())
             game_scope = false;
         Options& o = game_scope ? game_opts : global;
-        std::vector<int> ids = {kGraphics, kMode, kResolution, kGpuAccuracy, kButtons, kSpread, kMulticore, kFastmem,
+        std::vector<int> ids = {kGraphics, kMode, kResolution, kGpuAccuracy, kButtons, kSpread, kPin, kMulticore, kFastmem,
                                 kAccuracy, kAsync, kOverlay, kOverlayCorner, kProfiler};
         if (!game_scope) // the launcher's own setting, for all games
             ids.insert(ids.begin() + 4, kLayout);
@@ -985,6 +989,12 @@ void ps4_menu_run() {
                 settings.push_back({"Spread game threads", o.spread_threads ? "On" : "Off",
                                     "Lets the game's helper threads (music, loading) run on idle CPU cores instead "
                                     "of sharing the main one - fewer lag spikes. Turn off if a game misbehaves."});
+                break;
+            case kPin:
+                settings.push_back({"Pin threads to cores", o.pin_threads ? "On" : "Off",
+                                    "Experimental: gives the emulated CPU cores, the GPU thread and the Vulkan "
+                                    "worker a PS4 core each instead of letting the system move them around. Try it "
+                                    "on and off in the same spot and compare the frame rate."});
                 break;
             case kMulticore:
                 settings.push_back({"Multi-core", o.multicore ? "On" : "Off",
@@ -1084,7 +1094,7 @@ void ps4_menu_run() {
                 settings[j].group = "Performance";
                 settings[j].kind = kSettingChoice;
                 break;
-            case kSpread: case kMulticore: case kFastmem: case kAsync:
+            case kSpread: case kPin: case kMulticore: case kFastmem: case kAsync:
                 settings[j].group = "Performance";
                 settings[j].kind = kSettingToggle;
                 break;
@@ -1229,6 +1239,9 @@ void ps4_menu_run() {
                     break;
                 case kSpread:
                     o.spread_threads = !o.spread_threads;
+                    break;
+                case kPin:
+                    o.pin_threads = !o.pin_threads;
                     break;
                 case kMulticore:
                     o.multicore = !o.multicore;

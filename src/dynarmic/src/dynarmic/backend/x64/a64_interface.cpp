@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -26,6 +28,10 @@
 #include "dynarmic/interface/A64/a64.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/opt_passes.h"
+
+#ifdef __OPENORBIS__
+extern "C" __attribute__((weak)) void ps4_jit_cache_full(unsigned core, unsigned long long size); // externals/ps4sup/stub.cpp
+#endif
 
 namespace Dynarmic::A64 {
 
@@ -247,6 +253,14 @@ private:
 
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
+#ifdef __OPENORBIS__
+            // A full code cache: everything gets recompiled (a hitch) - worth knowing how often.
+            if (ps4_jit_cache_full)
+                ps4_jit_cache_full(conf.processor_id, conf.code_cache_size);
+#else
+            if (std::getenv("EDEN_CODE_CACHE_MB"))
+                std::fprintf(stderr, "JIT CACHE FULL core %u\n", unsigned(conf.processor_id));
+#endif
             // Immediately evacuate cache
             invalidate_entire_cache = true;
             PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);

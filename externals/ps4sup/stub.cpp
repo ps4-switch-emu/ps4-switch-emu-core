@@ -71,3 +71,13 @@ std::atomic<unsigned long long> ps4_pipelines_built{0};
 extern "C" void ps4_count_fastmem_fault() {
     ps4_fastmem_faults.fetch_add(1, std::memory_order_relaxed);
 }
+
+// dynarmic: a core's code cache filled up and is thrown away (everything recompiles: a hitch).
+extern "C" void ps4_boot_trace(const char* stage);
+extern "C" void ps4_jit_cache_full(unsigned core, unsigned long long size) {
+    static std::atomic<unsigned> count{0};
+    char line[128];
+    snprintf(line, sizeof(line), "jit: core %u code cache full (%llu MiB), cleared - %u so far", core,
+             size >> 20, count.fetch_add(1, std::memory_order_relaxed) + 1);
+    ps4_boot_trace(line);
+}

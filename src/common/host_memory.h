@@ -57,6 +57,8 @@ public:
     /// Bytes of guest address space the fastmem arena covers (0 = no arena). On the PS4 this can
     /// be less than the guest address space.
     [[nodiscard]] size_t FastmemArenaSize() const noexcept;
+    /// PS4: nothing is mapped in the guest span after the arena, so fastmem needs no bounds check.
+    [[nodiscard]] bool FastmemUnchecked() const noexcept;
 
     /// PS4: writes the fastmem arena's statistics to the boot trace (no-op elsewhere).
     void LogFastmemStats(const char* when);

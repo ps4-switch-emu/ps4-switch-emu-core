@@ -278,6 +278,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 #else
     config.code_cache_size = std::uint32_t(512_MiB);
 #endif
+#ifndef __OPENORBIS__
+    // PC experiment: EDEN_CODE_CACHE_MB=32 gives each core the PS4's code cache size.
+    if (const char* mb = std::getenv("EDEN_CODE_CACHE_MB"))
+        config.code_cache_size = std::uint32_t(std::atoi(mb)) * 1024 * 1024;
+#endif
 
     // Allow memory fault handling to work
     if (m_system.DebuggerEnabled()) {
@@ -390,6 +395,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         if (arena_bits < 12) {
             config.fastmem_pointer = std::nullopt;
             config.fastmem_exclusive_access = false;
+        } else if (m_system.DeviceMemory().buffer.FastmemUnchecked()) {
+            // Nothing mapped in the guest span after the arena: addresses above it fault into the
+            // slow path by themselves, no bounds check needed (the presets' 64 bits stand).
+            config.silently_mirror_fastmem = false;
         } else {
             config.fastmem_address_space_bits = std::min<u32>(config.fastmem_address_space_bits, arena_bits);
             config.silently_mirror_fastmem = false;

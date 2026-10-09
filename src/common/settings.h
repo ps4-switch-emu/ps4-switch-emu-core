@@ -314,8 +314,10 @@ struct Values {
     Setting<bool> cpuopt_ignore_memory_aborts{linkage, true, "cpuopt_ignore_memory_aborts",
                                               Category::CpuDebug};
 
+    // The PS4 has fastmem (direct memory aliasing), so Unsafe keeps it there too (yuzu_cmd also
+    // sets this explicitly on the PS4, over whatever an older saved config holds).
     SwitchableSetting<bool> cpuopt_unsafe_host_mmu{linkage,
-#if !defined(__APPLE__) && !defined(__linux__) && !defined(__ANDROID__) && !defined(_WIN32)
+#if !defined(__APPLE__) && !defined(__linux__) && !defined(__ANDROID__) && !defined(_WIN32) && !defined(__OPENORBIS__)
                                         false,
 #else
                                         true,
@@ -881,14 +883,7 @@ struct Values {
                                      linkage, false, "reporting_services", Category::Debugging, Specialization::Default, false};
     Setting<bool> quest_flag{linkage, false, "quest_flag", Category::Debugging};
     Setting<bool> use_dev_keys{linkage, false, "use_dev_keys", Category::Debugging};
-    Setting<bool> disable_macro_jit{linkage,
-#ifdef __OPENORBIS__
-                                    // The macro JIT's Xbyak buffer isn't mapped the PS4 way
-                                    // (dynarmic's PS4ExecAllocator); the interpreter is used.
-                                    true,
-#else
-                                    false,
-#endif
+    Setting<bool> disable_macro_jit{linkage, false, // the PS4 maps its code like dynarmic does (macro.cpp)
                                     "disable_macro_jit",
                                     Category::DebuggingGraphics};
     Setting<bool> disable_macro_hle{linkage, false, "disable_macro_hle",

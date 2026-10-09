@@ -26,6 +26,7 @@
 #include "common/string_util.h"
 #include "common/sparse_large_vector.h"
 #include "common/cpu_features.h"
+#include "common/x64/rdtsc.h"
 #include "core/core.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/acc/profile_manager.h"
@@ -115,6 +116,7 @@ extern "C" bool ps4_swapchain_overlay_begin();
 extern "C" void ps4_swapchain_overlay_draw(void (*draw)(uint32_t*, const uint32_t*, int, void*), void* ctx);
 extern "C" void ps4_swapchain_overlay_end();
 extern "C" bool ps4_status_home_animating(); // status_screen.cpp
+extern std::atomic<unsigned long long> ps4_fastmem_faults; // externals/ps4sup/stub.cpp
 extern "C" unsigned long long ps4_gpu_wait_us(); // vk_swapchain.cpp
 extern "C" void ps4_overlay_configure(int mode, int corner); // vk_present_manager.cpp
 extern "C" int ps4_overlay_mode();
@@ -519,6 +521,29 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // -1 = none works); dynarmic's PS4ExecAllocator maps through the method found here.
     PS4_TRACE("main: executable memory method {}", ps4_exec_probe());
     PS4_TRACE("main: clock {}", Common::g_wall_clock.IsNative() ? "TSC (fast)" : "clock_gettime (slow)");
+    {
+        // How fast this PS4 runs us: a PS4 Pro gives an app that doesn't declare Pro support the
+        // base PS4's clocks (CPU 1.6 instead of 2.13 GHz) unless Boost Mode is on. A counted loop
+        // (one dependent add per cycle) against the TSC measures the real clock either way.
+        const u64 tsc = sceKernelGetTscFrequency();
+        constexpr u64 kIterations = 100'000'000;
+        const u64 t0 = Common::X64::FencedRDTSC();
+        asm volatile("mov %0, %%rcx\n1:\n\tdec %%rcx\n\tjnz 1b" : : "r"(kIterations) : "rcx", "cc");
+        const u64 t1 = Common::X64::FencedRDTSC();
+        const double seconds = double(t1 - t0) / double(tsc);
+        PS4_TRACE("main: cpu {:.0f} MHz measured, {} MHz reported, Pro mode {} (has {}), cpu mode {}, TSC {} MHz",
+                  double(kIterations) / seconds / 1e6, u32(sceKernelGetCpuFrequency()) / 1000000,
+                  sceKernelIsNeoMode(), sceKernelHasNeoMode(), sceKernelGetCpumode(), tsc / 1000000);
+    }
+    {
+        // What the JIT can use on this CPU (dynarmic picks slower fallbacks for what's missing).
+        const auto& c = Common::g_cpu_caps;
+        PS4_TRACE("main: cpu features: sse4.1 {} sse4.2 {} avx {} avx2 {} bmi1 {} bmi2 {} fma {} f16c {} lzcnt {} "
+                  "popcnt {} movbe {} aes {} pclmul {}",
+                  bool(c.sse4_1), bool(c.sse4_2), bool(c.avx), bool(c.avx2), bool(c.bmi1), bool(c.bmi2),
+                  bool(c.fma), bool(c.f16c), bool(c.lzcnt), bool(c.popcnt), bool(c.movbe), bool(c.aes),
+                  bool(c.pclmulqdq));
+    }
     if (struct stat st; stat("/data/switch-emu/test-crash", &st) == 0) {
         // Test switch: checks that crash.log gets written.
         PS4_TRACE("main: test-crash: writing to address 0x10");
@@ -1212,11 +1237,18 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         const Core::PerfStatsResults perf = state->system.GetAndResetPerfStats();
         static unsigned long long s_gpu_wait = 0;
         const unsigned long long gpu_wait = ps4_gpu_wait_us();
+        static unsigned long long s_faults = 0;
+        const unsigned long long faults = ps4_fastmem_faults.load(std::memory_order_relaxed);
         PS4_TRACE("perf: game {:.1f} fps, emulation speed {:.0f}%, {:.1f} ms per frame, waiting for the GPU {:.0f}% of "
-                  "the time",
+                  "the time, {} fastmem faults",
                   perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0,
-                  double(gpu_wait - s_gpu_wait) / 50000.0); // us per 5 s -> %
+                  double(gpu_wait - s_gpu_wait) / 50000.0, faults - s_faults); // us per 5 s -> %
         s_gpu_wait = gpu_wait;
+        s_faults = faults;
+        // Every 30 s: how much of the game's memory the fast path covers, and why the rest isn't.
+        static int s_reports = 0;
+        if (++s_reports % 6 == 0)
+            state->system.DeviceMemory().buffer.LogFastmemStats("playing");
         g_ps4_last_perf = fmt::format("Frame rate: {:.0f} fps (last 5 s)", perf.average_game_fps);
     }
 #endif

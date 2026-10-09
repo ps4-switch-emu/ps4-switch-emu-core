@@ -447,6 +447,51 @@ void RememberCurrentThreadNice(pid_t tid, s32 nice_value) {
 #include "common/x64/rdtsc.h"
 #endif
 
+#ifdef __OPENORBIS__
+extern "C" __attribute__((weak)) void ps4_sampler_register_thread(const char* name); // externals/ps4sup/sampler.cpp
+extern "C" __attribute__((weak)) const char* ps4_sampler_thread_name();
+extern "C" __attribute__((weak)) void ps4_boot_trace(const char* line); // externals/ps4sup/crashlog.cpp
+extern "C" void* scePthreadSelf();
+extern "C" int scePthreadGetprio(void* thread, int* priority);
+extern "C" int scePthreadSetprio(void* thread, int priority);
+extern "C" int scePthreadGetaffinity(void* thread, unsigned long long* mask);
+extern "C" int scePthreadSetaffinity(void* thread, unsigned long long mask);
+#include <sys/stat.h>
+
+// Launcher option "Pin threads to cores" (/data/switch-emu/pin-threads): the busiest threads each
+// get a PS4 core of their own - the emulated CPU cores 0-3, the GPU thread 4, the Vulkan worker 5 -
+// instead of the scheduler moving them around (or putting two on one core). Everything else is
+// left alone. Only cores the thread may already use are taken.
+static void PinPs4Thread(const char* name) {
+    static const bool pin = [] {
+        struct stat st;
+        return stat("/data/switch-emu/pin-threads", &st) == 0;
+    }();
+    if (!pin || !name)
+        return;
+    int core = -1;
+    if (strncmp(name, "CPUCore_", 8) == 0 && name[8] >= '0' && name[8] <= '3' && name[9] == 0)
+        core = name[8] - '0';
+    else if (strcmp(name, "GPU") == 0)
+        core = 4;
+    else if (strcmp(name, "VulkanWorker") == 0)
+        core = 5;
+    if (core < 0)
+        return;
+    void* const self = scePthreadSelf();
+    unsigned long long allowed = 0;
+    scePthreadGetaffinity(self, &allowed);
+    const unsigned long long want = 1ULL << core;
+    const int result = (allowed & want) ? scePthreadSetaffinity(self, want) : -1;
+    if (ps4_boot_trace) {
+        char line[128];
+        snprintf(line, sizeof(line), "thread %s: pinned to core %d (allowed %#llx, result %#x)", name, core, allowed,
+                 unsigned(result));
+        ps4_boot_trace(line);
+    }
+}
+#endif
+
 namespace Common {
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
@@ -490,6 +535,27 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
         LOG_DEBUG(Common, "Could not set thread nice value to {}: {}", nice_value,
                   GetLastErrorMsg());
     }
+#elif defined(__OPENORBIS__)
+    // The PS4's own priorities: 256 (highest) to 767 (lowest), applications at 700. The POSIX
+    // path below maps "Critical" to the top of SCHED_OTHER's range, which on the PS4 may mean the
+    // lowest priority; set the native value instead (and say what happened in the boot trace).
+    static constexpr int kPs4Priority[] = {760, 700, 600, 520, 480}; // Low .. Critical
+    const int priority = kPs4Priority[(std::min)(static_cast<u32>(new_priority), 4U)];
+    void* const self = scePthreadSelf();
+    int before = 0;
+    scePthreadGetprio(self, &before);
+    const int result = scePthreadSetprio(self, priority);
+    int after = 0;
+    scePthreadGetprio(self, &after);
+    unsigned long long cores = 0;
+    scePthreadGetaffinity(self, &cores);
+    if (ps4_boot_trace) {
+        char line[160];
+        const char* name = ps4_sampler_thread_name ? ps4_sampler_thread_name() : nullptr;
+        snprintf(line, sizeof(line), "thread %s: priority %d -> %d (asked %d, result %#x), cores %#llx",
+                 name ? name : "?", before, after, priority, unsigned(result), cores);
+        ps4_boot_trace(line);
+    }
 #else
     const s32 max_prio = sched_get_priority_max(SCHED_OTHER);
     const s32 min_prio = sched_get_priority_min(SCHED_OTHER);
@@ -503,14 +569,13 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 #endif
 }
 
-#ifdef __OPENORBIS__
-extern "C" __attribute__((weak)) void ps4_sampler_register_thread(const char* name); // externals/ps4sup/sampler.cpp
-#endif
+
 
 void SetCurrentThreadName(const char* name) {
 #ifdef __OPENORBIS__
     if (ps4_sampler_register_thread)
         ps4_sampler_register_thread(name);
+    PinPs4Thread(name);
 #endif
 #ifdef _MSC_VER
     // Sets the debugger-visible name of the current thread.

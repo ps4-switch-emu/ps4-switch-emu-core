@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <cstring>
 #include "common/logging.h"
 #include "common/random.h"
@@ -237,6 +238,9 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
     // 16 KiB steps on the PS4: its fastmem maps 16 KiB pages, and only guest memory whose
     // virtual and physical addresses line up at 16 KiB can use it.
     aslr_offset &= ~std::uintptr_t(0x3FFF);
+#else
+    if (std::getenv("EDEN_LOW_LAYOUT")) // PC test of the PS4's layout (see k_page_table_base.cpp)
+        aslr_offset &= ~std::uintptr_t(0x3FFF);
 #endif
 
     // Setup the process code layout

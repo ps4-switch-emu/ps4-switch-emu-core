@@ -779,7 +779,32 @@ public:
         // The whole 39-bit guest space (512 GiB) is refused (0x8002000c on hardware): take the
         // largest power of two the kernel gives. dynarmic then bounds-checks against it and sends
         // accesses above it down the slow path (ArmDynarmic64/32 set fastmem_address_space_bits).
-        for (size_t size = virtual_size; size >= (size_t(8) << 30); size /= 2) {
+        //
+        // Better: a high address with nothing mapped in the whole guest span after it. Then a guest
+        // address above the arena lands on unmapped host memory and faults into the slow path by
+        // itself, and the JIT needs no bounds check on every access (as on a PC, whose arena
+        // covers the whole span).
+        for (const uintptr_t candidate : {uintptr_t(0x10000000000ULL), uintptr_t(0x20000000000ULL),
+                                          uintptr_t(0x8000000000ULL)}) {
+            if (!SpanIsEmpty(candidate, virtual_size))
+                continue;
+            for (size_t size = virtual_size; size >= (size_t(8) << 30) && !virtual_base; size /= 2) {
+                void* fixed = reinterpret_cast<void*>(candidate);
+                if (sceKernelReserveVirtualRange(&fixed, size, MapFixed, Align) == 0) {
+                    if (fixed == reinterpret_cast<void*>(candidate)) {
+                        virtual_base = static_cast<u8*>(fixed);
+                        arena_size = size;
+                        reserved_bytes = size;
+                        unchecked = true;
+                    } else {
+                        sceKernelMunmap(fixed, size);
+                    }
+                }
+            }
+            if (virtual_base)
+                break;
+        }
+        for (size_t size = virtual_size; size >= (size_t(8) << 30) && !virtual_base; size /= 2) {
             void* reserved = nullptr;
             result = sceKernelReserveVirtualRange(&reserved, size, 0, Align);
             if (result == 0) {
@@ -809,9 +834,10 @@ public:
             while (arena_size * 2 <= reserved_bytes)
                 arena_size *= 2;
         }
-        Trace("fastmem: %s %zu GiB arena at %p (%zu GiB reserved, guest space %zu GiB)",
+        Trace("fastmem: %s %zu GiB arena at %p (%zu GiB reserved, guest space %zu GiB), %s",
               virtual_base ? "reserved" : "could not reserve", arena_size >> 30, static_cast<void*>(virtual_base),
-              reserved_bytes >> 30, virtual_size >> 30);
+              reserved_bytes >> 30, virtual_size >> 30,
+              unchecked ? "no bounds checks (nothing mapped in the guest span after it)" : "bounds-checked");
     }
 
     ~PS4Arena() {
@@ -904,8 +930,20 @@ public:
     size_t ArenaSize() const {
         return arena_size;
     }
+    bool Unchecked() const {
+        return unchecked;
+    }
 
 private:
+    /// True when nothing is mapped in [start, start + length).
+    static bool SpanIsEmpty(uintptr_t start, size_t length) {
+        OrbisKernelVirtualQueryInfo info{};
+        constexpr int32_t FindNext = 1; // the mapping at or after the address
+        if (sceKernelVirtualQuery(reinterpret_cast<const void*>(start), FindNext, &info, sizeof(info)) != 0)
+            return true; // nothing at or after it
+        return reinterpret_cast<uintptr_t>(info.unk01) >= start + length;
+    }
+
     /// Limits a guest range to the arena; false when nothing of it is inside.
     bool Clip(size_t offset, size_t& length) const {
         if (offset >= arena_size)
@@ -923,13 +961,19 @@ private:
 
     /// What a block should be: the backing page index + 1 of its first guest page and the
     /// protection, or {0, 0} when it can't be mapped as one 16 KiB host page.
+    /// Pages with different permissions (one of them write-protected because the GPU caches
+    /// it, say) map with what they all allow: read-only rather than not at all, so reads of the
+    /// whole block stay fast and writes fault into the slow path, which checks each page. (Not
+    /// mapped at all, every access to all four pages faulted and its code was recompiled to the
+    /// slow path for good - on a PC only that one page's writes do.)
     static std::pair<u32, u8> Desired(const Block& b) {
         if (b.page[0] == 0 || (b.page[0] - 1) % Sub != 0)
             return {0, 0};
-        const u8 perm = b.perm[0];
+        u8 perm = b.perm[0];
         for (size_t i = 1; i < Sub; i++) {
-            if (b.page[i] != b.page[0] + i || b.perm[i] != perm)
+            if (b.page[i] != b.page[0] + i)
                 return {0, 0};
+            perm &= b.perm[i];
         }
         const bool read = (perm & u8(MemoryPermission::Read)) != 0;
         const bool write = (perm & u8(MemoryPermission::Write)) != 0;
@@ -1173,6 +1217,7 @@ private:
     size_t committed_chunks{};
     unsigned commit_failures{};
     size_t reserved_bytes{}; ///< fastmem reservation (arena_size rounded down to a power of two)
+    bool unchecked{};       ///< nothing mapped in the guest span after the arena: no bounds checks
     size_t backing_bytes{};
     size_t arena_size{};
     std::mutex mutex;
@@ -1285,6 +1330,14 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
     const bool write = True(perm & MemoryPermission::Write);
     const bool execute = True(perm & MemoryPermission::Execute);
     impl->Protect(virtual_offset + virtual_base_offset, length, read, write, execute);
+#endif
+}
+
+bool HostMemory::FastmemUnchecked() const noexcept {
+#ifdef __OPENORBIS__
+    return ps4_arena && virtual_base && ps4_arena->Unchecked();
+#else
+    return true;
 #endif
 }
 

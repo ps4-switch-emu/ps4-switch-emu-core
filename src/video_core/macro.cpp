@@ -15,6 +15,11 @@
 #ifdef ARCHITECTURE_x86_64
 #include "common/x64/xbyak.h"
 #endif
+#ifdef __OPENORBIS__
+#include <mutex>
+#include <unordered_map>
+#include <sys/mman.h>
+#endif
 
 #include "common/assert.h"
 #include "common/scope_exit.h"
@@ -712,9 +717,55 @@ static const auto default_cg_mode = Xbyak::DontSetProtectRWE;
 static const auto default_cg_mode = nullptr; //Allow RWE
 #endif
 
+#ifdef __OPENORBIS__
+/// The PS4 only makes memory executable when PROT_EXEC is asked for at mmap time (the PS4
+/// runtime's mmap wrapper applies the jailbreak's method then); Xbyak's default allocator maps
+/// read/write and mprotects later, which fails - why the macro JIT used to be off on the PS4.
+/// Same as dynarmic's PS4ExecAllocator: one read/write/execute mapping per macro, never
+/// mprotected.
+class PS4MacroCodeAllocator final : public Xbyak::Allocator {
+public:
+    uint8_t* alloc(size_t size) override {
+        const size_t page = Xbyak::inner::getPageSize();
+        size = (size + page - 1) & ~(page - 1);
+        void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (p == MAP_FAILED)
+            return nullptr;
+        std::scoped_lock lk{mutex};
+        sizes[p] = size;
+        return static_cast<uint8_t*>(p);
+    }
+    void free(uint8_t* p) override {
+        if (!p)
+            return;
+        std::scoped_lock lk{mutex};
+        if (auto it = sizes.find(p); it != sizes.end()) {
+            munmap(p, it->second);
+            sizes.erase(it);
+        }
+    }
+    bool useProtect() const override {
+        return false;
+    }
+
+private:
+    std::mutex mutex;
+    std::unordered_map<void*, size_t> sizes;
+};
+
+Xbyak::Allocator* MacroCodeAllocator() {
+    static PS4MacroCodeAllocator allocator;
+    return &allocator;
+}
+#else
+Xbyak::Allocator* MacroCodeAllocator() {
+    return nullptr; // Xbyak's default
+}
+#endif
+
 struct MacroJITx64Impl final : public Xbyak::CodeGenerator, public DynamicCachedMacro {
     explicit MacroJITx64Impl(Core::System& system, std::span<const u32> code_)
-        : Xbyak::CodeGenerator(MAX_CODE_SIZE, default_cg_mode)
+        : Xbyak::CodeGenerator(MAX_CODE_SIZE, default_cg_mode, MacroCodeAllocator())
         , code{code_}
     {
         Compile(system);
@@ -1428,8 +1479,19 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
 
 AnyCachedMacro MacroEngine::Compile(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> code) {
 #ifdef ARCHITECTURE_x86_64
-    if (!is_interpreted)
+    if (!is_interpreted) {
+#ifdef __OPENORBIS__
+        // No executable memory for it (or Xbyak failed): interpret this macro instead.
+        try {
+            return std::make_unique<MacroJITx64Impl>(system, code);
+        } catch (...) {
+            LOG_WARNING(HW_GPU, "macro JIT unavailable, interpreting");
+            return MacroInterpreterImpl(code);
+        }
+#else
         return std::make_unique<MacroJITx64Impl>(system, code);
+#endif
+    }
 #endif
     return MacroInterpreterImpl(code);
 }
