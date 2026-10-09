@@ -1218,6 +1218,11 @@ static void MaybeScreenshot(Core::System& system) {
         Layout::DefaultFrameLayout(kW, kH));
 }
 
+#ifdef __OPENORBIS__
+// The PS4 Vulkan driver's counters (vendor/DolphinPS4 port/mesa/ac_ps4_drm.c).
+extern "C" __attribute__((weak)) void ac_ps4_get_stats(uint64_t* submitted, uint64_t* completed, uint64_t* bo_bytes,
+                                                       uint64_t* bo_count);
+#endif
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
     MaybeScreenshot(state->system);
@@ -1256,10 +1261,16 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         const unsigned long long gpu_wait = ps4_gpu_wait_us();
         static unsigned long long s_faults = 0;
         const unsigned long long faults = ps4_fastmem_faults.load(std::memory_order_relaxed);
+        // GPU memory the Vulkan driver holds (buffers, images): with the [dmem] free figure in front
+        // of every trace line, shows how close a 3D game gets to running out.
+        uint64_t submitted = 0, completed = 0, bo_bytes = 0, bo_count = 0;
+        if (ac_ps4_get_stats)
+            ac_ps4_get_stats(&submitted, &completed, &bo_bytes, &bo_count);
         PS4_TRACE("perf: game {:.1f} fps, emulation speed {:.0f}%, {:.1f} ms per frame, waiting for the GPU {:.0f}% of "
-                  "the time, {} fastmem faults",
+                  "the time, {} fastmem faults, GPU memory {} MiB in {} buffers",
                   perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0,
-                  double(gpu_wait - s_gpu_wait) / 50000.0, faults - s_faults); // us per 5 s -> %
+                  double(gpu_wait - s_gpu_wait) / 50000.0, faults - s_faults, // us per 5 s -> %
+                  bo_bytes >> 20, bo_count);
         s_gpu_wait = gpu_wait;
         s_faults = faults;
         // Every 30 s: how much of the game's memory the fast path covers, and why the rest isn't.

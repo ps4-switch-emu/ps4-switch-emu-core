@@ -311,6 +311,18 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 }
 
 size_t GetTotalPipelineWorkers() {
+#ifdef __OPENORBIS__
+    // A fixed 3 on the PS4 rather than trusting hardware_concurrency() there: games get six full
+    // Jaguar cores and part of a seventh, the emulated CPUs and the GPU thread use about four.
+    // (With async shaders, more builders means less pop-in on a game's first run.)
+    if (ps4_boot_trace) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "shader: 3 pipeline builder threads (hardware_concurrency %u)",
+                      std::thread::hardware_concurrency());
+        ps4_boot_trace(line);
+    }
+    return 3;
+#endif
     const size_t max_core_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
 #ifdef __ANDROID__
