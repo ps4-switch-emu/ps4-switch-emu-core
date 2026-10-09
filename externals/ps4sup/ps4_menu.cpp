@@ -20,6 +20,7 @@
 #include <dirent.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -569,6 +570,11 @@ constexpr int kSuiteCount = int(sizeof(kSuite) / sizeof(kSuite[0]));
 // The run in progress, or -1. Set by ps4_menu_run, used when the guest exits.
 int g_suite_index = -1;
 volatile bool g_restart_requested = false;
+// A finished benchmark suite's results are up: any button goes back to the launcher.
+std::atomic<bool> g_wait_for_button{false};
+// ps4_menu_run returned: a program is starting (a crash from here on can go back to the launcher;
+// one before it, in the launcher itself, must not restart into the same crash forever).
+std::atomic<bool> g_program_started{false};
 
 // suite.txt: "<index> <running>". running = 1 while that run is in progress: finding it set at
 // startup means the run crashed (the app was restarted by hand).
@@ -795,6 +801,7 @@ extern "C" {
 // Shows the start menu, or continues a benchmark suite. Returns when Eden should start; the
 // switch files are set for that run.
 void ps4_menu_run() {
+    struct MarkStarted { ~MarkStarted() { g_program_started = true; } } mark_started; // on every return
     bool crashed = false;
     g_suite_index = ReadSuiteIndex(&crashed);
     if (g_suite_index >= 0 && crashed) {
@@ -1401,8 +1408,9 @@ void ps4_menu_guest_exited() {
         WriteSuiteIndex(-1);
         WriteOptions(kSuite[kSuiteCount - 1].options);
         ps4_status_watch_file(kResults, "Benchmark suite results");
-        ps4_status_set_stage("Benchmark suite finished - results on the right. Close the app with the PS button.");
+        ps4_status_set_stage("Benchmark suite finished - results on the right. Press any button for the launcher.");
         ps4_boot_trace("menu: benchmark suite finished");
+        g_wait_for_button = true;
     }
 }
 
@@ -1456,6 +1464,40 @@ void ps4_menu_restart_now() {
 }
 
 // Called regularly from the main thread: performs a requested restart.
+// Back to the launcher: the app restarts into it (as "Quit to launcher" does).
+static void BackToLauncher(const char* why) {
+    if (FILE* f = fopen(kBackToMenu, "w"))
+        fclose(f);
+    ps4_boot_trace(why);
+    sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
+}
+
+// The main loop's newly pressed buttons while the activity screen shows (no game on screen):
+// Circle cancels a benchmark suite run; any button leaves a finished suite's results.
+void ps4_menu_activity_input(bool any, bool circle) {
+    if (g_wait_for_button && any) {
+        BackToLauncher("menu: benchmark results closed");
+    } else if (g_suite_index >= 0 && circle) {
+        WriteSuiteIndex(-1);
+        WriteOptions(kSuite[kSuiteCount - 1].options);
+        ps4_status_set_stage("Benchmark suite cancelled - back to the launcher...");
+        BackToLauncher("menu: benchmark suite cancelled");
+    }
+}
+
+// After a crash (crashlog.cpp's signal handler, so only system calls): back to the launcher, or
+// into the next benchmark run when a suite was running (it notes the crash and goes on).
+void ps4_menu_after_crash() {
+    if (!g_program_started)
+        return;
+    if (g_suite_index < 0) {
+        const int fd = open(kBackToMenu, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0)
+            close(fd);
+    }
+    sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
+}
+
 void ps4_menu_poll_restart() {
     if (!g_restart_requested)
         return;

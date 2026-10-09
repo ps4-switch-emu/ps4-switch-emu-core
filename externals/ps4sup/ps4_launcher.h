@@ -74,6 +74,10 @@ void ps4_launcher_toast(const char* text);
 void ps4_launcher_set_scope(const char* text, bool switchable);
 // The game being started, for the loading screen (icon may be nullptr; must stay valid).
 void ps4_launcher_set_loading(const char* title, const uint32_t* icon);
+// Loading screen stages: shaders loaded from the cache so far, then the game starting (until its
+// first frame - the swap chain redraws the screen meanwhile, see vk_swapchain.cpp).
+void ps4_loading_cache(unsigned done, unsigned total);
+void ps4_loading_starting_game();
 // In-game Home menu into a swap image (see vk_swapchain.cpp's overlay); capture: take src as the
 // new background.
 void ps4_status_draw_home(uint32_t* dst, const uint32_t* src, int pitch, const Ps4HomeMenu* menu, bool capture);

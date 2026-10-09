@@ -80,6 +80,27 @@ inline bool IsZeroExtendedLong(const IR::Value& value) {
     return opcode == IR::Opcode::ZeroExtendLongToQuad || opcode == IR::Opcode::A64GetD || IsZeroExtendedWord(value);
 }
 
+/// A U32 in a vector register known to be zero above its low 32 bits (HostRegisterLocality):
+/// a lane-0 VectorGetElement32 (an aliased clean source, an insertps, or a movd from a GPR), or a
+/// scalar add/sub/mul/div of two such values - FPThreeOp keeps op1's upper lanes, and its NaN paths
+/// write a zero-extended constant or op2 (hence both). Anything else counts as not known.
+inline bool IsCleanScalar32(const IR::Value& value, int depth = 0) {
+    if (value.IsImmediate() || depth > 8)
+        return false;
+    const IR::Inst* const inst = value.GetInstRecursive();
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::VectorGetElement32:
+        return inst->GetArg(1).IsImmediate() && inst->GetArg(1).GetU8() == 0;
+    case IR::Opcode::FPAdd32:
+    case IR::Opcode::FPSub32:
+    case IR::Opcode::FPMul32:
+    case IR::Opcode::FPDiv32:
+        return IsCleanScalar32(inst->GetArg(0), depth + 1) && IsCleanScalar32(inst->GetArg(1), depth + 1);
+    default:
+        return false;
+    }
+}
+
 struct EmitContext {
     EmitContext(RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& shared_labels);
     virtual ~EmitContext();

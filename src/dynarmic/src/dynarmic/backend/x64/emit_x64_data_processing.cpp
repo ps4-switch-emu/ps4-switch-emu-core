@@ -58,6 +58,14 @@ void EmitX64::EmitLeastSignificantWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
 
     // TODO: DefineValue directly on Argument
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate() && !args[0].IsInXmm(ctx.reg_alloc)) {
+        // From the source into a fresh register (see ZeroExtendByteToWord).
+        const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+        const Xbyak::Reg64 res = ctx.reg_alloc.ScratchGpr(code);
+        code.mov(res.cvt32(), source.cvt32());
+        ctx.reg_alloc.DefineValue(code, inst, res);
+        return;
+    }
     const Xbyak::Reg64 res = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.mov(res.cvt32(), res.cvt32());
     ctx.reg_alloc.DefineValue(code, inst, res);
@@ -1484,6 +1492,14 @@ void EmitX64::EmitNot64(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitSignExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate()) {
+        // From the source into a fresh register (see ZeroExtendByteToWord).
+        const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+        const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
+        code.movsx(result.cvt32(), source.cvt8());
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.movsx(result.cvt32(), result.cvt8());
     ctx.reg_alloc.DefineValue(code, inst, result);
@@ -1491,6 +1507,14 @@ void EmitX64::EmitSignExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitSignExtendHalfToWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate()) {
+        // From the source into a fresh register (see ZeroExtendByteToWord).
+        const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+        const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
+        code.movsx(result.cvt32(), source.cvt16());
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.movsx(result.cvt32(), result.cvt16());
     ctx.reg_alloc.DefineValue(code, inst, result);
@@ -1498,6 +1522,14 @@ void EmitX64::EmitSignExtendHalfToWord(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitSignExtendByteToLong(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate()) {
+        // From the source into a fresh register (see ZeroExtendByteToWord).
+        const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+        const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
+        code.movsx(result.cvt64(), source.cvt8());
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.movsx(result.cvt64(), result.cvt8());
     ctx.reg_alloc.DefineValue(code, inst, result);
@@ -1505,6 +1537,14 @@ void EmitX64::EmitSignExtendByteToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitSignExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate()) {
+        // From the source into a fresh register (see ZeroExtendByteToWord).
+        const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+        const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
+        code.movsx(result.cvt64(), source.cvt16());
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.movsx(result.cvt64(), result.cvt16());
     ctx.reg_alloc.DefineValue(code, inst, result);
@@ -1512,6 +1552,14 @@ void EmitX64::EmitSignExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitSignExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate()) {
+        // From the source into a fresh register (see ZeroExtendByteToWord).
+        const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+        const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
+        code.movsxd(result.cvt64(), source.cvt32());
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.movsxd(result.cvt64(), result.cvt32());
     ctx.reg_alloc.DefineValue(code, inst, result);
@@ -1519,6 +1567,15 @@ void EmitX64::EmitSignExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate()) {
+        // Extend from the source into a fresh register: one instruction whether or not the
+        // source is still needed (UseScratchGpr would copy a live source first).
+        const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+        const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
+        code.movzx(result.cvt32(), source.cvt8());
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.movzx(result.cvt32(), result.cvt8());
     ctx.reg_alloc.DefineValue(code, inst, result);
@@ -1526,6 +1583,15 @@ void EmitX64::EmitZeroExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendHalfToWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate()) {
+        // Extend from the source into a fresh register: one instruction whether or not the
+        // source is still needed (UseScratchGpr would copy a live source first).
+        const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+        const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
+        code.movzx(result.cvt32(), source.cvt16());
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.movzx(result.cvt32(), result.cvt16());
     ctx.reg_alloc.DefineValue(code, inst, result);
@@ -1546,8 +1612,20 @@ void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
     if (args[0].IsInXmm(ctx.reg_alloc) && code.HasHostFeature(HostFeature::SSE41) && ctx.HasOptimization(OptimizationFlag::HostRegisterLocality)) {
         // A scalar FP result on its way back into a vector register (ZeroExtendToQuad): stay in
         // the vector register instead of a movd to a GPR and a movq back.
+        if (IsCleanScalar32(inst->GetArg(0))) {
+            ctx.reg_alloc.DefineValue(code, inst, args[0]); // already zero above bit 31
+            return;
+        }
         const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(code, args[0]);
         code.insertps(result, result, 0b00001110);
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate() && !args[0].IsInXmm(ctx.reg_alloc)) {
+        // Copy and zero-extend in one 32-bit move into a fresh register (see ZeroExtendByteToWord).
+        const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+        const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr(code);
+        code.mov(result.cvt32(), source.cvt32());
         ctx.reg_alloc.DefineValue(code, inst, result);
         return;
     }

@@ -30,6 +30,9 @@
 #include "status_font_title.h"
 #include "status_logo.h"
 
+// New pipelines built in game (stub.cpp; the loading screen shows them).
+extern std::atomic<unsigned long long> ps4_pipelines_built;
+
 extern "C" {
 int32_t sceVideoOutOpen(int32_t user, int32_t bus, int32_t index, const void* param);
 int32_t sceVideoOutClose(int32_t handle);
@@ -1246,46 +1249,116 @@ void DrawLauncher() {
 char g_loading_title[96] = "";
 const uint32_t* g_loading_icon = nullptr;
 
-void DrawLoading(const char* progress) {
+// Loading screen state (ps4_loading_*): what is really happening between the launcher and the
+// game's first frame, so nothing pretends to know how long the unknown part takes.
+struct LoadingState {
+    std::atomic<int> stage{0};          // 0 starting the graphics, 1 shaders from the cache, 2 starting the game
+    std::atomic<unsigned> cache_done{0}, cache_total{0};
+    std::atomic<unsigned long long> shaders_at_start{0};
+    double shown = NAN, stage_time = NAN; // Elapsed() when first drawn / when the stage began (NaN: not yet)
+} g_load;
+
+void DrawSpinner(int cx, int cy, double t); // below
+
+// A green disc with a check mark.
+void DrawCheck(int cx, int cy) {
+    Disc(cx, cy, 15, kGood);
+    Line(cx - 7, cy + 1, cx - 2, cy + 6, 4, Rgb(14, 20, 34));
+    Line(cx - 2, cy + 6, cx + 8, cy - 6, 4, Rgb(14, 20, 34));
+}
+
+const char* const kLoadingTips[] = {
+    "Hold L3 + R3 (press both sticks) for 1 second in a game to open the Home menu.",
+    "Square on a game in the launcher gives it its own settings (resolution, docked or handheld).",
+    "Shaders built now are saved: the next start of this game loads them from the cache.",
+    "Async shaders (Settings > Performance) keeps games moving while new shaders build.",
+    "Updates and DLC go in /data/switch-emu/install - Triangle in the launcher installs them.",
+    "The Home menu's performance overlay shows the frame rate and where the time goes.",
+};
+
+void DrawLoading(const char* /*progress*/) {
+    const double now = Elapsed();
+    if (std::isnan(g_load.shown))
+        g_load.shown = now;
+    if (std::isnan(g_load.stage_time))
+        g_load.stage_time = now;
     GameEntry g{};
     CopyText(g.title, sizeof(g.title), g_loading_title[0] ? g_loading_title : "Starting");
     g.icon = g_loading_icon;
     const uint32_t accent = g.icon ? AverageColor(g.icon) : TileColor(g.title);
     DrawBackground(accent);
     DrawBrand();
-    constexpr int kIcon = 360, kX = 140, kY = 300;
+
+    // The game's card, breathing gently while it loads.
+    constexpr int kIcon = 360, kX = 140, kY = 260;
+    const float breathe = 0.5f + 0.5f * float(std::sin(now * 2.2));
     g.accent = accent;
+    RoundRect(kX - 14, kY - 14, kIcon + 28, kIcon + 28, 34, Mix(accent, kWhite, 0.35f), uint32_t(40 + 50 * breathe));
     DrawCard(static_cast<const GameEntry&>(g), kX, kY, kIcon, false);
-    const int tx = kX + kIcon + 90;
-    DrawText(kTitleFont, tx, kY + 24, g.title, kWhite, kWidth - 80);
-    DrawText(kBold, tx, kY + 24 + kTitleFontHeight + 18, progress, kText, kWidth - 80);
-    // Progress bar: "... <done> of <total>" in the text gives the fill; otherwise a moving segment.
-    const int bx = tx, by = kY + 24 + kTitleFontHeight + 18 + kBoldFontHeight + 22, bw = kWidth - 120 - tx, bh = 12;
-    RoundRect(bx, by, bw, bh, bh / 2, Rgb(255, 255, 255), 36);
-    int done = 0, total = 0;
-    const char* of = strstr(progress, " of ");
-    if (of) {
-        const char* p = of;
-        while (p > progress && p[-1] >= '0' && p[-1] <= '9')
-            p--;
-        done = atoi(p);
-        total = atoi(of + 4);
+
+    const int tx = kX + kIcon + 90, right = kWidth - 140;
+    DrawText(kTitleFont, tx, kY + 4, g.title, kWhite, right);
+
+    const int stage = g_load.stage.load();
+    const unsigned done = g_load.cache_done.load(), total = g_load.cache_total.load();
+    const unsigned long long built = ps4_pipelines_built.load() - g_load.shaders_at_start.load();
+    char detail[96];
+    int y = kY + kTitleFontHeight + 46;
+    const auto step = [&](int index, const char* label, const char* info) {
+        const int cy = y + 18;
+        if (stage > index)
+            DrawCheck(tx + 15, cy);
+        else if (stage == index)
+            DrawSpinner(tx + 15, cy, now);
+        else
+            Ring(tx + 15, cy, 13, 3, Rgb(70, 82, 110));
+        DrawText(kBold, tx + 50, y + (36 - kBoldFontHeight) / 2, label, stage >= index ? kWhite : kDim, right);
+        if (info && info[0])
+            DrawText(right - TextWidth(kRegular, info), y + (36 - kStatusFontHeight) / 2, info,
+                     stage == index ? kText : kDim);
+        y += 62;
+    };
+
+    step(0, "Starting the graphics", "");
+    if (stage <= 1 && total > 0)
+        std::snprintf(detail, sizeof(detail), "%u of %u", std::min(done, total), total);
+    else if (stage >= 2)
+        std::snprintf(detail, sizeof(detail), total > 0 ? "%u loaded" : "none yet - first start", total);
+    else
+        detail[0] = 0;
+    step(1, "Loading shaders from the cache", detail);
+    if (stage == 1 && total > 0) {
+        // A real fill: shaders loaded so far out of those in the cache.
+        const int bx = tx + 50, bw = right - bx, bh = 10, by = y - 18;
+        RoundRect(bx, by, bw, bh, bh / 2, Rgb(255, 255, 255), 36);
+        RoundRect(bx, by, std::max(bh, int(int64_t(bw) * std::min(done, total) / total)), bh, bh / 2, kAccent);
+        y += 14;
     }
-    if (total > 0) {
-        const int fill = std::max(bh, int(int64_t(bw) * std::min(done, total) / total));
-        RoundRect(bx, by, fill, bh, bh / 2, kAccent);
+    if (stage >= 2) {
+        const int secs = int(now - g_load.stage_time);
+        std::snprintf(detail, sizeof(detail), "%d:%02d%s", secs / 60, secs % 60, "");
     } else {
-        static int step = 0;
-        step++;
-        const int seg = bw / 4, x = bx + (step * 37) % (bw + seg) - seg;
-        const int x0 = std::max(x, bx), x1 = std::min(x + seg, bx + bw);
-        if (x1 > x0)
-            RoundRect(x0, by, x1 - x0, bh, bh / 2, kAccent);
+        detail[0] = 0;
     }
-    DrawText(tx, by + 46, "The first start of a game builds its shaders and can take a minute or two.", kDim,
-             kWidth - 80);
-    DrawText(tx, by + 46 + kStatusFontHeight + 6, "Later starts load them from the shader cache and are faster.",
-             kDim, kWidth - 80);
+    step(2, "Starting the game", detail);
+    if (stage == 2) {
+        // No bar here: how long a game takes to boot isn't known. What it is doing is.
+        if (built > 0)
+            std::snprintf(detail, sizeof(detail), "Building new shaders: %llu so far (saved for next time)", built);
+        else
+            std::snprintf(detail, sizeof(detail), "The game is loading its data");
+        DrawText(tx + 50, y - 16, detail, kDim, right);
+        y += 30;
+    }
+
+    // A tip, changing every 7 seconds, fading between them.
+    const double tip_time = (now - g_load.shown) / 7.0;
+    const int tip = int(tip_time) % int(sizeof(kLoadingTips) / sizeof(kLoadingTips[0]));
+    const double phase = tip_time - std::floor(tip_time);
+    const float fade = float(std::min({1.0, tip_time < 1 ? 1.0 : phase * 14.0, (1.0 - phase) * 14.0}));
+    RoundRect(tx, 900, right - tx, 64, 16, Rgb(10, 13, 24), 150);
+    DrawText(kBold, tx + 24, 900 + (64 - kBoldFontHeight) / 2, "Tip", kAccent);
+    DrawText(tx + 84, 900 + (64 - kStatusFontHeight) / 2, kLoadingTips[tip], Mix(Rgb(10, 13, 24), kText, fade), right - 20);
 }
 
 // In-game Home menu (yuzu_cmd): drawn over a darkened copy of the game's last frame.
@@ -1388,7 +1461,7 @@ StatusView ReadStatus(const char* stage) {
     if (g_crashed) {
         CopyText(v.title, sizeof(v.title), "Something went wrong");
         CopyText(v.detail, sizeof(v.detail),
-                 "The emulator crashed. crash.log is in /data/switch-emu/logs - close the app with the PS button.");
+                 "The emulator crashed - crash.log is in /data/switch-emu/logs. Back to the launcher in a few seconds...");
         v.error = true;
     } else if (starts("Benchmark suite finished")) {
         CopyText(v.title, sizeof(v.title), "Benchmarks finished");
@@ -1582,13 +1655,20 @@ void DrawStatus(int tick) {
     // Hints.
     int hx = kX;
     const int hy = 936;
-    if (v.finished && strstr(stage, "Benchmark")) {
+    if (g_crashed) {
+        Hint(hx, hy, "Back to the launcher in a few seconds");
+    } else if ((v.finished && strstr(stage, "Benchmark")) || strstr(stage, "Press any button for the launcher")) {
         hx = DrawButton(hx, hy, Button::Cross);
-        Hint(hx, hy, "Back to the launcher");
+        Hint(hx, hy, "Back to the launcher (any button)");
     } else if (strstr(stage, "press any button")) {
         Hint(hx, hy, "Press any button to stop");
+    } else if (strstr(stage, "Benchmark suite")) {
+        hx = DrawButton(hx, hy, Button::Circle);
+        Hint(hx, hy, "Cancel and go back to the launcher");
+    } else if (strstr(stage, "Install")) {
+        Hint(hx, hy, "Back to the launcher by itself when the install is done");
     } else {
-        Hint(hx, hy, "Close the app with the PS button");
+        Hint(hx, hy, "Please wait - back to the launcher when it's done");
     }
     const char* logs = "Logs: /data/switch-emu/logs";
     DrawText(kRegular, kWidth - 100 - TextWidth(kRegular, logs), hy + 8, logs, kDim);
@@ -1835,6 +1915,22 @@ const char* ps4_launcher_loading_title() {
 void ps4_launcher_set_loading(const char* title, const uint32_t* icon) {
     CopyText(g_loading_title, sizeof(g_loading_title), title);
     g_loading_icon = icon;
+    g_load.stage = 0;
+    g_load.cache_done = g_load.cache_total = 0;
+    g_load.shown = g_load.stage_time = NAN;
+}
+
+void ps4_loading_cache(unsigned done, unsigned total) {
+    if (g_load.stage.exchange(1) != 1)
+        g_load.stage_time = Elapsed();
+    g_load.cache_done = done;
+    g_load.cache_total = total;
+}
+
+void ps4_loading_starting_game() {
+    g_load.shaders_at_start = ps4_pipelines_built.load();
+    g_load.stage_time = Elapsed();
+    g_load.stage = 2;
 }
 
 // Draws the loading screen into dst (1920x1080, pitch in pixels). Called from the Vulkan swap

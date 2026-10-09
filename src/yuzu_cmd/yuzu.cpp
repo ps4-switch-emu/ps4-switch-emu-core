@@ -107,6 +107,7 @@ extern "C" void ps4_status_set_stage(const char* stage);
 extern "C" void ps4_status_watch_file(const char* path, const char* heading);
 // externals/ps4sup/ps4_menu.cpp: start menu (DualShock 4) and the automatic benchmark suite.
 extern "C" void ps4_menu_run();
+extern "C" void ps4_menu_activity_input(bool any, bool circle); // ps4_menu.cpp
 extern "C" void ps4_menu_guest_exited();
 extern "C" void ps4_menu_poll_restart();
 extern "C" void ps4_menu_load_failed(int code, const char* path);
@@ -122,6 +123,8 @@ extern "C" unsigned long long ps4_gpu_wait_us(); // vk_swapchain.cpp
 extern "C" void ps4_overlay_configure(int mode, int corner); // vk_present_manager.cpp
 extern "C" int ps4_overlay_mode();
 extern "C" void ps4_swapchain_show_loading(const char* progress); // vk_swapchain.cpp
+extern "C" void ps4_loading_cache(unsigned done, unsigned total);    // status_screen.cpp
+extern "C" void ps4_loading_starting_game();
 #define PS4_STAGE(...) ps4_status_set_stage(fmt::format(__VA_ARGS__).c_str())
 
 // The launcher's library: a game's real title and icon, read from its file into
@@ -1015,24 +1018,23 @@ skip_controller_mapping:
                 if (stage == VideoCore::LoadCallbackStage::Build)
                     s_pipelines = total;
 #ifdef __OPENORBIS__
-                // Progress on the loading screen, a few times a second.
-                static u64 s_last = 0;
-                if (const u64 now = SDL_GetTicks(); stage == VideoCore::LoadCallbackStage::Build && now - s_last >= 200) {
-                    s_last = now;
-                    ps4_swapchain_show_loading(
-                        fmt::format("Building shaders from the cache: {} of {}", value, total).c_str());
-                }
+                // The loading screen (redrawn by the swap chain) shows how many are loaded.
+                if (stage == VideoCore::LoadCallbackStage::Build)
+                    ps4_loading_cache(unsigned(value), unsigned(total));
 #endif
             });
         PS4_TRACE("shader cache: {} pipelines built from disk in {:.1f} s (async shaders {})", s_pipelines,
                   (SDL_GetTicks() - load_start) / 1000.0, Settings::values.use_asynchronous_shaders.GetValue());
     }
+#ifdef __OPENORBIS__
+    ps4_loading_starting_game(); // until the first frame
+#endif
 
     // don't do anything, SDL3 already exists for us :D
     state->system.RegisterExitCallback([state] {
         state->system.DeviceMemory().buffer.LogFastmemStats("guest exit");
         PS4_TRACE("main: guest program exited");
-        PS4_STAGE("Finished - the program exited. Close the app with the PS button.");
+        PS4_STAGE("Finished - the program exited. Back to the launcher...");
 #ifdef __OPENORBIS__
         ps4_menu_guest_exited();
 #endif
@@ -1234,14 +1236,26 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     {
         static u64 s_combo_since = 0;
         bool held = false;
+        u32 buttons = 0; // every button down, one bit each (for the activity screen below)
         int count = 0;
         if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
-            for (int i = 0; i < count && !held; i++)
-                if (SDL_Gamepad* gp = SDL_GetGamepadFromID(ids[i]))
-                    held = SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_LEFT_STICK) &&
-                           SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_RIGHT_STICK);
+            for (int i = 0; i < count; i++)
+                if (SDL_Gamepad* gp = SDL_GetGamepadFromID(ids[i])) {
+                    held = held || (SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_LEFT_STICK) &&
+                                    SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_RIGHT_STICK));
+                    for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT && b < 32; b++)
+                        if (SDL_GetGamepadButton(gp, SDL_GamepadButton(b)))
+                            buttons |= 1u << b;
+                }
             SDL_free(ids);
         }
+        // No game on screen (benchmark suite, install): Circle cancels a suite, any button closes
+        // finished results - instead of the app having to be closed with the PS button.
+        static u32 s_buttons = 0;
+        const u32 pressed = buttons & ~s_buttons;
+        s_buttons = buttons;
+        if (pressed != 0 && Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Null)
+            ps4_menu_activity_input(true, (pressed & (1u << SDL_GAMEPAD_BUTTON_EAST)) != 0);
         const u64 now = SDL_GetTicks();
         if (!held) {
             s_combo_since = 0;

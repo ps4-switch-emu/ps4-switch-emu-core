@@ -34,6 +34,7 @@ extern "C" uint32_t sceSysmoduleLoadModuleInternal(uint32_t id);
 // externals/ps4sup/status_screen.cpp (weak: optional)
 extern "C" __attribute__((weak)) void ps4_status_push(const char* line);
 extern "C" __attribute__((weak)) void ps4_status_crashed();
+extern "C" __attribute__((weak)) void ps4_menu_after_crash(); // ps4_menu.cpp
 extern "C" int32_t sceSysmoduleLoadModule(uint16_t id);
 extern "C" void ps4_boot_trace(const char* stage);
 extern "C" int32_t sceKernelAvailableFlexibleMemorySize(size_t* size);
@@ -196,6 +197,12 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
     if (ps4_status_crashed) {
         ps4_status_crashed();
         usleep(800 * 1000); // let the status screen show it before the system's error dialog
+    }
+    // Back to the launcher (or the next benchmark run) instead of leaving the user to close the
+    // app; crash.log is written. If the restart doesn't happen, the system's crash report follows.
+    if (ps4_menu_after_crash) {
+        usleep(2500 * 1000);
+        ps4_menu_after_crash();
     }
 
     // Back to the default action: returning re-executes the faulting instruction, which now

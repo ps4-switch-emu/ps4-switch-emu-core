@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <mutex>
+#include <thread>
 #include <cstdarg>
 #include <cstdio>
 #include <array>
@@ -65,6 +67,39 @@ int g_ps4_video = -1; // one VideoOut handle for the process
 uint32_t* g_ps4_loading_dst = nullptr;
 u32 g_ps4_loading_pitch = 0;
 std::atomic<bool> g_ps4_presented{false};
+// Redraws the loading screen (~15 fps: its spinner, elapsed time, shader count) from the swap
+// chain's creation until the game acquires its first image; the lock keeps a redraw and the
+// game's first frame apart (both use image 0).
+std::mutex g_ps4_loading_mutex;
+std::thread g_ps4_loading_thread;
+bool g_ps4_loading_stop = false;
+
+void StopLoadingScreenPS4() {
+    {
+        std::scoped_lock lk{g_ps4_loading_mutex};
+        g_ps4_loading_stop = true;
+    }
+    if (g_ps4_loading_thread.joinable())
+        g_ps4_loading_thread.join();
+}
+
+void StartLoadingScreenPS4() {
+    if (g_ps4_loading_thread.joinable())
+        return;
+    g_ps4_loading_stop = false;
+    g_ps4_loading_thread = std::thread([] {
+        for (;;) {
+            {
+                std::scoped_lock lk{g_ps4_loading_mutex};
+                if (g_ps4_loading_stop || g_ps4_presented || !g_ps4_loading_dst || !ps4_status_render_loading)
+                    return;
+                ps4_status_render_loading(g_ps4_loading_dst, int(g_ps4_loading_pitch), nullptr);
+                sceVideoOutSubmitFlip(g_ps4_video, 0, PS4FlipVsync, 0);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(66));
+        }
+    });
+}
 // The swap chain in use and its image addresses (one per process), for the Home menu overlay.
 Swapchain* g_ps4_swapchain = nullptr;
 std::array<uint32_t*, 3> g_ps4_addresses{};
@@ -239,6 +274,8 @@ bool Swapchain::AcquireNextImage() {
     // image doesn't wait on a present semaphore on the PS4 (PresentManager::CopyToSwapchain).
     // Time spent waiting for the GPU (and VideoOut) before reusing an image: a large share of
     // each second means the PS4's GPU is the limit (reported by yuzu_cmd's perf line).
+    if (g_ps4_loading_thread.joinable())
+        StopLoadingScreenPS4(); // the game draws from now on
     const auto wait_start = std::chrono::steady_clock::now();
     WaitForImageOffScreenPS4();
     image_index = (image_index + 1) % image_count;
@@ -620,7 +657,7 @@ void Swapchain::CreatePS4() {
     if (ps4_buffer_set >= 0 && !g_ps4_presented) {
         g_ps4_loading_dst = static_cast<uint32_t*>(addresses[0]);
         g_ps4_loading_pitch = pitch;
-        ps4_swapchain_show_loading("Starting...");
+        StartLoadingScreenPS4();
     }
 }
 
@@ -629,6 +666,7 @@ void Swapchain::DestroyPS4() {
     const VkDevice dev = *device.GetLogical();
     if (!images.empty() || !ps4_memory.empty())
         device.GetLogical().WaitIdle();
+    StopLoadingScreenPS4();
     g_ps4_loading_dst = nullptr;
     if (g_ps4_swapchain == this)
         g_ps4_swapchain = nullptr;
@@ -700,8 +738,10 @@ void Swapchain::WaitForImageOffScreenPS4() {
 // Redraws the loading screen (image 0) with a progress line, until the game's first frame.
 extern "C" void ps4_swapchain_show_loading(const char* progress) {
     using namespace Vulkan;
-    if (!g_ps4_loading_dst || g_ps4_presented || !ps4_status_render_loading || g_ps4_video < 0)
-        return;
+    std::scoped_lock lk{g_ps4_loading_mutex};
+    if (g_ps4_loading_thread.joinable() || !g_ps4_loading_dst || g_ps4_presented || !ps4_status_render_loading ||
+        g_ps4_video < 0)
+        return; // the loading screen thread redraws it
     ps4_status_render_loading(g_ps4_loading_dst, int(g_ps4_loading_pitch), progress);
     sceVideoOutSubmitFlip(g_ps4_video, 0, PS4FlipVsync, 0);
 }
