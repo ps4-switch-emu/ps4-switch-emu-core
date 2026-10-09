@@ -125,6 +125,42 @@ extern "C" int ps4_overlay_mode();
 extern "C" void ps4_swapchain_show_loading(const char* progress); // vk_swapchain.cpp
 extern "C" void ps4_loading_cache(unsigned done, unsigned total);    // status_screen.cpp
 extern "C" void ps4_loading_starting_game();
+static u64 g_ps4_session_start = 0; // SDL ticks when the game started, for the Home menu's play time
+
+// Play time across sessions: /data/switch-emu/titles/<file>.play holds "<seconds> <sessions>" (the
+// launcher shows it). Added to every 30 s while a game runs - leaving through the launcher (a
+// LoadExec) or a crash loses at most that much; time in the Home menu doesn't count.
+static struct {
+    std::string path;
+    long seconds = 0, sessions = 0;
+    u64 counted_to = 0; // SDL ticks up to which time is counted
+} g_ps4_play;
+
+static void PS4PlaySave() {
+    if (g_ps4_play.path.empty())
+        return;
+    const u64 now = SDL_GetTicks();
+    const u64 whole = (now - g_ps4_play.counted_to) / 1000;
+    g_ps4_play.seconds += long(whole);
+    g_ps4_play.counted_to += whole * 1000;
+    if (FILE* f = fopen(g_ps4_play.path.c_str(), "w")) {
+        fprintf(f, "%ld %ld\n", g_ps4_play.seconds, g_ps4_play.sessions);
+        fclose(f);
+    }
+}
+
+static void PS4PlayStart(const std::string& filepath) {
+    mkdir("/data/switch-emu/titles", 0777);
+    g_ps4_play.path = "/data/switch-emu/titles/" + filepath.substr(filepath.rfind('/') + 1) + ".play";
+    if (FILE* f = fopen(g_ps4_play.path.c_str(), "r")) {
+        if (fscanf(f, "%ld %ld", &g_ps4_play.seconds, &g_ps4_play.sessions) != 2)
+            g_ps4_play.seconds = g_ps4_play.sessions = 0;
+        fclose(f);
+    }
+    g_ps4_play.sessions++;
+    g_ps4_play.counted_to = SDL_GetTicks();
+    PS4PlaySave();
+}
 #define PS4_STAGE(...) ps4_status_set_stage(fmt::format(__VA_ARGS__).c_str())
 
 // The launcher's library: a game's real title and icon, read from its file into
@@ -1028,6 +1064,9 @@ skip_controller_mapping:
     }
 #ifdef __OPENORBIS__
     ps4_loading_starting_game(); // until the first frame
+    g_ps4_session_start = SDL_GetTicks();
+    if (Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Null)
+        PS4PlayStart(filepath); // games, not benchmarks or test programs
 #endif
 
     // don't do anything, SDL3 already exists for us :D
@@ -1122,7 +1161,10 @@ static void PS4HomeMenu(SdlState* state) {
     static const char* const kOverlayLabels[] = {"Performance overlay: Off", "Performance overlay: FPS",
                                                   "Performance overlay: Detailed"};
     const char* items[] = {"Resume", "Restart game", "Quit to launcher", kOverlayLabels[ps4_overlay_mode() % 3]};
-    Ps4HomeMenu menu{ps4_launcher_loading_title(), g_ps4_last_perf.c_str(), items, 4, 0};
+    PS4PlaySave(); // the menu's time doesn't count: counted up to here, restarted on resume
+    const u64 opened = SDL_GetTicks();
+    Ps4HomeMenu menu{ps4_launcher_loading_title(), g_ps4_last_perf.c_str(), items, 4, 0,
+                     int((opened - g_ps4_session_start) / 1000), int(g_ps4_play.seconds)};
     struct Ctx {
         const Ps4HomeMenu* menu;
         bool capture;
@@ -1133,6 +1175,9 @@ static void PS4HomeMenu(SdlState* state) {
     };
     ps4_swapchain_overlay_draw(draw, &ctx);
     ctx.capture = false;
+    // The menu's sounds: their own audio port, open only while the menu shows (the game is paused).
+    ps4_sound_open();
+    ps4_sound_play(kSoundMenuOpen);
     constexpr u32 kUp = 1u << SDL_GAMEPAD_BUTTON_DPAD_UP, kDown = 1u << SDL_GAMEPAD_BUTTON_DPAD_DOWN,
                   kSelect = 1u << SDL_GAMEPAD_BUTTON_SOUTH, kBack = 1u << SDL_GAMEPAD_BUTTON_EAST,
                   kSticks = (1u << SDL_GAMEPAD_BUTTON_LEFT_STICK) | (1u << SDL_GAMEPAD_BUTTON_RIGHT_STICK);
@@ -1148,10 +1193,16 @@ static void PS4HomeMenu(SdlState* state) {
             menu.selected = (menu.selected + menu.count - 1) % menu.count;
         if (pressed & kDown)
             menu.selected = (menu.selected + 1) % menu.count;
+        if (menu.selected != old)
+            ps4_sound_play(kSoundMove);
         if (menu.selected != old || ps4_status_home_animating()) // the panel rising in, the highlight gliding
             ps4_swapchain_overlay_draw(draw, &ctx);
         if ((pressed & kBack) || ((pressed & kSelect) && menu.selected == 0)) {
+            ps4_sound_play(kSoundMenuClose);
+            ps4_sound_close(); // after the sound: the game's audio resumes
             ps4_swapchain_overlay_end();
+            g_ps4_session_start += SDL_GetTicks() - opened; // play time leaves the menu out
+            g_ps4_play.counted_to += SDL_GetTicks() - opened;
             state->system.Run();
             PS4_TRACE("main: Home menu closed, resuming");
             return;
@@ -1159,10 +1210,15 @@ static void PS4HomeMenu(SdlState* state) {
         if ((pressed & kSelect) && menu.selected == 1) {
             if (FILE* f = fopen("/data/switch-emu/autostart", "w"))
                 fclose(f);
+            ps4_sound_play(kSoundConfirm);
+            ps4_sound_close();
             ps4_menu_restart_now();
         }
-        if ((pressed & kSelect) && menu.selected == 2)
+        if ((pressed & kSelect) && menu.selected == 2) {
+            ps4_sound_play(kSoundBack);
+            ps4_sound_close();
             ps4_menu_restart_now();
+        }
         if ((pressed & kSelect) && menu.selected == 3) { // cycle the overlay (this session)
             const int mode = (ps4_overlay_mode() + 1) % 3;
             int corner = 1;
@@ -1173,6 +1229,7 @@ static void PS4HomeMenu(SdlState* state) {
                 fclose(f);
             }
             ps4_overlay_configure(mode, corner);
+            ps4_sound_play(kSoundToggle);
             items[3] = kOverlayLabels[mode];
             ps4_swapchain_overlay_draw(draw, &ctx);
         }
@@ -1289,8 +1346,10 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         s_faults = faults;
         // Every 30 s: how much of the game's memory the fast path covers, and why the rest isn't.
         static int s_reports = 0;
-        if (++s_reports % 6 == 0)
+        if (++s_reports % 6 == 0) {
             state->system.DeviceMemory().buffer.LogFastmemStats("playing");
+            PS4PlaySave();
+        }
         g_ps4_last_perf = fmt::format("Frame rate: {:.0f} fps (last 5 s)", perf.average_game_fps);
     }
 #endif

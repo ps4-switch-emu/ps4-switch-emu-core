@@ -47,6 +47,8 @@ struct OverlayState {
     int frames = 0;
     float worst_ms = 0;
     unsigned long long gpu_wait_start = 0;
+    std::array<float, std::size(Ps4OverlayStats{}.history)> gaps{}; // ring of frame gaps (ms)
+    size_t gaps_next = 0, gaps_count = 0;
     Ps4OverlayStats stats{};
     std::vector<uint32_t> pixels;
 };
@@ -57,8 +59,12 @@ void RecordPS4Overlay(MemoryAllocator& allocator, const vk::CommandBuffer& cmdbu
     auto& o = g_overlay;
     const auto now = std::chrono::steady_clock::now();
     if (o.last_frame.time_since_epoch().count() != 0) {
-        o.worst_ms = std::max(o.worst_ms, std::chrono::duration<float, std::milli>(now - o.last_frame).count());
+        const float gap = std::chrono::duration<float, std::milli>(now - o.last_frame).count();
+        o.worst_ms = std::max(o.worst_ms, gap);
         o.frames++;
+        o.gaps[o.gaps_next] = gap;
+        o.gaps_next = (o.gaps_next + 1) % o.gaps.size();
+        o.gaps_count = std::min(o.gaps_count + 1, o.gaps.size());
     } else {
         o.window_start = now;
         o.gpu_wait_start = ps4_gpu_wait_us();
@@ -76,6 +82,9 @@ void RecordPS4Overlay(MemoryAllocator& allocator, const vk::CommandBuffer& cmdbu
         size_t free_bytes = 0;
         sceKernelAvailableDirectMemorySize(0, off_t(sceKernelGetDirectMemorySize()), 16 * 1024, &at, &free_bytes);
         o.stats.gpu_free_mb = int(free_bytes >> 20);
+        o.stats.history_count = int(o.gaps_count);
+        for (size_t i = 0; i < o.gaps_count; i++) // oldest first
+            o.stats.history[i] = o.gaps[(o.gaps_next + o.gaps.size() - o.gaps_count + i) % o.gaps.size()];
         o.window_start = now;
         o.gpu_wait_start = wait;
         o.frames = 0;

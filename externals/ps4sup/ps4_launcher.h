@@ -34,6 +34,8 @@ struct Ps4HomeMenu {
     const char* const* items;
     int count;
     int selected;
+    int play_seconds;  // this session, for "Playing for 12:34"
+    int total_seconds; // every session (titles/<file>.play), 0: unknown
 };
 
 // In-game performance overlay (vk_present_manager.cpp copies it into each frame).
@@ -47,13 +49,15 @@ struct Ps4OverlayStats {
     float gpu_wait;    // share of time waiting for the GPU, 0..1
     int new_shaders;   // pipelines built in game so far
     int gpu_free_mb;   // largest free block of direct memory
+    float history[120]; // the latest gaps between frames (ms), oldest first: the frame-time graph
+    int history_count;
 };
-constexpr int kOverlayFpsW = 190, kOverlayFpsH = 70, kOverlayDetailW = 430, kOverlayDetailH = 292;
+constexpr int kOverlayFpsW = 190, kOverlayFpsH = 70, kOverlayDetailW = 430, kOverlayDetailH = 372;
 
 enum Ps4LauncherTab { kLauncherGames = 0, kLauncherSettings = 1 };
 
 // Games tab: a grid, or one row of large tiles with round shortcuts below (console style).
-enum Ps4LauncherLayout { kLayoutGrid = 0, kLayoutRow = 1 };
+enum Ps4LauncherLayout { kLayoutGrid = 0, kLayoutRow = 1, kLayoutList = 2, kLayoutCount = 3 };
 // The row layout's shortcuts, left to right.
 enum Ps4LauncherShortcut { kShortcutSettings = 0, kShortcutInstall = 1, kShortcutBackup = 2, kShortcutCount = 3 };
 
@@ -87,4 +91,14 @@ bool ps4_status_home_animating();
 void ps4_status_render_overlay(uint32_t* dst, int w, int h, const Ps4OverlayStats* stats);
 // The title of the game being played (for the Home menu).
 const char* ps4_launcher_loading_title();
+
+// The app's sounds (ps4_sounds.cpp). Open the port while menus show; close it (waits for the
+// sounds playing to end) before a game starts its own audio.
+enum Ps4Sound {
+    kSoundMove = 1, kSoundConfirm, kSoundBack, kSoundToggle, kSoundStartup, kSoundLaunch,
+    kSoundMenuOpen, kSoundMenuClose, kSoundError,
+};
+void ps4_sound_open();
+void ps4_sound_play(int sound);
+void ps4_sound_close();
 }

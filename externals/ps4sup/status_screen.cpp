@@ -29,6 +29,7 @@
 #include "status_font_bold.h"
 #include "status_font_title.h"
 #include "status_logo.h"
+#include "status_logo_big.h"
 
 // New pipelines built in game (stub.cpp; the loading screen shows them).
 extern std::atomic<unsigned long long> ps4_pipelines_built;
@@ -244,7 +245,8 @@ double Elapsed() {
 constexpr int kMaxGames = 128, kMaxSettings = 24;
 constexpr int kCardSize = 160, kCardBig = 180; // icon sizes kept scaled per game (normal, selected)
 constexpr int kRowTile = 300, kRowBig = 340;    // the row layout's cards (normal, selected)
-constexpr int kLoadingCard = 360;               // the loading screen's card
+constexpr int kLoadingCard = 360;               // the loading screen's card (and the list's selected game)
+constexpr int kListIcon = 72;                   // the list layout's icons
 struct GameEntry {
     char title[96];
     char detail[128];
@@ -296,6 +298,7 @@ struct Anim {
     float tint_r = 30, tint_g = 60, tint_b = 120; // background tint
     float tab_x = -1, tab_w = 0;                  // tab underline
     float row_scroll = 0;                         // row layout: pixels
+    float games_list_scroll = 0, games_list_bar = -1; // list layout: pixels, the highlight's row
     float grow[kMaxGames] = {};                   // each card's growth toward the selected size, 0..1
     float shortcut_grow[kShortcutCount] = {};     // row layout: each shortcut's highlight, 0..1
     float bar_y = -1;                             // settings: the highlight bar, list space
@@ -627,7 +630,7 @@ void DrawCardImage(GameEntry& g, int x, int y, int size) {
     constexpr int kRadius = 18;
     const uint32_t* pixels = nullptr;
     if (g.icon && size != kCardSize && size != kCardBig && size != kRowTile && size != kRowBig &&
-        size != kLoadingCard && g.small_size != size && g.big_size != size) {
+        size != kLoadingCard && size != kListIcon && g.small_size != size && g.big_size != size) {
         // A size in between (a card growing or shrinking): each pixel straight from the icon,
         // no scaled copy (one a frame would cost far more than the drawing).
         int src_x[kLoadingCard];
@@ -788,6 +791,78 @@ void DrawToast(double now) {
 
 // Row layout of the games tab: one row of large tiles that scrolls sideways, the selected game's
 // title above it, and round shortcuts below. Returns true while animating.
+// List layout: the games as rows (icon, title, details) on the left, the selected one large on the
+// right with its details a line each (play time, last played - see ps4_menu.cpp's detail text).
+bool DrawGameList(int game_sel, int game_count, float k) {
+    constexpr int kLeft = 100, kListW = 860, kRowH = 88, kTop = 150, kVisible = 8, kBottom = kTop + kVisible * kRowH;
+    bool moving = false;
+    const int total = game_count * kRowH;
+    const int target = std::clamp(game_sel * kRowH - (kVisible / 2 - 1) * kRowH, 0, std::max(0, total - kVisible * kRowH));
+    moving |= Approach(g_anim.games_list_scroll, float(target), k);
+    if (g_anim.games_list_bar < 0)
+        g_anim.games_list_bar = float(game_sel);
+    moving |= ApproachUnit(g_anim.games_list_bar, float(game_sel), k * 1.2f);
+    const int scroll = int(g_anim.games_list_scroll);
+
+    RoundRect(kLeft - 20, kTop, kListW + 40, kVisible * kRowH, 26, Rgb(10, 13, 24), 120);
+    const int bar_y = kTop + int(g_anim.games_list_bar * float(kRowH)) - scroll;
+    RoundRect(kLeft - 12, bar_y + 4, kListW + 24, kRowH - 8, 20, Rgb(236, 240, 248));
+    Lock();
+    for (int i = 0; i < game_count; i++) {
+        const int y = kTop + i * kRowH - scroll;
+        if (y + kRowH <= kTop || y >= kBottom)
+            continue;
+        const float cover = std::clamp(1.0f - std::fabs(g_anim.games_list_bar - float(i)), 0.0f, 1.0f);
+        DrawCardImage(g_games[i], kLeft + 8, y + (kRowH - kListIcon) / 2, kListIcon);
+        char title[96], detail[128];
+        CopyText(title, sizeof(title), g_games[i].title);
+        Ellipsize(kBold, title, sizeof(title), kListW - kListIcon - 50);
+        CopyText(detail, sizeof(detail), g_games[i].detail);
+        Ellipsize(kRegular, detail, sizeof(detail), kListW - kListIcon - 50);
+        const int tx = kLeft + 8 + kListIcon + 24;
+        DrawText(kBold, tx, y + 10, title, Mix(kWhite, Rgb(14, 20, 34), cover), kLeft + kListW);
+        DrawText(kRegular, tx, y + 48, detail, Mix(kDim, Rgb(70, 80, 100), cover), kLeft + kListW);
+    }
+    // The selected game, large, on the right.
+    constexpr int kPanelX = kLeft + kListW + 80, kBigCard = kLoadingCard;
+    const int panel_w = kWidth - 100 - kPanelX;
+    const int cx = kPanelX + (panel_w - kBigCard) / 2;
+    GameEntry& g = g_games[game_sel];
+    Shadow(cx, kTop, kBigCard, kBigCard, 22);
+    DrawCardImage(g, cx, kTop, kBigCard);
+    g_anim.sel_x = cx, g_anim.sel_y = kTop, g_anim.sel_size = kBigCard;
+    char title[96], detail[128];
+    CopyText(title, sizeof(title), g.title);
+    CopyText(detail, sizeof(detail), g.detail);
+    Unlock();
+    // What scrolled past the list's ends (the header and hints are drawn after this).
+    RepaintBackground(0, kTop);
+    RepaintBackground(kBottom, kBottom + kRowH);
+    if (scroll > 0)
+        DrawText(kBold, kLeft + kListW / 2, kTop - 42, "^", kDim);
+    if (scroll + kVisible * kRowH < total)
+        DrawText(kBold, kLeft + kListW / 2, kBottom + 4, "v", kDim);
+
+    Ellipsize(kTitleFont, title, sizeof(title), panel_w);
+    int y = kTop + kBigCard + 30;
+    DrawText(kTitleFont, kPanelX + (panel_w - TextWidth(kTitleFont, title)) / 2, y, title, kWhite, kWidth - 80);
+    y += kTitleFontHeight + 14;
+    // The detail text's "  -  " parts, a line each.
+    for (char* part = detail; part && *part && y < kBottom;) {
+        char* next = strstr(part, "  -  ");
+        if (next)
+            *next = 0;
+        DrawText(kRegular, kPanelX + (panel_w - TextWidth(kRegular, part)) / 2, y, part, kText, kWidth - 80);
+        y += kStatusFontHeight + 6;
+        part = next ? next + 5 : nullptr;
+    }
+    char count_text[48];
+    snprintf(count_text, sizeof(count_text), "%d of %d", game_sel + 1, game_count);
+    DrawText(kRegular, kPanelX + (panel_w - TextWidth(kRegular, count_text)) / 2, kBottom - kStatusFontHeight + 10,
+             count_text, kDim);
+    return moving;
+}
+
 bool DrawGameRow(int game_sel, int game_count, int shortcut, float k) {
     constexpr int kTile = kRowTile, kBig = kRowBig, kGap = 30, kPitch = kTile + kGap, kLeft = 100, kTop = 250;
     constexpr int kVisible = (kWidth - 2 * kLeft + kGap) / kPitch;
@@ -1005,6 +1080,8 @@ void DrawLauncher() {
             DrawText(100, 534, "/data/switch-emu/nand/system/Contents/registered.", kText);
         } else if (layout == kLayoutRow) {
             moving |= DrawGameRow(game_sel, game_count, shortcut, k);
+        } else if (layout == kLayoutList) {
+            moving |= DrawGameList(game_sel, game_count, k);
         } else {
             constexpr int kCols = kLauncherColumns, kGapX = 62, kTitleH = 44, kGapY = 24, kTop = 140, kRows = 3,
                           kRowH = kCardSize + kTitleH + kGapY, kLeft = 100;
@@ -1361,19 +1438,64 @@ void DrawLoading(const char* /*progress*/) {
     DrawText(tx + 84, 900 + (64 - kStatusFontHeight) / 2, kLoadingTips[tip], Mix(Rgb(10, 13, 24), kText, fade), right - 20);
 }
 
-// In-game Home menu (yuzu_cmd): drawn over a darkened copy of the game's last frame.
+// In-game Home menu (yuzu_cmd): a panel over a darkened copy of the game's last frame.
 uint32_t* g_pause_bg = nullptr;
 
 // Home menu animation: the panel rises in when opened, the highlight glides between items.
 struct PauseAnim {
     double opened = -1, last = 0;
-    float highlight = -1;
+    float highlight = -1, target = 0;
 } g_pause_anim;
 
 bool PauseAnimating() {
     const double now = Elapsed();
     return now - g_pause_anim.opened < 0.25 || g_pause_anim.highlight < 0 ||
-           std::fabs(g_pause_anim.highlight - std::floor(g_pause_anim.highlight + 0.5f)) > 0.01f;
+           std::fabs(g_pause_anim.highlight - g_pause_anim.target) > 0.01f;
+}
+
+// A filled triangle (scanlines; for icons).
+void FillTriangle(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t color) {
+    const int top = std::min({y0, y1, y2}), bottom = std::max({y0, y1, y2});
+    for (int y = top; y <= bottom; y++) {
+        float lo = 1e9f, hi = -1e9f;
+        const int px[3] = {x0, x1, x2}, py[3] = {y0, y1, y2};
+        for (int i = 0; i < 3; i++) {
+            const int a = i, b = (i + 1) % 3;
+            if ((py[a] <= y && py[b] >= y) || (py[b] <= y && py[a] >= y)) {
+                const float t = py[a] == py[b] ? 0.0f : float(y - py[a]) / float(py[b] - py[a]);
+                const float x = float(px[a]) + t * float(px[b] - px[a]);
+                lo = std::min(lo, x), hi = std::max(hi, x);
+            }
+        }
+        if (hi >= lo)
+            FillRect(int(lo), y, int(hi - lo) + 1, 1, color);
+    }
+}
+
+// The Home menu's item icons, by the item's first word; bg is the row's colour (for cut-outs).
+void DrawItemIcon(const char* item, int cx, int cy, uint32_t c, uint32_t bg) {
+    if (strncmp(item, "Resume", 6) == 0) {
+        FillTriangle(cx - 8, cy - 12, cx - 8, cy + 12, cx + 12, cy, c);
+    } else if (strncmp(item, "Restart", 7) == 0) {
+        // A circular arrow: a ring open at the top right, with an arrowhead on its end.
+        for (int y = -14; y <= 14; y++)
+            for (int x = -14; x <= 14; x++) {
+                const int d2 = x * x + y * y;
+                if (d2 > 13 * 13 || d2 < 9 * 9 || (x > 0 && y < 0 && x < -y * 2) || cx + x < 0 ||
+                    cx + x >= kWidth || cy + y < 0 || cy + y >= kHeight) // (the panel slides in from off screen)
+                    continue;
+                g_frame[size_t(cy + y) * kWidth + size_t(cx + x)] = c;
+            }
+        FillTriangle(cx - 2, cy - 17, cx - 2, cy - 5, cx + 8, cy - 11, c);
+    } else if (strncmp(item, "Quit", 4) == 0) {
+        FillTriangle(cx - 14, cy - 1, cx + 14, cy - 1, cx, cy - 14, c); // a house
+        FillRect(cx - 10, cy - 1, 20, 14, c);
+        FillRect(cx - 3, cy + 5, 6, 8, bg);
+    } else {
+        FillRect(cx - 12, cy + 2, 6, 10, c); // bars: the performance overlay
+        FillRect(cx - 3, cy - 6, 6, 18, c);
+        FillRect(cx + 6, cy - 12, 6, 24, c);
+    }
 }
 
 void DrawPause(const Ps4HomeMenu& m) {
@@ -1384,32 +1506,78 @@ void DrawPause(const Ps4HomeMenu& m) {
     const double now = Elapsed();
     const float dt = float(std::min(now - g_pause_anim.last, 0.1));
     g_pause_anim.last = now;
-    const float open = Ease(float((now - g_pause_anim.opened) / 0.22));
+    const float open = Ease(float((now - g_pause_anim.opened) / 0.25));
     if (g_pause_anim.highlight < 0)
         g_pause_anim.highlight = float(m.selected);
+    g_pause_anim.target = float(m.selected);
     ApproachUnit(g_pause_anim.highlight, float(m.selected), 1.0f - std::exp(-dt * 18.0f));
-    constexpr int kW = 820, kH = 610;
-    const int x = (kWidth - kW) / 2, y = (kHeight - kH) / 2 + int((1.0f - open) * 40.0f);
-    Shadow(x, y, kW, kH, 32);
-    RoundRect(x, y, kW, kH, 32, kCard, uint32_t(245 * open));
-    DrawText(kTitleFont, x + 50, y + 34, m.title ? m.title : "Paused", kWhite, x + kW - 40);
-    DrawText(x + 50, y + 34 + kTitleFontHeight + 4, m.stats ? m.stats : "", kDim, x + kW - 40);
-    const int list_y = y + 34 + kTitleFontHeight + kStatusFontHeight + 36;
-    const float hl = g_pause_anim.highlight;
-    RoundRect(x + 30, list_y + int(hl * 72.0f), kW - 60, 60, 18, Rgb(236, 240, 248));
-    for (int i = 0; i < m.count; i++) {
-        const int ry = list_y + i * 72;
-        // Dark text where the highlight covers the item, light elsewhere, blending as it passes.
-        const float cover = std::clamp(1.0f - std::fabs(hl - float(i)), 0.0f, 1.0f);
-        DrawText(kBold, x + 60, ry + (60 - kBoldFontHeight) / 2, m.items[i], Mix(kText, Rgb(14, 20, 34), cover),
-                 x + kW - 40);
+
+    // A panel sliding in from the left over the game's (darkened) picture.
+    // (Drawn in place, then shifted left while it opens: the drawing helpers needn't clip at x < 0.)
+    constexpr int kW = 720, kEdge = 24;
+    constexpr uint32_t kPanel = Rgb(12, 17, 30);
+    constexpr int x = 0;
+    FillRect(0, 0, kW, kHeight, kPanel);
+    for (int i = 0; i < kEdge; i++) // a soft edge on its right
+        FillBlend(kW + i, 0, 1, kHeight, kPanel, uint32_t(120 * (1 - i / float(kEdge))));
+    const int px = x + 70;
+
+    // The game: its card, title, how it runs and for how long.
+    GameEntry g{};
+    CopyText(g.title, sizeof(g.title), m.title ? m.title : "Paused");
+    g.icon = g_loading_icon;
+    g.accent = g.icon ? AverageColor(g.icon) : TileColor(g.title);
+    DrawText(kBold, px, 70, "HOME", kAccent);
+    DrawCard(static_cast<const GameEntry&>(g), px, 134, 170, false);
+    DrawText(kTitleFont, px, 134 + 170 + 26, g.title, kWhite, x + kW - 40);
+    int sy = 134 + 170 + 26 + kTitleFontHeight + 6;
+    if (m.stats && m.stats[0]) {
+        DrawText(px, sy, m.stats, kText, x + kW - 40);
+        sy += kStatusFontHeight + 4;
     }
-    int hx = x + 50;
-    const int hy = y + kH - 74;
-    hx = DrawButton(hx, hy, Button::Cross);
-    hx = Hint(hx, hy, "Select");
-    hx = DrawButton(hx, hy, Button::Circle);
-    Hint(hx, hy, "Resume");
+    if (m.play_seconds > 0) {
+        char line[96];
+        const int s = m.play_seconds;
+        int n = s >= 3600 ? std::snprintf(line, sizeof(line), "Playing for %d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
+                          : std::snprintf(line, sizeof(line), "Playing for %d:%02d", s / 60, s % 60);
+        if (const int t = m.total_seconds; t >= 60 && n > 0 && n < int(sizeof(line))) {
+            if (t >= 3600)
+                std::snprintf(line + n, sizeof(line) - size_t(n), "  -  %d h %d min in all", t / 3600, t / 60 % 60);
+            else
+                std::snprintf(line + n, sizeof(line) - size_t(n), "  -  %d min in all", t / 60);
+        }
+        DrawText(px, sy, line, kDim, x + kW - 40);
+    }
+
+    // The items, with icons; the highlight glides between them.
+    const int list_y = 560, row_h = 76;
+    const float hl = g_pause_anim.highlight;
+    const int hy = list_y + int(hl * float(row_h));
+    RoundRect(px - 20, hy - 6, kW - 100, row_h - 8 + 12, 20, kAccent, 40); // glow
+    RoundRect(px - 16, hy - 2, kW - 108, row_h - 8 + 4, 18, Rgb(236, 240, 248));
+    for (int i = 0; i < m.count; i++) {
+        const int ry = list_y + i * row_h;
+        const float cover = std::clamp(1.0f - std::fabs(hl - float(i)), 0.0f, 1.0f);
+        const uint32_t c = Mix(kText, Rgb(14, 20, 34), cover);
+        DrawItemIcon(m.items[i], px + 16, ry + (row_h - 8) / 2, Mix(kAccent, Rgb(14, 20, 34), cover),
+                     Mix(kPanel, Rgb(236, 240, 248), cover));
+        DrawText(kBold, px + 56, ry + (row_h - 8 - kBoldFontHeight) / 2, m.items[i], c, x + kW - 40);
+    }
+
+    int hx = px;
+    const int hint_y = kHeight - 100;
+    hx = DrawButton(hx, hint_y, Button::Cross);
+    hx = Hint(hx, hint_y, "Select");
+    hx = DrawButton(hx, hint_y, Button::Circle);
+    Hint(hx, hint_y, "Resume");
+
+    if (const int shift = int((1.0f - open) * (kW + kEdge)); shift > 0)
+        for (int row = 0; row < kHeight; row++) {
+            uint32_t* line = g_frame + size_t(row) * kWidth;
+            memmove(line, line + shift, size_t(kW + kEdge - shift) * 4);
+            for (int col = kW + kEdge - shift; col < kW + kEdge; col++) // the game, uncovered
+                line[col] = g_pause_bg ? g_pause_bg[size_t(row) * kWidth + col] : kPanel;
+        }
 }
 
 // Everything shown while no game picture is: benchmark runs and their results, installing
@@ -1674,9 +1842,201 @@ void DrawStatus(int tick) {
     DrawText(kRegular, kWidth - 100 - TextWidth(kRegular, logs), hy + 8, logs, kDim);
 }
 
+// --- splash screen ---------------------------------------------------------------------------
+//
+// On a fresh start: the logo scales in over the app's background with a light-bar sweep under it
+// (the DualShock 4's light bar), the name rises in, then it cross-fades into the launcher. It
+// holds (pulsing, "Loading your games") while the library is still being read, and is skipped
+// when the app restarts into a game or back from one.
+
+double g_splash_t0 = NAN;   // Elapsed() when it started; NaN: no splash this run
+double g_splash_end = NAN;  // when the cross-fade out began
+constexpr double kSplashMin = 1.9, kSplashFade = 0.45;
+char g_version[32] = "";
+
+float EaseOut(float x) {
+    x = std::clamp(x, 0.0f, 1.0f);
+    return 1 - (1 - x) * (1 - x) * (1 - x);
+}
+
+float EaseOutBack(float x) {
+    x = std::clamp(x, 0.0f, 1.0f);
+    const float c1 = 1.4f, c3 = c1 + 1;
+    return 1 + c3 * (x - 1) * (x - 1) * (x - 1) + c1 * (x - 1) * (x - 1);
+}
+
+// The 256x256 logo at (cx, cy), scaled (bilinear) and faded.
+void DrawLogoBig(int cx, int cy, float scale, float alpha) {
+    const int size = int(kLogoBigSize * scale);
+    if (size < 2 || alpha <= 0)
+        return;
+    const int x0 = cx - size / 2, y0 = cy - size / 2;
+    const float step = float(kLogoBigSize - 1) / float(size - 1);
+    for (int y = 0; y < size; y++) {
+        const int fy = y0 + y;
+        if (fy < 0 || fy >= kHeight)
+            continue;
+        const float sy = y * step;
+        const int iy = std::min(int(sy), kLogoBigSize - 2);
+        const float wy = sy - iy;
+        for (int x = 0; x < size; x++) {
+            const int fx = x0 + x;
+            if (fx < 0 || fx >= kWidth)
+                continue;
+            const float sx = x * step;
+            const int ix = std::min(int(sx), kLogoBigSize - 2);
+            const float wx = sx - ix;
+            const uint32_t* row0 = kLogoBigPixels + iy * kLogoBigSize + ix;
+            const uint32_t* row1 = row0 + kLogoBigSize;
+            float c[4];
+            for (int k = 0; k < 4; k++) {
+                const int sh = k * 8;
+                const float top = float((row0[0] >> sh) & 255) * (1 - wx) + float((row0[1] >> sh) & 255) * wx;
+                const float bottom = float((row1[0] >> sh) & 255) * (1 - wx) + float((row1[1] >> sh) & 255) * wx;
+                c[k] = top * (1 - wy) + bottom * wy;
+            }
+            const uint32_t a = uint32_t(c[3] * alpha);
+            if (a == 0)
+                continue;
+            const uint32_t px = uint32_t(c[0]) | (uint32_t(c[1]) << 8) | (uint32_t(c[2]) << 16);
+            uint32_t& dst = g_frame[size_t(fy) * kWidth + size_t(fx)];
+            dst = Blend(dst, px, a);
+        }
+    }
+}
+
+// A horizontal band of light: brightest at x_center, fading out over half_width and in height.
+void LightBand(int y, int x_center, int half_width, int height, uint32_t color, float strength) {
+    for (int dy = -height; dy <= height; dy++) {
+        const int fy = y + dy;
+        if (fy < 0 || fy >= kHeight)
+            continue;
+        const float vy = 1.0f - float(std::abs(dy)) / float(height + 1);
+        const int x0 = std::max(0, x_center - half_width), x1 = std::min(kWidth, x_center + half_width);
+        for (int fx = x0; fx < x1; fx++) {
+            const float vx = 1.0f - float(std::abs(fx - x_center)) / float(half_width);
+            const uint32_t a = uint32_t(255 * strength * vx * vx * vy * vy);
+            if (a)
+                g_frame[size_t(fy) * kWidth + size_t(fx)] = Blend(g_frame[size_t(fy) * kWidth + size_t(fx)], color, a);
+        }
+    }
+}
+
+// A soft radial glow (one pass over its box): alpha falls off with the square of the distance.
+void Glow(int cx, int cy, int radius, uint32_t color, float strength) {
+    if (strength <= 0 || radius < 2)
+        return;
+    const float inv = 1.0f / float(radius);
+    for (int y = std::max(0, cy - radius); y < std::min(kHeight, cy + radius); y++) {
+        const float dy = float(y - cy) * inv;
+        for (int x = std::max(0, cx - radius); x < std::min(kWidth, cx + radius); x++) {
+            const float dx = float(x - cx) * inv, d2 = dx * dx + dy * dy;
+            if (d2 >= 1)
+                continue;
+            const float k = (1 - d2);
+            const uint32_t a = uint32_t(255 * strength * k * k);
+            if (a)
+                g_frame[size_t(y) * kWidth + size_t(x)] = Blend(g_frame[size_t(y) * kWidth + size_t(x)], color, a);
+        }
+    }
+}
+
+void DrawSplash(double t, bool holding) {
+    DrawBackground();
+    // Out of black.
+    const float bg = EaseOut(float(t / 0.5));
+    if (bg < 1)
+        FillBlend(0, 0, kWidth, kHeight, Rgb(0, 0, 0), uint32_t(255 * (1 - bg)));
+
+    constexpr int cx = kWidth / 2, cy = 410, strip_y = 640;
+    const float in = float((t - 0.1) / 0.65);
+    const float pulse = holding ? 0.025f * float(std::sin(t * 3.0)) : 0.0f;
+
+    // A soft blue glow behind the logo, and a ring going out once as it lands.
+    Glow(cx, cy, 330, kAccent, 0.32f * EaseOut(in) + (holding ? 0.06f * float(std::sin(t * 3.0)) : 0.0f));
+    if (t > 0.55 && t < 1.45) {
+        const float k = float((t - 0.55) / 0.9);
+        Ring(cx, cy, int(170 + 230 * EaseOut(k)), 3, Mix(kBackground, Rgb(170, 210, 255), 0.6f * (1 - k)));
+    }
+
+    // The light bar under the logo: a glow, a bright core, and a highlight sweeping across once.
+    const float strip = EaseOut(float((t - 0.25) / 0.6));
+    LightBand(strip_y, cx, int(620 * strip), 14, kAccent, 0.45f * strip);
+    LightBand(strip_y, cx, int(380 * strip), 3, Rgb(210, 235, 255), 0.95f * strip);
+    if (t > 0.35 && t < 1.35) {
+        const float sweep = float((t - 0.35) / 1.0);
+        LightBand(strip_y, int(cx - 640 + 1280 * sweep), 160, 8, kWhite, 0.9f * std::sin(sweep * 3.14159265f));
+    }
+
+    // The logo, scaling in with a slight overshoot.
+    DrawLogoBig(cx, cy, (0.75f + 0.5f * EaseOutBack(in)) * (1 + pulse), EaseOut(in * 1.6f));
+
+    // The name, rising in.
+    const float name = EaseOut(float((t - 0.6) / 0.5));
+    if (name > 0) {
+        const int rise = int(24 * (1 - name));
+        const int w = TextWidth(kTitleFont, "Switch Emu") + 16 + TextWidth(kBold, "for PS4");
+        const int nx = cx - w / 2, ny = 690 + rise;
+        DrawText(kTitleFont, nx, ny, "Switch Emu", Mix(kBackground, kWhite, name));
+        DrawText(kBold, nx + TextWidth(kTitleFont, "Switch Emu") + 16, ny + 28, "for PS4", Mix(kBackground, kAccent, name));
+        if (g_version[0]) {
+            const int vw = TextWidth(kRegular, g_version);
+            DrawText(kRegular, cx - vw / 2, ny + kTitleFontHeight + 20, g_version, Mix(kBackground, kDim, name));
+        }
+    }
+    if (holding && t > kSplashMin) {
+        // The library scan's own progress when it has some ("Reading game info (3 of 12)").
+        const char* text = strncmp(g_stage, "Reading game info", 17) == 0 ? g_stage : "Loading your games";
+        const float f = EaseOut(float((t - kSplashMin) / 0.4));
+        const int tw = TextWidth(kRegular, text);
+        DrawSpinner(cx - tw / 2 - 30, 960 + kStatusFontHeight / 2, t);
+        DrawText(kRegular, cx - tw / 2, 960, text, Mix(kBackground, kDim, f));
+    }
+}
+
+// Whether the splash (or its fade out) is drawn this frame: draws it, or blends it over the
+// next screen already in g_frame. Returns true when the frame is fully the splash.
+bool SplashFrame() {
+    if (std::isnan(g_splash_t0))
+        return false;
+    const double t = Elapsed() - g_splash_t0;
+    // Something else needs the screen: a game restarting, a benchmark suite, the status screen.
+    const bool other = g_loading_title[0] != 0 || g_crashed || strncmp(g_stage, "Benchmark", 9) == 0 ||
+                       strncmp(g_stage, "Install", 7) == 0;
+    if (other) {
+        g_splash_t0 = NAN;
+        return false;
+    }
+    if (std::isnan(g_splash_end)) {
+        if (t < kSplashMin || !g_launcher_on) {
+            DrawSplash(t, t >= kSplashMin);
+            g_animating = true;
+            return true;
+        }
+        // Launcher ready: snapshot the splash and fade it out over the launcher.
+        DrawSplash(t, false);
+        SnapshotFrame();
+        g_splash_end = Elapsed();
+    }
+    return false;
+}
+
 void DrawFrame(int tick) {
+    g_animating = false; // whatever draws below says if it moves
+    if (SplashFrame())
+        return;
     if (g_launcher_on) {
         DrawLauncher();
+        if (!std::isnan(g_splash_end)) {
+            // The splash fading out over the launcher.
+            const double f = (Elapsed() - g_splash_end) / kSplashFade;
+            if (f >= 1) {
+                g_splash_t0 = g_splash_end = NAN;
+            } else {
+                BlendPrev(0, uint32_t(255 * (1 - EaseOut(float(f)))));
+                g_animating = true;
+            }
+        }
         return;
     }
     // A game is starting with graphics on: the loading screen right away (the launch zoom ends on
@@ -1734,7 +2094,7 @@ void* ThreadMain(void*) {
         sceVideoOutSubmitFlip(handle, current, kFlipVsync, tick);
         current = (current + 1) % kBuffers;
         // A few frames a second, or at once when the launcher changed (button presses).
-        if (g_launcher_on && g_animating) {
+        if (g_animating) {
             usleep(16 * 1000); // something moves: ~60 Hz
             continue;
         }
@@ -1969,8 +2329,8 @@ void ps4_status_draw_home(uint32_t* dst, const uint32_t* src, int pitch, const P
             const uint32_t* row = src + size_t(y) * size_t(pitch);
             uint32_t* out = g_pause_bg + size_t(y) * kWidth;
             memcpy(out, row, size_t(kWidth) * 4);
-            for (int x = 0; x < kWidth; x++) // darken to ~35%
-                out[x] = 0xFF000000u | ((out[x] >> 2) & 0x003F3F3Fu) | ((out[x] >> 3) & 0x001F1F1Fu);
+            for (int x = 0; x < kWidth; x++) // darken to ~62% (the game stays visible beside the panel)
+                out[x] = 0xFF000000u | ((out[x] >> 1) & 0x007F7F7Fu) | ((out[x] >> 3) & 0x001F1F1Fu);
         }
     }
     uint32_t* const saved = g_frame;
@@ -2024,6 +2384,23 @@ void ps4_status_render_overlay(uint32_t* dst, int w, int h, const Ps4OverlayStat
         row("New shaders", line, kText);
         snprintf(line, sizeof(line), "%d MB", st->gpu_free_mb);
         row("GPU memory free", line, st->gpu_free_mb < 128 ? kBad : kText);
+        // Frame-time graph: a bar per frame (0..50 ms), lines at 60 and 30 fps; spikes are stutters.
+        const int gx = 22, gw = w - 42, gy = y + 6, gh = h - 10 - gy;
+        if (gh > 20) {
+            FillRect(gx, gy, gw, gh, Rgb(18, 23, 38));
+            const auto ms_y = [&](float ms) { return gy + gh - int(std::min(ms, 50.0f) / 50.0f * float(gh)); };
+            const int count = std::clamp(st->history_count, 0, int(std::size(st->history)));
+            const int slots = int(std::size(st->history));
+            for (int i = 0; i < count; i++) {
+                const float ms = st->history[i];
+                const int x0 = gx + (slots - count + i) * gw / slots, x1 = gx + (slots - count + i + 1) * gw / slots;
+                const uint32_t c = ms <= 20 ? Rgb(110, 220, 140) : ms <= 40 ? Rgb(250, 205, 90) : kBad;
+                const int top = ms_y(ms);
+                FillRect(x0, top, std::max(1, x1 - x0), gy + gh - top, c);
+            }
+            for (const float ms : {1000.0f / 60.0f, 1000.0f / 30.0f})
+                FillBlend(gx, ms_y(ms), gw, 1, kWhite, 90);
+        }
     }
     g_frame = saved;
     for (int y = 0; y < h; y++)
@@ -2042,6 +2419,22 @@ void ps4_status_start(const char* title) {
     Unlock();
     clock_gettime(CLOCK_MONOTONIC, &g_start);
     g_stop = false;
+    // The splash on a fresh start only (not after "Quit to launcher" or a crash: those leave
+    // back-to-menu behind; not on "Restart game": autostart).
+    struct stat st;
+    if (stat("/data/switch-emu/back-to-menu", &st) != 0 && stat("/data/switch-emu/autostart", &st) != 0) {
+        g_splash_t0 = 0;
+        ps4_sound_open(); // the launcher keeps it; closed before a game opens its audio
+        ps4_sound_play(kSoundStartup);
+    }
+    if (FILE* f = fopen("/app0/version.txt", "r")) {
+        char v[24] = "";
+        if (fgets(v, sizeof(v), f)) {
+            v[strcspn(v, "\r\n")] = 0;
+            std::snprintf(g_version, sizeof(g_version), "v%s", v);
+        }
+        fclose(f);
+    }
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 512 * 1024);

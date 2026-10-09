@@ -292,6 +292,43 @@ void MarkPlayed(const std::string& file) {
     }
 }
 
+// Play time across sessions (/data/switch-emu/titles/<file>.play: "<seconds> <sessions>", kept by
+// the emulator while a game runs), as "played 12 h 31 min".
+std::string PlayedDetail(const std::string& file) {
+    long seconds = 0, sessions = 0;
+    if (FILE* f = fopen((std::string(kTitlesDir) + file + ".play").c_str(), "r")) {
+        if (fscanf(f, "%ld %ld", &seconds, &sessions) != 2)
+            seconds = 0;
+        fclose(f);
+    }
+    char text[48];
+    if (seconds >= 3600)
+        snprintf(text, sizeof(text), "  -  played %ld h %ld min", seconds / 3600, seconds / 60 % 60);
+    else if (seconds >= 60)
+        snprintf(text, sizeof(text), "  -  played %ld min", seconds / 60);
+    else
+        text[0] = 0;
+    return text;
+}
+
+// "today", "yesterday" or "Oct 08", for when a game was last played.
+std::string PlayedWhen(long played) {
+    const time_t then = time_t(played), now = time(nullptr);
+    tm a{}, b{};
+    if (!localtime_r(&then, &a) || !localtime_r(&now, &b))
+        return "";
+    a.tm_hour = b.tm_hour = 12, a.tm_min = b.tm_min = a.tm_sec = b.tm_sec = 0; // whole days apart
+    const long days = long(difftime(mktime(&b), mktime(&a)) / 86400.0 + 0.5);
+    if (days == 0)
+        return "today";
+    if (days == 1)
+        return "yesterday";
+    char when[32];
+    localtime_r(&then, &a);
+    strftime(when, sizeof(when), "%b %d", &a);
+    return when;
+}
+
 std::string FileDetail(const std::string& file) {
     struct stat st;
     std::string ext = file.substr(file.rfind('.') + 1);
@@ -452,7 +489,7 @@ int ReadLayout() {
             layout = kLayoutGrid;
         fclose(f);
     }
-    return std::clamp(layout, 0, 1);
+    return std::clamp(layout, 0, kLayoutCount - 1);
 }
 
 void SaveLayout(int layout) {
@@ -722,78 +759,6 @@ private:
     }
 }
 
-// Navigation sounds while the launcher shows: short synthesized tones on their own audio port,
-// closed again before Eden opens the audio output for the game.
-class MenuSounds {
-public:
-    enum Sound { kNone, kMove, kConfirm, kBack };
-
-    MenuSounds() {
-        const int32_t init = sceAudioOutInit();
-        (void)init; // already initialised is fine
-        port = sceAudioOutOpen(0xFF /* system user */, 0 /* main */, 0, kFrames, 48000, 1 /* S16 stereo */);
-        if (port > 0)
-            thread = std::thread([this] { Run(); });
-    }
-    ~MenuSounds() {
-        stop = true;
-        if (thread.joinable())
-            thread.join();
-        if (port > 0)
-            sceAudioOutClose(port);
-    }
-    void Play(Sound sound) {
-        pending.store(sound, std::memory_order_relaxed);
-    }
-
-private:
-    static constexpr uint32_t kFrames = 256; // 5.3 ms at 48 kHz
-
-    void Run() {
-        int16_t block[kFrames * 2];
-        double phase = 0;
-        int sound = kNone, t = 0;
-        while (!stop) {
-            if (const int next = pending.exchange(kNone, std::memory_order_relaxed); next != kNone)
-                sound = next, t = 0;
-            for (uint32_t i = 0; i < kFrames; i++, t++) {
-                float v = 0;
-                if (sound != kNone) {
-                    const float sec = float(t) / 48000.0f;
-                    float freq = 0, volume = 0, length = 0;
-                    switch (sound) {
-                    case kMove: // a soft tick
-                        freq = 1700, volume = 0.07f * std::exp(-sec / 0.010f), length = 0.05f;
-                        break;
-                    case kConfirm: // two rising notes
-                        freq = sec < 0.06f ? 880 : 1320, volume = 0.12f * std::exp(-std::fmod(sec, 0.06f) / 0.05f),
-                        length = 0.14f;
-                        break;
-                    case kBack: // two falling notes
-                        freq = sec < 0.06f ? 990 : 660, volume = 0.10f * std::exp(-std::fmod(sec, 0.06f) / 0.05f),
-                        length = 0.14f;
-                        break;
-                    }
-                    if (sec >= length) {
-                        sound = kNone;
-                    } else {
-                        phase += 2.0 * 3.14159265358979 * freq / 48000.0;
-                        v = volume * float(std::sin(phase));
-                    }
-                }
-                block[i * 2] = block[i * 2 + 1] = int16_t(v * 32767.0f);
-            }
-            sceAudioOutOutput(port, block); // blocks until the port takes it: paces this loop
-        }
-        sceAudioOutOutput(port, nullptr);
-    }
-
-    int32_t port = -1;
-    std::thread thread;
-    std::atomic<bool> stop{false};
-    std::atomic<int> pending{kNone};
-};
-
 } // namespace
 
 extern "C" {
@@ -801,7 +766,8 @@ extern "C" {
 // Shows the start menu, or continues a benchmark suite. Returns when Eden should start; the
 // switch files are set for that run.
 void ps4_menu_run() {
-    struct MarkStarted { ~MarkStarted() { g_program_started = true; } } mark_started; // on every return
+    // On every return: a program is starting (and the menu sounds' port closes before its audio opens).
+    struct MarkStarted { ~MarkStarted() { g_program_started = true; ps4_sound_close(); } } mark_started;
     bool crashed = false;
     g_suite_index = ReadSuiteIndex(&crashed);
     if (g_suite_index >= 0 && crashed) {
@@ -884,16 +850,10 @@ void ps4_menu_run() {
     icons.clear();
     for (const std::string& file : games) {
         titles.push_back(CachedTitle(file));
-        std::string detail = FileDetail(file);
-        if (const long played = LastPlayed(file); played > 0) {
-            const time_t t = time_t(played);
-            char when[48];
-            if (const tm* local = localtime(&t))
-                strftime(when, sizeof(when), "  -  last played %b %d", local);
-            else
-                when[0] = 0;
-            detail += when;
-        }
+        std::string detail = FileDetail(file) + PlayedDetail(file);
+        if (const long played = LastPlayed(file); played > 0)
+            if (const std::string when = PlayedWhen(played); !when.empty())
+                detail += "  -  last played " + when;
         details.push_back(detail);
         icons.push_back(CachedIcon(file));
     }
@@ -903,7 +863,7 @@ void ps4_menu_run() {
     ps4_launcher_set_games(entries.data(), int(entries.size()));
 
     Pad pad;
-    MenuSounds sounds;
+    ps4_sound_open(); // already open from the start screen, or opened now (back from a game)
     remove(kBackToMenu);
     Setup setup = CheckSetup();
     const int install_count = CountInstallFiles();
@@ -1054,9 +1014,11 @@ void ps4_menu_run() {
                                     "restore, copy a backup's folders back into /data/switch-emu/nand/user/save."});
                 break;
             case kLayout:
-                settings.push_back({"Games layout", layout == kLayoutRow ? "Console row" : "Grid",
+                settings.push_back({"Games layout",
+                                    layout == kLayoutRow ? "Console row" : layout == kLayoutList ? "List" : "Grid",
                                     "Grid shows 24 games at a time. Console row shows one row of large tiles "
-                                    "with shortcuts below (Down to reach them), like a console's home screen."});
+                                    "with shortcuts below (Down to reach them), like a console's home screen. List "
+                                    "shows the games as rows with the selected one large, with its play time."});
                 break;
             case kAppVersion:
                 settings.push_back({"Version", app_version.c_str(),
@@ -1187,6 +1149,25 @@ void ps4_menu_run() {
                     game_scope = true;
                     row = 0;
                 }
+            } else if (count > 0 && layout == kLayoutList) {
+                // Rows: Up/Down one game, Left/Right a page.
+                if ((pressed & kUp) && game > 0)
+                    game--;
+                if ((pressed & kDown) && game + 1 < count)
+                    game++;
+                if (pressed & kLeft)
+                    game = std::max(0, game - 8);
+                if (pressed & kRight)
+                    game = std::min(count - 1, game + 8);
+                if (pressed & (kCross | kOptions)) {
+                    start_game = true;
+                    break;
+                }
+                if (pressed & kSquare) { // this game's settings
+                    tab = kLauncherSettings;
+                    game_scope = true;
+                    row = 0;
+                }
             } else if (count > 0) {
                 // Grid of kLauncherColumns per row (status_screen.cpp draws it).
                 if ((pressed & kLeft) && game > 0)
@@ -1226,7 +1207,7 @@ void ps4_menu_run() {
             if (pressed & (kCross | kLeft | kRight)) {
                 switch (ids[size_t(row)]) {
                 case kLayout:
-                    layout = layout == kLayoutRow ? kLayoutGrid : kLayoutRow;
+                    layout = (pressed & kLeft) ? (layout + kLayoutCount - 1) % kLayoutCount : (layout + 1) % kLayoutCount;
                     SaveLayout(layout);
                     break;
                 case kGraphics:
@@ -1315,19 +1296,21 @@ void ps4_menu_run() {
                     break;
             }
         }
-        // Sounds: moving around ticks, a choice chimes, going back falls.
+        // Sounds: moving around ticks, a setting changing plucks, a choice chimes, back falls.
         if ((pressed & kCircle) && old_tab == kLauncherSettings)
-            sounds.Play(MenuSounds::kBack);
-        else if (tab == kLauncherSettings && old_tab == tab && (pressed & (kCross | kLeft | kRight)))
-            sounds.Play(MenuSounds::kConfirm);
+            ps4_sound_play(kSoundBack);
+        else if (tab == kLauncherSettings && old_tab == tab && (pressed & (kLeft | kRight)))
+            ps4_sound_play(kSoundToggle);
+        else if (tab == kLauncherSettings && old_tab == tab && (pressed & kCross))
+            ps4_sound_play(kSoundConfirm);
         else if (tab == kLauncherGames && old_shortcut >= 0 && (pressed & kCross))
-            sounds.Play(MenuSounds::kConfirm);
+            ps4_sound_play(kSoundConfirm);
         else if (tab != old_tab || game != old_game || row != old_row || game_scope != old_scope ||
                  shortcut != old_shortcut)
-            sounds.Play(MenuSounds::kMove);
+            ps4_sound_play(kSoundMove);
         usleep(16 * 1000);
     }
-    sounds.Play(MenuSounds::kConfirm);
+    ps4_sound_play(start_game ? kSoundLaunch : kSoundConfirm);
     if (start_game && !games.empty()) {
         // The card zooms into the loading screen (also lets the chime finish).
         ps4_launcher_set_loading(titles[size_t(game)].c_str(), icons[size_t(game)].empty() ? nullptr : icons[size_t(game)].data());
