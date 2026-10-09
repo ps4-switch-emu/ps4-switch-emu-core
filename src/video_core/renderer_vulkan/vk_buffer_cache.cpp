@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -57,7 +60,7 @@ size_t BytesPerIndex(VkIndexType index_type) {
 }
 
 vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator, u64 size,
-                        VkDeviceSize sparse_alignment) {
+                        VkDeviceSize sparse_alignment, bool direct_uploads) {
     VkBufferUsageFlags flags =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
@@ -83,10 +86,11 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    const MemoryUsage usage = direct_uploads ? MemoryUsage::DeviceLocalHostWrite : MemoryUsage::DeviceLocal;
     if (sparse_alignment > 1) {
-        return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
+        return memory_allocator.CreateBuffer(buffer_ci, usage, sparse_alignment);
     }
-    return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
+    return memory_allocator.CreateBuffer(buffer_ci, usage);
 }
 } // Anonymous namespace
 
@@ -108,7 +112,7 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
     : VideoCommon::BufferBase(cpu_addr_, size_bytes_), device{&runtime.device},
       scheduler{&runtime.scheduler},
       buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
-                          runtime.SparseAlignmentFor(sparse_compatible_))},
+                          runtime.SparseAlignmentFor(sparse_compatible_), runtime.direct_uploads)},
       tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
     if (runtime.device.HasDebuggingToolAttached()) {
@@ -361,6 +365,19 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
     const VkDriverIdKHR driver_id = device.GetDriverID();
     limit_dynamic_storage_buffers = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                     driver_id == VK_DRIVER_ID_ARM_PROPRIETARY;
+#ifdef __OPENORBIS__
+    // The PS4's GPU memory is the CPU's (unified): idle buffers can be written in place. Opt-in
+    // (an empty file /data/switch-emu/direct-upload) until tested on the console - on the PC it
+    // renders identically, but Mario's opening uploads only ~0.7 MB/s of buffers, so the copy it
+    // saves is small there; the perf trace's "uploads" figures show what a game moves.
+    if (std::FILE* f = std::fopen("/data/switch-emu/direct-upload", "r")) {
+        std::fclose(f);
+        direct_uploads = true;
+    }
+#else
+    direct_uploads = std::getenv("EDEN_DIRECT_UPLOAD") != nullptr; // a PC trying the PS4's path
+#endif
+    LOG_INFO(Render_Vulkan, "Direct buffer uploads: {}", direct_uploads ? "on" : "off");
     if (limit_dynamic_storage_buffers) {
         max_dynamic_storage_buffers = device.GetMaxDescriptorSetStorageBuffersDynamic();
     }    
@@ -372,6 +389,26 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                                                      scheduler_, staging_pool_);
     quad_strip_index_buffer = std::make_shared<QuadStripIndexBuffer>(device_, memory_allocator_,
                                                                      scheduler_, staging_pool_);
+}
+
+// Unified memory (the PS4): a buffer in mapped device memory that the GPU has finished with (no
+// submitted or recorded work uses it) is written in place - no staging copy, no GPU copy command.
+// Anything else goes through staging as before.
+std::span<u8> BufferCacheRuntime::DirectUploadSpan(Buffer& buffer) {
+    if (!direct_uploads) {
+        return {};
+    }
+    const std::span<u8> mapped = buffer.MappedMemory();
+    if (mapped.empty() || !scheduler.IsFree(buffer.LastUsageTick())) {
+        return {};
+    }
+    return mapped;
+}
+
+void BufferCacheRuntime::FinishDirectUpload(Buffer& buffer) {
+    buffer.FlushMappedMemory();
+    // Write-combined stores out before any later submission that reads them.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {

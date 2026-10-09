@@ -1093,8 +1093,12 @@ void ps4_menu_run() {
         // Sections and how each value is drawn.
         for (size_t j = 0; j < ids.size(); j++) {
             switch (ids[j]) {
-            case kGraphics: case kMode: case kResolution: case kGpuAccuracy: case kLayout: case kSort:
+            case kGraphics: case kMode: case kResolution: case kGpuAccuracy:
                 settings[j].group = "Display";
+                settings[j].kind = kSettingChoice;
+                break;
+            case kLayout: case kSort:
+                settings[j].group = "Launcher";
                 settings[j].kind = kSettingChoice;
                 break;
             case kButtons:

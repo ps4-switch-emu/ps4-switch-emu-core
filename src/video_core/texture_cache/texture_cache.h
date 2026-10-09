@@ -16,6 +16,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/upload_stats.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
@@ -1156,7 +1157,9 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
     const std::span<u8> mapped_span = staging.mapped_span;
     const GPUVAddr gpu_addr = image.gpu_addr;
 
+    upload_stats.texture_count.fetch_add(1, std::memory_order_relaxed);
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
+        upload_stats.texture_gpu_bytes.fetch_add(mapped_span.size_bytes(), std::memory_order_relaxed);
         gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
                               VideoCommon::CacheType::NoTextureCache);
         const auto uploads = FullUploadSwizzles(image.info);
@@ -1166,7 +1169,9 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
 
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(
         *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+    upload_stats.texture_cpu_bytes.fetch_add(image.guest_size_bytes, std::memory_order_relaxed);
     if (True(image.flags & ImageFlagBits::Converted)) {
+        upload_stats.texture_converted_bytes.fetch_add(image.guest_size_bytes, std::memory_order_relaxed);
         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
         auto copies = FixSmallVectorADL(UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, unswizzle_data_buffer));
         ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);

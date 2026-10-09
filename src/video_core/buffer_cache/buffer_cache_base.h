@@ -38,6 +38,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/surface.h"
+#include "video_core/upload_stats.h"
 #include "video_core/texture_cache/types.h"
 
 namespace VideoCommon {

@@ -33,6 +33,7 @@ namespace {
     [[maybe_unused]] VkMemoryPropertyFlags MemoryUsagePropertyFlags(MemoryUsage usage) {
         switch (usage) {
             case MemoryUsage::DeviceLocal:
+            case MemoryUsage::DeviceLocalHostWrite:
                 return VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
             case MemoryUsage::Upload:
                 return VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -54,8 +55,9 @@ namespace {
         if (usage == MemoryUsage::Download) {
             return VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         }
-        return usage != MemoryUsage::DeviceLocal ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                                                    : VkMemoryPropertyFlagBits{};
+        return usage != MemoryUsage::DeviceLocal && usage != MemoryUsage::DeviceLocalHostWrite
+                   ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                   : VkMemoryPropertyFlagBits{};
     }
 
     [[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryUsage usage) {
@@ -69,6 +71,11 @@ namespace {
                         VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
             case MemoryUsage::DeviceLocal:
                 return {};
+            case MemoryUsage::DeviceLocalHostWrite:
+                // Mapped if VMA finds device-local host-visible memory; otherwise plain device
+                // memory (not mapped: the caller then uploads through staging as before).
+                return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                       VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT;
         }
         return {};
     }
@@ -76,6 +83,7 @@ namespace {
     [[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryUsage usage) {
         switch (usage) {
             case MemoryUsage::DeviceLocal:
+            case MemoryUsage::DeviceLocalHostWrite:
             case MemoryUsage::Stream:
                 return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
             case MemoryUsage::Upload:

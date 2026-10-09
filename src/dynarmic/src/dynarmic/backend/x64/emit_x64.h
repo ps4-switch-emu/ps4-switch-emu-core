@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <memory>
@@ -112,6 +113,13 @@ struct EmitContext {
     }
 
     std::vector<std::function<void()>> deferred_emits;
+    /// Add64(base, imm) whose only use is a fastmem access's address: emitted as nothing (aliasing
+    /// base), the access adds imm as its displacement (HostRegisterLocality, A64).
+    std::vector<const IR::Inst*> folded_address_adds;
+    bool IsFoldedAddressAdd(const IR::Inst* inst) const {
+        return !folded_address_adds.empty()
+            && std::find(folded_address_adds.begin(), folded_address_adds.end(), inst) != folded_address_adds.end();
+    }
     RegAlloc& reg_alloc;
     IR::Block& block;
     boost::container::stable_vector<Xbyak::Label>& shared_labels;

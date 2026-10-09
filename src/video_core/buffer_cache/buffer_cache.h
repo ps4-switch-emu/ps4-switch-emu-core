@@ -965,6 +965,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 }
                 const auto span = ImmediateBufferWithData(device_addr, size);
                 runtime.PushFastUniformBuffer(stage, binding_index, span);
+                upload_stats.uniform_bytes.fetch_add(size, std::memory_order_relaxed);
                 return;
             }
         }
@@ -973,6 +974,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+        upload_stats.uniform_bytes.fetch_add(size, std::memory_order_relaxed);
         return;
     }
     // Classic cached path
@@ -1804,6 +1806,22 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
                                         [[maybe_unused]] u64 total_size_bytes,
                                         [[maybe_unused]] std::span<BufferCopy> copies) {
     if constexpr (USE_MEMORY_MAPS) {
+        upload_stats.buffer_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+        if constexpr (requires { runtime.DirectUploadSpan(buffer); }) {
+            // Unified memory: straight from guest memory into the idle buffer (vk_buffer_cache.cpp).
+            if (const std::span<u8> mapped = runtime.DirectUploadSpan(buffer); !mapped.empty()) {
+                for (const BufferCopy& copy : copies) {
+                    const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
+                    if (Settings::values.enable_gpu_buffer_readback.GetValue()) {
+                        DownloadBufferMemory(buffer, device_addr, copy.size);
+                    }
+                    device_memory.ReadBlockUnsafe(device_addr, mapped.data() + copy.dst_offset, copy.size);
+                }
+                runtime.FinishDirectUpload(buffer);
+                upload_stats.direct_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+                return;
+            }
+        }
         auto upload_staging = runtime.UploadStagingBuffer(total_size_bytes);
         const std::span<u8> staging_pointer = upload_staging.mapped_span;
         for (BufferCopy& copy : copies) {
@@ -1844,11 +1862,20 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
                                                 std::span<const u8> inlined_buffer) {
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
+    upload_stats.inline_bytes.fetch_add(copy_size, std::memory_order_relaxed);
 
     BufferId buffer_id = FindBuffer(dest_address, static_cast<u32>(copy_size), false);
     auto& buffer = slot_buffers[buffer_id];
     SynchronizeBuffer(buffer, dest_address, static_cast<u32>(copy_size));
 
+    if constexpr (requires { runtime.DirectUploadSpan(buffer); }) {
+        if (const std::span<u8> mapped = runtime.DirectUploadSpan(buffer); !mapped.empty()) {
+            std::memcpy(mapped.data() + buffer.Offset(dest_address), inlined_buffer.data(), copy_size);
+            runtime.FinishDirectUpload(buffer);
+            upload_stats.direct_bytes.fetch_add(copy_size, std::memory_order_relaxed);
+            return;
+        }
+    }
     if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
         auto upload_staging = runtime.UploadStagingBuffer(copy_size);
         std::array copies{BufferCopy{

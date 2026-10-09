@@ -7,11 +7,14 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
+
+#include <sys/mman.h>
 
 #include <catch2/catch_test_macros.hpp>
 #include "common/common_types.h"
@@ -894,4 +897,192 @@ TEST_CASE("A64: HostRegisterLocality differential: CBZ / TBZ (wall clock)", "[a6
         instructions.push_back(0xD4000001);  // SVC #0 (not taken)
         instructions.push_back(0xD4000021);  // SVC #1 (taken)
     }, false, 200000, {.fast_dispatch = true, .wall_clock = true});
+}
+
+// Fastmem with displacements folded into the access (HostRegisterLocality, FoldFastmemAddresses):
+// random loads and stores at base + offset, some into a page that faults (the fallback must get
+// the full address and leave the base register as it was), some whose stored value is the base
+// register itself. Same program with and without the optimization; registers, vectors and memory
+// must match.
+namespace {
+constexpr u64 kFmSize = 0x20000, kFmFaultStart = 0x10000, kFmFaultEnd = 0x11000, kFmCode = 0x100000;
+
+class FastmemDisplacementEnv final : public Dynarmic::A64::UserCallbacks {
+public:
+    FastmemDisplacementEnv() {
+        host = static_cast<u8*>(mmap(nullptr, kFmSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        REQUIRE(host != MAP_FAILED);
+        REQUIRE(mprotect(host + kFmFaultStart, kFmFaultEnd - kFmFaultStart, PROT_NONE) == 0); // "device memory"
+    }
+    ~FastmemDisplacementEnv() override { munmap(host, kFmSize); }
+
+    u8* host;
+    std::array<u8, kFmFaultEnd - kFmFaultStart> device{};
+    std::vector<u32> code;
+    u64 ticks_left = 0;
+    bool out_of_range = false;
+
+    void Reset(u64 seed) {
+        std::memset(host, 0, kFmFaultStart);
+        std::memset(host + kFmFaultEnd, 0, kFmSize - kFmFaultEnd);
+        for (u64 a = 0; a < kFmSize; a += 8) {
+            const u64 v = (a * 0x9E3779B97F4A7C15ull) ^ seed;
+            if (a < kFmFaultStart || a >= kFmFaultEnd)
+                std::memcpy(host + a, &v, 8);
+            else
+                std::memcpy(device.data() + (a - kFmFaultStart), &v, 8);
+        }
+        out_of_range = false;
+    }
+    u8& Byte(u64 a) {
+        static u8 dummy;
+        if (a >= kFmSize) {
+            out_of_range = true;
+            return dummy;
+        }
+        return a >= kFmFaultStart && a < kFmFaultEnd ? device[a - kFmFaultStart] : host[a];
+    }
+    template<typename T>
+    T Read(u64 a) {
+        T v;
+        for (size_t i = 0; i < sizeof(T); i++)
+            reinterpret_cast<u8*>(&v)[i] = Byte(a + i);
+        return v;
+    }
+    template<typename T>
+    void Write(u64 a, const T& v) {
+        for (size_t i = 0; i < sizeof(T); i++)
+            Byte(a + i) = reinterpret_cast<const u8*>(&v)[i];
+    }
+
+    std::optional<u32> MemoryReadCode(u64 vaddr) override {
+        const u64 i = (vaddr - kFmCode) / 4;
+        return vaddr >= kFmCode && i < code.size() ? code[i] : 0x14000000; // B .
+    }
+    u8 MemoryRead8(u64 a) override { return Read<u8>(a); }
+    u16 MemoryRead16(u64 a) override { return Read<u16>(a); }
+    u32 MemoryRead32(u64 a) override { return Read<u32>(a); }
+    u64 MemoryRead64(u64 a) override { return Read<u64>(a); }
+    Vector MemoryRead128(u64 a) override { return Read<Vector>(a); }
+    void MemoryWrite8(u64 a, u8 v) override { Write(a, v); }
+    void MemoryWrite16(u64 a, u16 v) override { Write(a, v); }
+    void MemoryWrite32(u64 a, u32 v) override { Write(a, v); }
+    void MemoryWrite64(u64 a, u64 v) override { Write(a, v); }
+    void MemoryWrite128(u64 a, Vector v) override { Write(a, v); }
+    bool MemoryWriteExclusive8(u64 a, u8 v, u8) override { Write(a, v); return true; }
+    bool MemoryWriteExclusive16(u64 a, u16 v, u16) override { Write(a, v); return true; }
+    bool MemoryWriteExclusive32(u64 a, u32 v, u32) override { Write(a, v); return true; }
+    bool MemoryWriteExclusive64(u64 a, u64 v, u64) override { Write(a, v); return true; }
+    bool MemoryWriteExclusive128(u64 a, Vector v, Vector) override { Write(a, v); return true; }
+    void CallSVC(u32) override {}
+    void ExceptionRaised(u64, Dynarmic::A64::Exception) override {}
+    void AddTicks(u64 ticks) override { ticks_left = ticks > ticks_left ? 0 : ticks_left - ticks; }
+    u64 GetTicksRemaining() override { return ticks_left; }
+    u64 GetCNTPCT() override { return 0; }
+};
+
+// One load or store at [X0..X3 + offset]; loads never into X0..X3 (the bases stay in range).
+u32 GenFastmemAccess() {
+    const u32 rn = RandInt<u32>(0, 3);
+    const u32 rt = RandInt<u32>(0, 15), rt_load = RandInt<u32>(4, 15);
+    const u32 rt2_load = 4 + (rt_load - 4 + RandInt<u32>(1, 11)) % 12; // != rt_load
+    const u32 imm12 = RandInt<u32>(0, 255), imm9 = RandInt<u32>(0, 0x1FF), imm7 = RandInt<u32>(0, 0x7F);
+    const u32 v = RandInt<u32>(0, 31);
+    switch (RandInt<int>(0, 19)) {
+    case 0: return 0xF9400000 | imm12 << 10 | rn << 5 | rt_load;  // LDR X
+    case 1: return 0xF9000000 | imm12 << 10 | rn << 5 | rt;       // STR X
+    case 2: return 0xB9400000 | imm12 << 10 | rn << 5 | rt_load;  // LDR W
+    case 3: return 0xB9000000 | imm12 << 10 | rn << 5 | rt;       // STR W
+    case 4: return 0x79400000 | imm12 << 10 | rn << 5 | rt_load;  // LDRH
+    case 5: return 0x79000000 | imm12 << 10 | rn << 5 | rt;       // STRH
+    case 6: return 0x39400000 | imm12 << 10 | rn << 5 | rt_load;  // LDRB
+    case 7: return 0x39000000 | imm12 << 10 | rn << 5 | rt;       // STRB
+    case 8: return 0xB9800000 | imm12 << 10 | rn << 5 | rt_load;  // LDRSW
+    case 9: return 0xF8400000 | imm9 << 12 | rn << 5 | rt_load;   // LDUR X (offset -256..255)
+    case 10: return 0xF8000000 | imm9 << 12 | rn << 5 | rt;       // STUR X
+    case 11: return 0xA9400000 | imm7 << 15 | rt2_load << 10 | rn << 5 | rt_load; // LDP X
+    case 12: return 0xA9000000 | imm7 << 15 | RandInt<u32>(0, 15) << 10 | rn << 5 | rt; // STP X
+    case 13: return 0x3DC00000 | imm12 << 10 | rn << 5 | v;       // LDR Q
+    case 14: return 0x3D800000 | imm12 << 10 | rn << 5 | v;       // STR Q
+    case 15: return 0xFD400000 | imm12 << 10 | rn << 5 | v;       // LDR D
+    case 16: return 0xFD000000 | imm12 << 10 | rn << 5 | v;       // STR D
+    case 17: return 0xBD400000 | imm12 << 10 | rn << 5 | v;       // LDR S
+    case 18: return 0xBD000000 | imm12 << 10 | rn << 5 | v;       // STR S
+    default: return 0x8B000000 | RandInt<u32>(4, 15) << 16 | RandInt<u32>(4, 15) << 5 | RandInt<u32>(4, 15); // ADD Xd, Xn, Xm
+    }
+}
+} // namespace
+
+static void RunFastmemDisplacementDifferential(bool recompile, size_t iterations) {
+    FastmemDisplacementEnv env_a, env_b;
+    const auto make_conf = [&](FastmemDisplacementEnv& env, bool locality) {
+        Dynarmic::A64::UserConfig conf{};
+        conf.callbacks = &env;
+        conf.fastmem_pointer = reinterpret_cast<uintptr_t>(env.host);
+        conf.fastmem_address_space_bits = 64; // unchecked, as in Eden's default accuracy
+        conf.recompile_on_fastmem_failure = recompile;
+        conf.silently_mirror_fastmem = false;
+        if (locality)
+            conf.optimizations |= OptimizationFlag::HostRegisterLocality;
+        else
+            conf.optimizations &= ~OptimizationFlag::HostRegisterLocality;
+        return conf;
+    };
+    Dynarmic::A64::Jit jit_a{make_conf(env_a, !std::getenv("DIFF_CONTROL"))};
+    Dynarmic::A64::Jit jit_b{make_conf(env_b, false)};
+    for (size_t iteration = 0; iteration < iterations; ++iteration) {
+        std::vector<u32> code(RandInt<size_t>(1, 24));
+        std::generate(code.begin(), code.end(), GenFastmemAccess);
+        const std::array<u64, 4> bases{RandInt<u64>(0x800, 0x1000) * 8, RandInt<u64>(kFmFaultStart, kFmFaultEnd - 0x100),
+                                       kFmFaultStart - RandInt<u64>(1, 0x900), RandInt<u64>(0x2400, 0x2E00) * 8};
+        std::array<u64, 31> regs;
+        std::generate(regs.begin(), regs.end(), [] { return RandInt<u64>(0, ~u64(0)); });
+        std::copy(bases.begin(), bases.end(), regs.begin());
+        std::array<Vector, 32> vecs;
+        std::generate(vecs.begin(), vecs.end(), [] { return Vector{RandInt<u64>(0, ~u64(0)), RandInt<u64>(0, ~u64(0))}; });
+        const u64 seed = RandInt<u64>(0, ~u64(0));
+
+        std::string listing;
+        for (u32 instruction : code)
+            listing += fmt::format("{:08x} ", instruction);
+        INFO("Instructions: " << listing << " bases " << std::hex << bases[0] << " " << bases[1] << " " << bases[2] << " " << bases[3]);
+
+        for (auto [jit, env] : {std::pair{&jit_a, &env_a}, std::pair{&jit_b, &env_b}}) {
+            env->Reset(seed);
+            env->code = code;
+            jit->SetRegisters(regs);
+            jit->SetVectors(vecs);
+            jit->SetPC(kFmCode);
+            jit->SetSP(0x8000);
+            jit->SetFpcr(0);
+            jit->SetFpsr(0);
+            jit->SetPstate(0);
+            if (iteration % 4 == 0)
+                jit->ClearCache(); // otherwise recompiled-after-fault blocks get reused too
+            for (int pass = 0; pass < 2; pass++) { // a second pass reruns any block recompiled after a fault
+                env->Reset(seed);
+                jit->SetRegisters(regs);
+                jit->SetVectors(vecs);
+                jit->SetPC(kFmCode);
+                env->ticks_left = code.size();
+                CheckedRun([&]() { jit->Run(); });
+            }
+        }
+        REQUIRE(!env_a.out_of_range);
+        REQUIRE(!env_b.out_of_range);
+        REQUIRE(jit_a.GetPC() == jit_b.GetPC());
+        REQUIRE(jit_a.GetRegisters() == jit_b.GetRegisters());
+        REQUIRE(jit_a.GetVectors() == jit_b.GetVectors());
+        REQUIRE(std::memcmp(env_a.host, env_b.host, kFmFaultStart) == 0);
+        REQUIRE(std::memcmp(env_a.host + kFmFaultEnd, env_b.host + kFmFaultEnd, kFmSize - kFmFaultEnd) == 0);
+        REQUIRE(env_a.device == env_b.device);
+    }
+}
+
+TEST_CASE("A64: HostRegisterLocality differential: fastmem displacements", "[a64][differential]") {
+    RunFastmemDisplacementDifferential(false, 20000);
+}
+
+TEST_CASE("A64: HostRegisterLocality differential: fastmem displacements, recompile after a fault", "[a64][differential]") {
+    RunFastmemDisplacementDifferential(true, 20000);
 }

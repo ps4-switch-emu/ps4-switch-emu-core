@@ -69,6 +69,17 @@ public:
         return last_usage_tick;
     }
 
+    /// The buffer's memory when the CPU can write it in place (empty: not mapped).
+    [[nodiscard]] std::span<u8> MappedMemory() noexcept {
+        return buffer.Mapped();
+    }
+
+    void FlushMappedMemory() const {
+        if (!buffer.IsHostCoherent()) {
+            buffer.Flush();
+        }
+    }
+
     operator VkBuffer() const noexcept {
         return *buffer;
     }
@@ -129,6 +140,13 @@ public:
     u32 GetStorageBufferAlignment() const;
 
     [[nodiscard]] StagingBufferRef UploadStagingBuffer(size_t size);
+
+    /// Where to write an upload in place (empty: use staging); see vk_buffer_cache.cpp.
+    [[nodiscard]] std::span<u8> DirectUploadSpan(Buffer& buffer);
+    void FinishDirectUpload(Buffer& buffer);
+
+    /// Buffers live in mapped device memory and idle ones are written directly (unified memory).
+    bool direct_uploads = false;
 
     [[nodiscard]] StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 

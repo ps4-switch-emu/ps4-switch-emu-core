@@ -99,6 +99,7 @@ public:
         bool recompile;
     };
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
+    void FoldFastmemAddresses(A64EmitContext& ctx);
     FakeCall FastmemCallback(u64 rip);
 
     // Memory access helpers

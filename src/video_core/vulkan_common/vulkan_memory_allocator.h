@@ -25,6 +25,7 @@ namespace Vulkan {
         Upload,      ///< Requires a host visible memory type optimized for CPU to GPU uploads
         Download,    ///< Requires a host visible memory type optimized for GPU to CPU readbacks
         Stream,      ///< Requests device local host visible buffer, falling back host memory.
+        DeviceLocalHostWrite, ///< Device local, mapped for CPU writes when such memory exists (unified memory).
     };
 
     template<typename F>

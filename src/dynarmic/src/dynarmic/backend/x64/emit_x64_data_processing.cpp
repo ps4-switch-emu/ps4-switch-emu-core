@@ -1036,6 +1036,12 @@ void EmitX64::EmitAdd32(EmitContext& ctx, IR::Inst* inst) {
 }
 
 void EmitX64::EmitAdd64(EmitContext& ctx, IR::Inst* inst) {
+    if (ctx.IsFoldedAddressAdd(inst)) {
+        // base + imm used only as a memory address: the access adds imm itself ([r13 + base + imm]).
+        auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+        ctx.reg_alloc.DefineValue(code, inst, args[0]);
+        return;
+    }
     EmitAdd(code, ctx, inst, 64);
 }
 

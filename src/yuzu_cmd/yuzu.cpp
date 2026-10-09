@@ -60,6 +60,7 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#include "video_core/upload_stats.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
@@ -1282,9 +1283,37 @@ static void MaybeScreenshot(Core::System& system) {
 extern "C" __attribute__((weak)) void ac_ps4_get_stats(uint64_t* submitted, uint64_t* completed, uint64_t* bo_bytes,
                                                        uint64_t* bo_count);
 #endif
+#ifndef __OPENORBIS__
+// EDEN_UPLOAD_STATS=1 (PC): what the PS4's perf line reports about GPU uploads, every 5 s on stderr.
+static void MaybePrintUploadStats() {
+    static const bool enabled = std::getenv("EDEN_UPLOAD_STATS") != nullptr;
+    if (!enabled)
+        return;
+    static u64 last = SDL_GetTicks();
+    static u64 s_up[7] = {};
+    const u64 now = SDL_GetTicks();
+    if (now - last < 5000)
+        return;
+    last = now;
+    auto& up = VideoCommon::upload_stats;
+    const u64 up_now[7] = {up.buffer_bytes.load() + up.inline_bytes.load(), up.texture_cpu_bytes.load(),
+                           up.texture_converted_bytes.load(), up.texture_gpu_bytes.load(), up.texture_count.load(),
+                               up.direct_bytes.load(), up.uniform_bytes.load()};
+    std::fprintf(stderr, "uploads (5 s): %.1f MiB uniforms, %.1f MiB buffers (%.1f in place), %.1f MiB textures on the CPU (%.1f converted), %.1f on the GPU, %llu textures\n",
+                 double(up_now[6] - s_up[6]) / 1048576.0,
+                 double(up_now[0] - s_up[0]) / 1048576.0, double(up_now[5] - s_up[5]) / 1048576.0,
+                 double(up_now[1] - s_up[1]) / 1048576.0, double(up_now[2] - s_up[2]) / 1048576.0, double(up_now[3] - s_up[3]) / 1048576.0,
+                 (unsigned long long)(up_now[4] - s_up[4]));
+    std::copy(std::begin(up_now), std::end(up_now), std::begin(s_up));
+}
+#endif
+
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
     MaybeScreenshot(state->system);
+#ifndef __OPENORBIS__
+    MaybePrintUploadStats();
+#endif
 #ifdef __OPENORBIS__
     // Nothing to draw here (rendering happens on its own thread); don't spin a whole Jaguar core.
     SDL_Delay(4);
@@ -1337,11 +1366,23 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         uint64_t submitted = 0, completed = 0, bo_bytes = 0, bo_count = 0;
         if (ac_ps4_get_stats)
             ac_ps4_get_stats(&submitted, &completed, &bo_bytes, &bo_count);
+        // What the GPU emulation copied in these 5 s (MiB): buffers through staging, textures
+        // unswizzled on the CPU (of which converted, e.g. ASTC) or on the GPU.
+        auto& up = VideoCommon::upload_stats;
+        static u64 s_up[7] = {};
+        const u64 up_now[7] = {up.buffer_bytes.load() + up.inline_bytes.load(), up.texture_cpu_bytes.load(),
+                               up.texture_converted_bytes.load(), up.texture_gpu_bytes.load(), up.texture_count.load(),
+                               up.direct_bytes.load(), up.uniform_bytes.load()};
         PS4_TRACE("perf: game {:.1f} fps, emulation speed {:.0f}%, {:.1f} ms per frame, waiting for the GPU {:.0f}% of "
-                  "the time, {} fastmem faults, GPU memory {} MiB in {} buffers",
+                  "the time, {} fastmem faults, GPU memory {} MiB in {} buffers, uploads {:.1f} MiB uniforms, {:.1f} MiB buffers ({:.1f} in place), "
+                  "{:.1f} MiB textures on the CPU ({:.1f} converted), {:.1f} on the GPU, {} textures",
                   perf.average_game_fps, perf.emulation_speed * 100.0, perf.frametime * 1000.0,
                   double(gpu_wait - s_gpu_wait) / 50000.0, faults - s_faults, // us per 5 s -> %
-                  bo_bytes >> 20, bo_count);
+                  bo_bytes >> 20, bo_count, double(up_now[6] - s_up[6]) / 1048576.0, double(up_now[0] - s_up[0]) / 1048576.0,
+                  double(up_now[5] - s_up[5]) / 1048576.0,
+                  double(up_now[1] - s_up[1]) / 1048576.0, double(up_now[2] - s_up[2]) / 1048576.0,
+                  double(up_now[3] - s_up[3]) / 1048576.0, up_now[4] - s_up[4]);
+        std::copy(std::begin(up_now), std::end(up_now), std::begin(s_up));
         s_gpu_wait = gpu_wait;
         s_faults = faults;
         // Every 30 s: how much of the game's memory the fast path covers, and why the rest isn't.

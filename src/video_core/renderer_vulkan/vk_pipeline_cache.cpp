@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdio>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -58,6 +60,29 @@ extern std::atomic<unsigned long long> ps4_pipelines_built; // externals/ps4sup/
 #endif
 
 namespace Vulkan {
+
+#ifdef __OPENORBIS__
+// The last graphics pipelines built, newest last: a GPU hang (vk_master_semaphore.cpp) names them -
+// a hang usually comes from a pipeline the GPU just ran for the first time.
+namespace {
+std::array<std::atomic<u64>, 6> g_recent_pipelines{};
+std::atomic<u32> g_recent_next{0};
+} // namespace
+
+void Ps4DescribeRecentPipelines(char* out, size_t size) {
+    const u32 next = g_recent_next.load(std::memory_order_relaxed);
+    size_t used = 0;
+    out[0] = 0;
+    for (u32 i = 0; i < g_recent_pipelines.size(); i++) {
+        const u64 hash = g_recent_pipelines[(next + i) % g_recent_pipelines.size()].load(std::memory_order_relaxed);
+        if (hash == 0 || used >= size)
+            continue;
+        const int n = std::snprintf(out + used, size - used, "%s0x%016llx", used ? " " : "", (unsigned long long)hash);
+        if (n > 0)
+            used += size_t(n);
+    }
+}
+#endif
 
 namespace {
 using Shader::Backend::SPIRV::EmitSPIRV;
@@ -784,6 +809,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         static u32 s_built = 0;
         ++s_built;
         ps4_pipelines_built.fetch_add(1, std::memory_order_relaxed);
+        g_recent_pipelines[g_recent_next.fetch_add(1, std::memory_order_relaxed) % g_recent_pipelines.size()].store(
+            graphics_key.Hash(), std::memory_order_relaxed);
         if (ms >= 30 && ps4_boot_trace) {
             char line[128];
             std::snprintf(line, sizeof(line), "shader: new pipeline #%u built in %lld ms%s", s_built, (long long)ms,

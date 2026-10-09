@@ -93,7 +93,16 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
     }
 
-    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
+    Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
+    // The address's "+ imm" when FoldFastmemAddresses folded it into this access (vaddr = base).
+    s64 disp = !inst->GetArg(1).IsImmediate() && ctx.IsFoldedAddressAdd(inst->GetArg(1).GetInst())
+        ? static_cast<s64>(inst->GetArg(1).GetInst()->GetArg(1).GetImmediateAsU64()) : 0;
+    if (disp != 0 && !fastmem_marker) { // (not expected: the fold checks this) form the address
+        const Xbyak::Reg64 full = ctx.reg_alloc.ScratchGpr(code);
+        code.lea(full, code.ptr[vaddr + disp]);
+        vaddr = full;
+        disp = 0;
+    }
     const int value_idx = bitsize == 128 ? ctx.reg_alloc.ScratchXmm(code).getIdx() : ctx.reg_alloc.ScratchGpr(code).getIdx();
 
     const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
@@ -105,23 +114,37 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
         bool require_abort_handling = false;
         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
 
-        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+        const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr + static_cast<size_t>(disp), ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
+            // A folded displacement: the fallback takes the full address in vaddr's register, which
+            // is put back afterwards (lea: the host flags may hold the guest's).
+            if (disp != 0) {
+                code.lea(vaddr, code.ptr[vaddr + disp]);
+            }
             code.call(wrapped_fn);
+            const u64 resume = std::bit_cast<u64>(code.getCurr());
+            if (disp != 0) {
+                code.lea(vaddr, code.ptr[vaddr - disp]);
+            }
+            EmitCheckMemoryAbort(ctx, inst, end);
+            code.jmp(*end, code.T_NEAR);
+            u64 fault_entry = std::bit_cast<u64>(wrapped_fn);
+            if (disp != 0) { // a fault "calls" this, returning to resume
+                fault_entry = std::bit_cast<u64>(code.getCurr());
+                code.lea(vaddr, code.ptr[vaddr + disp]);
+                code.jmp(reinterpret_cast<const void*>(wrapped_fn), code.T_NEAR);
+            }
 
             fastmem_patch_info.emplace(
                 std::bit_cast<u64>(location),
                 FastmemPatchInfo{
-                    std::bit_cast<u64>(code.getCurr()),
-                    std::bit_cast<u64>(wrapped_fn),
+                    resume,
+                    fault_entry,
                     *fastmem_marker,
                     conf.recompile_on_fastmem_failure,
                 });
-
-            EmitCheckMemoryAbort(ctx, inst, end);
-            code.jmp(*end, code.T_NEAR);
         });
     } else {
         // Use page table
@@ -178,10 +201,21 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
         ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
     }
 
-    const Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
+    Xbyak::Reg64 vaddr = ctx.reg_alloc.UseGpr(code, args[1]);
     const int value_idx = bitsize == 128
                             ? ctx.reg_alloc.UseXmm(code, args[2]).getIdx()
                             : (ordered ? ctx.reg_alloc.UseScratchGpr(code, args[2]).getIdx() : ctx.reg_alloc.UseGpr(code, args[2]).getIdx());
+    // The address's "+ imm" when FoldFastmemAddresses folded it into this access (vaddr = base).
+    s64 disp = !inst->GetArg(1).IsImmediate() && ctx.IsFoldedAddressAdd(inst->GetArg(1).GetInst())
+        ? static_cast<s64>(inst->GetArg(1).GetInst()->GetArg(1).GetImmediateAsU64()) : 0;
+    if (disp != 0 && (!fastmem_marker || (bitsize != 128 && vaddr.getIdx() == value_idx))) {
+        // Form the address in a register of its own: the fault path can't move vaddr when it is
+        // also the value stored (STR X1, [X1, #8]).
+        const Xbyak::Reg64 full = ctx.reg_alloc.ScratchGpr(code);
+        code.lea(full, code.ptr[vaddr + disp]);
+        vaddr = full;
+        disp = 0;
+    }
 
     const auto wrapped_fn = write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
 
@@ -192,23 +226,37 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
         bool require_abort_handling = false;
         const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
 
-        const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
+        const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr + static_cast<size_t>(disp), value_idx, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
             code.L(*abort);
+            // A folded displacement: the fallback takes the full address in vaddr's register, which
+            // is put back afterwards (lea: the host flags may hold the guest's).
+            if (disp != 0) {
+                code.lea(vaddr, code.ptr[vaddr + disp]);
+            }
             code.call(wrapped_fn);
+            const u64 resume = std::bit_cast<u64>(code.getCurr());
+            if (disp != 0) {
+                code.lea(vaddr, code.ptr[vaddr - disp]);
+            }
+            EmitCheckMemoryAbort(ctx, inst, end);
+            code.jmp(*end, code.T_NEAR);
+            u64 fault_entry = std::bit_cast<u64>(wrapped_fn);
+            if (disp != 0) { // a fault "calls" this, returning to resume
+                fault_entry = std::bit_cast<u64>(code.getCurr());
+                code.lea(vaddr, code.ptr[vaddr + disp]);
+                code.jmp(reinterpret_cast<const void*>(wrapped_fn), code.T_NEAR);
+            }
 
             fastmem_patch_info.emplace(
                 std::bit_cast<u64>(location),
                 FastmemPatchInfo{
-                    std::bit_cast<u64>(code.getCurr()),
-                    std::bit_cast<u64>(wrapped_fn),
+                    resume,
+                    fault_entry,
                     *fastmem_marker,
                     conf.recompile_on_fastmem_failure,
                 });
-
-            EmitCheckMemoryAbort(ctx, inst, end);
-            code.jmp(*end, code.T_NEAR);
         });
     } else {
         // Use page table

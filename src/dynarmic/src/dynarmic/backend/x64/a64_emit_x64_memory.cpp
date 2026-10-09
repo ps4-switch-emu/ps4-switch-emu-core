@@ -17,6 +17,7 @@
 #include "dynarmic/backend/x64/xbyak.h"
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
+#include "dynarmic/ir/basic_block.h"
 #include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/devirtualize.h"
 #include "dynarmic/backend/x64/emit_x64_memory.h"
@@ -284,6 +285,38 @@ void A64EmitX64::GenFastmemFallbacks() {
 #define Axx A64
 #include "dynarmic/backend/x64/emit_x64_memory.cpp.inc"
 #undef Axx
+
+// Loads and stores at base + immediate (LDR X0, [X1, #8] and the like): the addition goes into the
+// access's displacement ([r13 + base + imm]) instead of a lea into a register first. Only with
+// unchecked fastmem (no bounds test on the full address) and plain (unordered) accesses; the fault
+// path forms the full address for the fallback itself (EmitMemoryRead/Write).
+void A64EmitX64::FoldFastmemAddresses(A64EmitContext& ctx) {
+    ctx.folded_address_adds.clear();
+    if (!conf.HasOptimization(OptimizationFlag::HostRegisterLocality) || !conf.fastmem_pointer
+        || conf.fastmem_address_space_bits != 64) {
+        return;
+    }
+    for (auto& inst : ctx.block.instructions) {
+        const auto op = inst.GetOpcode();
+        const bool read = op == IR::Opcode::A64ReadMemory8 || op == IR::Opcode::A64ReadMemory16
+            || op == IR::Opcode::A64ReadMemory32 || op == IR::Opcode::A64ReadMemory64 || op == IR::Opcode::A64ReadMemory128;
+        const bool write = op == IR::Opcode::A64WriteMemory8 || op == IR::Opcode::A64WriteMemory16
+            || op == IR::Opcode::A64WriteMemory32 || op == IR::Opcode::A64WriteMemory64 || op == IR::Opcode::A64WriteMemory128;
+        if ((!read && !write) || IsOrdered(inst.GetArg(read ? 2 : 3).GetAccType()) || inst.GetArg(1).IsImmediate()) {
+            continue;
+        }
+        const IR::Inst* const add = inst.GetArg(1).GetInst();
+        if (add->GetOpcode() != IR::Opcode::Add64 || add->UseCount() != 1 || add->GetArg(0).IsImmediate()
+            || !add->GetArg(1).IsImmediate() || !add->GetArg(2).IsImmediate() || add->GetArg(2).GetU1()) {
+            continue;
+        }
+        const s64 disp = static_cast<s64>(add->GetArg(1).GetImmediateAsU64());
+        if (disp == 0 || disp < -0x40000000 || disp > 0x40000000 || !ShouldFastmem(ctx, &inst)) {
+            continue;
+        }
+        ctx.folded_address_adds.push_back(add);
+    }
+}
 
 void A64EmitX64::EmitA64ReadMemory8(A64EmitContext& ctx, IR::Inst* inst) {
     EmitMemoryRead<8, &A64::UserCallbacks::MemoryRead8>(ctx, inst);

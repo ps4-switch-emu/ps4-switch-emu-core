@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdio>
 #include <thread>
 
 #include <ranges>
@@ -12,7 +14,30 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+#ifdef __OPENORBIS__
+extern "C" __attribute__((weak)) void ps4_boot_trace(const char* stage);
+#endif
+
 namespace Vulkan {
+
+#ifdef __OPENORBIS__
+void Ps4DescribeRecentPipelines(char* out, size_t size); // vk_pipeline_cache.cpp
+
+// The GPU hasn't finished some work for a long time: trace it (at 5 s and 30 s), with the
+// pipelines built last - a hung GPU otherwise just freezes the game without a word in the logs.
+static void Ps4ReportGpuStall(double seconds, u64 tick, u64 gpu_tick) {
+    if (!ps4_boot_trace)
+        return;
+    char pipelines[160];
+    Ps4DescribeRecentPipelines(pipelines, sizeof(pipelines));
+    char line[320];
+    std::snprintf(line, sizeof(line),
+                  "GPU: no progress for %.0f s (waiting for submission %llu, finished %llu) - possible GPU hang; "
+                  "pipelines built last: %s",
+                  seconds, (unsigned long long)tick, (unsigned long long)gpu_tick, pipelines[0] ? pipelines : "none");
+    ps4_boot_trace(line);
+}
+#endif
 
 constexpr u64 FENCE_RESERVE_SIZE = 8;
 
@@ -104,8 +129,22 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+#ifdef __OPENORBIS__
+    {
+        const auto start = std::chrono::steady_clock::now();
+        int reported = 0;
+        while (!semaphore.Wait(tick, 1'000'000'000)) { // 1 s at a time, to notice a hang
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            if ((reported == 0 && s >= 5) || (reported == 1 && s >= 30)) {
+                Ps4ReportGpuStall(s, tick, semaphore.GetCounter());
+                reported++;
+            }
+        }
+    }
+#else
     while (!semaphore.Wait(tick)) {
     }
+#endif
 
     Refresh();
 }
@@ -345,7 +384,21 @@ void MasterSemaphore::WaitThread(std::stop_token token) {
             wait_queue.pop();
         }
 
+#ifdef __OPENORBIS__
+        {
+            const auto start = std::chrono::steady_clock::now();
+            int reported = 0;
+            while (fence.Wait(1'000'000'000) == VK_TIMEOUT) { // 1 s at a time, to notice a hang
+                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                if ((reported == 0 && s >= 5) || (reported == 1 && s >= 30)) {
+                    Ps4ReportGpuStall(s, host_tick, gpu_tick.load(std::memory_order_relaxed));
+                    reported++;
+                }
+            }
+        }
+#else
         fence.Wait();
+#endif
         fence.Reset();
 
         {
