@@ -900,26 +900,49 @@ public:
         const off_t phys = Commit(chunk_index);
         if (phys < 0)
             return false;
+        // Blocks are mapped in runs: consecutive guest blocks on consecutive backing with the same
+        // protection become one kernel call (a heap's blocks usually are - one call per chunk).
+        u64 run_index = 0, run_count = 0;
+        size_t run_host = 0;
+        u8 run_prot = 0;
+        const auto flush = [&] {
+            if (run_count == 0)
+                return;
+            void* addr = virtual_base + run_index * HostPage;
+            sceKernelMunmap(addr, run_count * HostPage); // the reservation
+            void* target = addr;
+            const int32_t r = sceKernelMapDirectMemory(&target, run_count * HostPage, run_prot, MapFixed,
+                                                       phys + off_t(run_host % Chunk), HostPage);
+            if (r != 0 && failures++ < 16)
+                Trace("fastmem: deferred map of %llu KiB at %p failed (%#x)",
+                      (unsigned long long)(run_count * HostPage >> 10), addr, unsigned(r));
+            run_count = 0;
+        };
         const auto map_deferred = [&](u64 index, Block& b) {
             const size_t host_offset = size_t(b.applied_page - 1) * GuestPage;
             if (!b.deferred || host_offset / Chunk != chunk_index)
                 return; // remapped or unmapped since
-            void* addr = virtual_base + index * HostPage;
-            sceKernelMunmap(addr, HostPage); // the reservation
-            void* target = addr;
-            const int32_t r = sceKernelMapDirectMemory(&target, HostPage, b.applied_prot, MapFixed,
-                                                       phys + off_t(host_offset % Chunk), HostPage);
-            if (r != 0 && failures++ < 16)
-                Trace("fastmem: deferred map at %p failed (%#x)", addr, unsigned(r));
+            if (run_count != 0 && index == run_index + run_count &&
+                host_offset == run_host + run_count * HostPage && b.applied_prot == run_prot) {
+                run_count++;
+            } else {
+                flush();
+                run_index = index;
+                run_host = host_offset;
+                run_prot = b.applied_prot;
+                run_count = 1;
+            }
             b.deferred = false;
             deferred_blocks--;
             deferred_mapped++;
         };
         map_deferred(it->first, it->second); // the faulting block first, list or not
+        flush();
         if (const auto list = deferred_by_chunk.find(chunk_index); list != deferred_by_chunk.end()) {
             for (const u64 index : list->second)
                 if (const auto bit = blocks.find(index); bit != blocks.end())
                     map_deferred(index, bit->second);
+            flush();
             list->second.clear(); // keeps its storage: nothing is freed in the signal handler
         }
         return true;

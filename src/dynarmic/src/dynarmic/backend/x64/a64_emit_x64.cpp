@@ -127,8 +127,18 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
     // Start emitting.
     code.align();
     const auto* const entrypoint = code.getCurr();
-    code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
-    code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+    // Frame info for unwinders through JIT code: three instructions per block executed. Not needed
+    // where nothing walks frame pointers through it (the PS4's crash log and profiler record
+    // instruction addresses); rbp is never allocated, so it then keeps the dispatcher's value.
+#ifdef _WIN32
+    const bool frame_info = true;
+#else
+    const bool frame_info = !conf.HasOptimization(OptimizationFlag::HostRegisterLocality);
+#endif
+    if (frame_info) {
+        code.mov(code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)], rbp);
+        code.lea(rbp, code.ptr[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer) - 8]);
+    }
 
     DEBUG_ASSERT(block.GetCondition() == IR::Cond::AL);
     typedef void (EmitX64::*EmitHandlerFn)(EmitContext& context, IR::Inst* inst);
@@ -182,7 +192,8 @@ finish_this_inst:
     reg_alloc.AssertNoMoreUses();
     if (conf.enable_cycle_counting)
         EmitAddCycles(block.CycleCount());
-    code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+    if (frame_info)
+        code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
     nzcv_in_host_flags = conf.HasOptimization(OptimizationFlag::HostRegisterLocality) && !conf.enable_cycle_counting
         && NzcvInHostFlagsAtBlockEnd(block);
     check_bit_in_flags = conf.HasOptimization(OptimizationFlag::HostRegisterLocality) && !conf.enable_cycle_counting
