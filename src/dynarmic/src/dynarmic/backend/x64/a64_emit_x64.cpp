@@ -72,6 +72,38 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 
 A64EmitX64::~A64EmitX64() = default;
 
+// Whether the host flags still hold the guest NZCV at the end of the block: the last code-emitting
+// instruction is an add/sub whose NZCV the block stores, followed only by plain register stores
+// (mov - no flag changes). EmitAdd/EmitSub capture NZCV with lahf/seto, which keep the flags, and
+// the terminal's conditional branch can then test them directly instead of reloading the store.
+static bool NzcvInHostFlagsAtBlockEnd(const IR::Block& block) {
+    const IR::Inst* nzcv = nullptr;
+    for (auto it = block.instructions.rbegin(); it != block.instructions.rend(); ++it) {
+        switch (it->GetOpcode()) {
+        case IR::Opcode::A64SetNZCV:
+            if (nzcv || it->GetArg(0).IsImmediate())
+                return false;
+            nzcv = it->GetArg(0).GetInstRecursive();
+            continue;
+        case IR::Opcode::A64SetX:
+        case IR::Opcode::A64SetW:
+        case IR::Opcode::GetNZCVFromOp:
+        case IR::Opcode::GetCarryFromOp:
+        case IR::Opcode::GetOverflowFromOp:
+            continue;
+        case IR::Opcode::Add32:
+        case IR::Opcode::Add64:
+        case IR::Opcode::Sub32:
+        case IR::Opcode::Sub64:
+            return nzcv && nzcv->GetOpcode() == IR::Opcode::GetNZCVFromOp && !nzcv->GetArg(0).IsImmediate()
+                && nzcv->GetArg(0).GetInst() == &*it;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
 A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
     if (conf.very_verbose_debugging_output) [[unlikely]] {
         std::puts(IR::DumpBlock(block).c_str());
@@ -86,6 +118,7 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
             gprs.reset(size_t(HostLoc::R14));
         return gprs;
     }(), any_xmm};
+    reg_alloc.scratch_into_free_registers = conf.HasOptimization(OptimizationFlag::HostRegisterLocality);
 
     A64EmitContext ctx{conf, reg_alloc, block, shared_labels};
 
@@ -148,7 +181,10 @@ finish_this_inst:
     if (conf.enable_cycle_counting)
         EmitAddCycles(block.CycleCount());
     code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
+    nzcv_in_host_flags = conf.HasOptimization(OptimizationFlag::HostRegisterLocality) && !conf.enable_cycle_counting
+        && NzcvInHostFlagsAtBlockEnd(block);
     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
+    nzcv_in_host_flags = false;
     code.int3();
     for (auto& deferred_emit : ctx.deferred_emits)
         deferred_emit();
@@ -419,6 +455,12 @@ void A64EmitX64::EmitA64SetS(A64EmitContext& ctx, IR::Inst* inst) {
     const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
     const auto addr = xword[code.ABI_JIT_PTR + offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec)];
 
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && IsZeroExtendedWord(inst->GetArg(1))) {
+        // Already zero above the low 32 bits (a scalar result): store it as it is.
+        const Xbyak::Xmm to_store = ctx.reg_alloc.UseXmm(code, args[1]);
+        code.movaps(addr, to_store);
+        return;
+    }
     const Xbyak::Xmm to_store = ctx.reg_alloc.UseXmm(code, args[1]);
     const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm(code);
     // TODO: Optimize
@@ -432,6 +474,12 @@ void A64EmitX64::EmitA64SetD(A64EmitContext& ctx, IR::Inst* inst) {
     const A64::Vec vec = inst->GetArg(0).GetA64VecRef();
     const auto addr = xword[code.ABI_JIT_PTR + offsetof(A64JitState, vec) + sizeof(u64) * 2 * static_cast<size_t>(vec)];
 
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && IsZeroExtendedLong(inst->GetArg(1))) {
+        // Already zero above the low 64 bits: store it as it is.
+        const Xbyak::Xmm to_store = ctx.reg_alloc.UseXmm(code, args[1]);
+        code.movaps(addr, to_store);
+        return;
+    }
     const Xbyak::Xmm to_store = ctx.reg_alloc.UseScratchXmm(code, args[1]);
     code.movq(to_store, to_store);  // TODO: Remove when able
     code.movaps(addr, to_store);

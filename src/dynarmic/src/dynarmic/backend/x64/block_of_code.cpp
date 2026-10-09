@@ -22,7 +22,9 @@
 #endif
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <string_view>
 
 #include "common/assert.h"
 #include "dynarmic/mcl/bit.hpp"
@@ -121,6 +123,13 @@ static const HostFeature features = []() {
             f |= HostFeature::FastBMI2;
         }
     }
+#    ifndef __OPENORBIS__
+    // PC test of the PS4's code paths: EDEN_HOST_FEATURES=jaguar keeps only what the PS4's Jaguar
+    // cores have (no AVX2, FMA, BMI2 or AVX-512), so profiles show the fallbacks the console runs.
+    if (const char* host = std::getenv("EDEN_HOST_FEATURES"); host && std::string_view{host} == "jaguar")
+        f &= HostFeature::SSSE3 | HostFeature::SSE41 | HostFeature::SSE42 | HostFeature::AVX | HostFeature::F16C
+           | HostFeature::AES | HostFeature::PCLMULQDQ | HostFeature::POPCNT | HostFeature::BMI1 | HostFeature::LZCNT;
+#    endif
     return f;
 #endif
 }();

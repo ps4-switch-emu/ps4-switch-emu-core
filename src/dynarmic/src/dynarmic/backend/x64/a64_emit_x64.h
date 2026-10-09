@@ -60,9 +60,17 @@ public:
         const void* code_ptr = nullptr;
     };
     static_assert(sizeof(FastDispatchEntry) == 0x10);
-    // Full size on the PS4 too (was cut to 0x100 entries: every lookup missed - measured slower).
+#ifdef __OPENORBIS__
+    // PS4: upstream dynarmic's 64K entries (1 MiB per core) instead of 16 MiB per core. The hot
+    // entries take the same cache lines either way, but spread over 16 MiB they touch 16x the
+    // pages (TLB misses on Jaguar) and the four tables cost 60 MiB of the console's memory.
+    // (0x100 entries was too small: every lookup missed - measured slower.)
+    static constexpr u64 fast_dispatch_table_mask = 0xFFFF0;
+    static constexpr size_t fast_dispatch_table_size = 0x10000;
+#else
     static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
     static constexpr size_t fast_dispatch_table_size = 0x100000;
+#endif
 
     void ClearFastDispatchTable();
     void GenMemory128Accessors();

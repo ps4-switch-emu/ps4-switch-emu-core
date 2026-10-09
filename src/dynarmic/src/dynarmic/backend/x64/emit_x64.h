@@ -27,6 +27,9 @@
 #include "dynarmic/backend/x64/reg_alloc.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/ir/location_descriptor.h"
+#include "dynarmic/ir/microinstruction.h"
+#include "dynarmic/ir/opcodes.h"
+#include "dynarmic/ir/value.h"
 #include "dynarmic/ir/terminal.h"
 
 namespace Dynarmic::IR {
@@ -55,6 +58,28 @@ template<typename T>
 using HalfVectorArray = std::array<T, A64FullVectorWidth::value / mcl::bitsizeof<T> / 2>;
 
 using SharedLabel = Xbyak::Label*;
+// A U128 known to be zero above its low 64 (IsZeroExtendedLong) or 32 (IsZeroExtendedWord) bits:
+// ZeroExtendLongToQuad (of ZeroExtendWordToLong), or a GetD/GetS load (movq/movd). These always
+// clear the bits, whichever registers they used.
+inline bool IsZeroExtendedWord(const IR::Value& value) {
+    if (value.IsImmediate())
+        return false;
+    const IR::Inst* const inst = value.GetInstRecursive();
+    if (inst->GetOpcode() == IR::Opcode::A64GetS)
+        return true;
+    if (inst->GetOpcode() != IR::Opcode::ZeroExtendLongToQuad)
+        return false;
+    const IR::Value along = inst->GetArg(0);
+    return !along.IsImmediate() && along.GetInstRecursive()->GetOpcode() == IR::Opcode::ZeroExtendWordToLong;
+}
+
+inline bool IsZeroExtendedLong(const IR::Value& value) {
+    if (value.IsImmediate())
+        return false;
+    const auto opcode = value.GetInstRecursive()->GetOpcode();
+    return opcode == IR::Opcode::ZeroExtendLongToQuad || opcode == IR::Opcode::A64GetD || IsZeroExtendedWord(value);
+}
+
 struct EmitContext {
     EmitContext(RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& shared_labels);
     virtual ~EmitContext();
@@ -106,6 +131,9 @@ public:
     virtual std::string LocationDescriptorToFriendlyName(const IR::LocationDescriptor&) const = 0;
     void EmitAddCycles(size_t cycles);
     Xbyak::Label EmitCond(IR::Cond cond);
+    /// Set around EmitTerminal when the host flags still hold the guest NZCV just stored (see
+    /// A64EmitX64::Emit): the next EmitCond uses them instead of reloading them.
+    bool nzcv_in_host_flags = false;
     BlockDescriptor RegisterBlock(const IR::LocationDescriptor& location_descriptor, CodePtr entrypoint, size_t size);
     void PushRSBHelper(Xbyak::Reg64 loc_desc_reg, Xbyak::Reg64 index_reg, IR::LocationDescriptor target);
 

@@ -39,6 +39,7 @@ public:
     std::vector<InstructionType> code_mem;
     std::map<u32, u8> modified_memory;
     std::vector<std::string> interrupts;
+    bool record_exceptions = false;  // record SVCs/exceptions in interrupts instead of aborting
 
     void PadCodeMem() {
         do {
@@ -98,11 +99,15 @@ public:
     }
 
     void CallSVC(std::uint32_t swi) override {
-        UNREACHABLE(); //ASSERT(false && "CallSVC({})", swi);
+        if (!record_exceptions)
+            UNREACHABLE(); //ASSERT(false && "CallSVC({})", swi);
+        interrupts.emplace_back("svc " + std::to_string(swi));
     }
 
-    void ExceptionRaised(u32 pc, Dynarmic::A32::Exception /*exception*/) override {
-        UNREACHABLE(); //ASSERT(false && "ExceptionRaised({:08x}) code = {:08x}", pc, *MemoryReadCode(pc));
+    void ExceptionRaised(u32 pc, Dynarmic::A32::Exception exception) override {
+        if (!record_exceptions)
+            UNREACHABLE(); //ASSERT(false && "ExceptionRaised({:08x}) code = {:08x}", pc, *MemoryReadCode(pc));
+        interrupts.emplace_back("exception " + std::to_string(pc) + " " + std::to_string(int(exception)));
     }
 
     void AddTicks(std::uint64_t ticks) override {

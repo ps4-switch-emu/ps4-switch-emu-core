@@ -217,7 +217,20 @@ void EmitX64::EmitVectorGetElement32(EmitContext& ctx, IR::Inst* inst) {
     ASSERT(args[1].IsImmediate());
     const u8 index = args[1].GetImmediateU8();
 
-    // TODO: DefineValue directly on Argument for index == 0
+    if (index == 0 && code.HasHostFeature(HostFeature::SSE41) && ctx.HasOptimization(OptimizationFlag::HostRegisterLocality)) {
+        // Lane 0 (every scalar S register read) stays in a vector register, zeroed above like a
+        // movd would leave it: the scalar FP ops that use it take it from there, instead of a
+        // pextrd to a GPR and a movd back - two GPR<->XMM crossings per value, slow on Jaguar.
+        if (IsZeroExtendedWord(inst->GetArg(0))) {
+            // Already zero above lane 0 (a scalar result written back earlier in the block).
+            ctx.reg_alloc.DefineValue(code, inst, args[0]);
+            return;
+        }
+        const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(code, args[0]);
+        code.insertps(result, result, 0b00001110);
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
 
     const Xbyak::Reg32 dest = ctx.reg_alloc.ScratchGpr(code).cvt32();
 
@@ -238,18 +251,25 @@ void EmitX64::EmitVectorGetElement64(EmitContext& ctx, IR::Inst* inst) {
     ASSERT(args[1].IsImmediate());
     const u8 index = args[1].GetImmediateU8();
 
-    if (index == 0) {
-        // TODO: DefineValue directly on Argument for index == 0
-        const Xbyak::Reg64 dest = ctx.reg_alloc.ScratchGpr(code).cvt64();
-        auto const source = ctx.reg_alloc.UseXmm(code, args[0]);
-        code.movq(dest, source);
-        ctx.reg_alloc.DefineValue(code, inst, dest);
+    if (index == 0 && ctx.HasOptimization(OptimizationFlag::HostRegisterLocality)) {
+        // Lane 0 (every scalar D register read) stays in a vector register, zeroed above (see
+        // EmitVectorGetElement32).
+        if (IsZeroExtendedLong(inst->GetArg(0))) {
+            ctx.reg_alloc.DefineValue(code, inst, args[0]);
+            return;
+        }
+        const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(code, args[0]);
+        code.movq(result, result);
+        ctx.reg_alloc.DefineValue(code, inst, result);
         return;
     }
 
     const Xbyak::Reg64 dest = ctx.reg_alloc.ScratchGpr(code).cvt64();
 
-    if (code.HasHostFeature(HostFeature::SSE41)) {
+    if (index == 0) {
+        auto const source = ctx.reg_alloc.UseXmm(code, args[0]);
+        code.movq(dest, source);
+    } else if (code.HasHostFeature(HostFeature::SSE41)) {
         auto const source = ctx.reg_alloc.UseXmm(code, args[0]);
         code.pextrq(dest, source, 1);
     } else {

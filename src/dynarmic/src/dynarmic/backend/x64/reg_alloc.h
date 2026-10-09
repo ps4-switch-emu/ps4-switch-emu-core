@@ -141,6 +141,9 @@ public:
     RegAlloc() noexcept = default;
     RegAlloc(std::bitset<32> gpr_order, std::bitset<32> xmm_order) noexcept;
 
+    /// OptimizationFlag::HostRegisterLocality: scratch copies of live values go into free registers.
+    bool scratch_into_free_registers = false;
+
     ArgumentInfo GetArgumentInfo(const IR::Inst* inst) noexcept;
     void RegisterPseudoOperation(const IR::Inst* inst) noexcept;
     inline bool IsValueLive(const IR::Inst* inst) const noexcept {

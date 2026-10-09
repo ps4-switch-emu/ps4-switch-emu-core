@@ -294,9 +294,16 @@ void EmitX64::EmitAddCycles(size_t cycles) {
 Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
     Xbyak::Label pass;
 
-    code.mov(eax, dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
-
-    code.LoadRequiredFlagsForCondFromRax(cond);
+    if (nzcv_in_host_flags) {
+        // The flags are as the add/sub that produced the stored NZCV left them: SF/ZF/OF, and CF
+        // already holding the ARM carry - what sahf (and cmp al, 0x81) would restore.
+        nzcv_in_host_flags = false;
+        if (cond == IR::Cond::HI || cond == IR::Cond::LS)
+            code.cmc();
+    } else {
+        code.mov(eax, dword[code.ABI_JIT_PTR + code.GetJitStateInfo().offsetof_cpsr_nzcv]);
+        code.LoadRequiredFlagsForCondFromRax(cond);
+    }
 
     switch (cond) {
     case IR::Cond::EQ:
@@ -348,7 +355,10 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
 }
 
 EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& descriptor, CodePtr entrypoint, size_t size) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    // (Elsewhere PerfMapRegister does nothing, but the name would still be formatted per block.)
     PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
+#endif
     Patch(descriptor, entrypoint);
 
     BlockDescriptor block_desc{entrypoint, size};

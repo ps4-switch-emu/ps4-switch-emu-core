@@ -8,6 +8,9 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
 #include "common/container/unordered_map.h"
 #include "common/assert.h"
 #include "common/common_types.h"
@@ -18,6 +21,8 @@ using Vector = Dynarmic::A64::Vector;
 class A64TestEnv : public Dynarmic::A64::UserCallbacks {
 public:
     ::Common::unordered_map<u64, u8> modified_memory;
+    std::vector<std::string> interrupts;
+    bool record_exceptions = false;  // record SVCs/exceptions in interrupts instead of aborting
     std::vector<u32> code_mem;
     u64 ticks_left = 0;
     u64 code_mem_start_address = 0;
@@ -100,11 +105,15 @@ public:
     }
 
     void CallSVC(std::uint32_t swi) override {
-        UNREACHABLE(); //ASSERT(false && "CallSVC({})", swi);
+        if (!record_exceptions)
+            UNREACHABLE(); //ASSERT(false && "CallSVC({})", swi);
+        interrupts.emplace_back("svc " + std::to_string(swi));
     }
 
-    void ExceptionRaised(u64 pc, Dynarmic::A64::Exception /*exception*/) override {
-        UNREACHABLE(); //ASSERT(false && "ExceptionRaised({:016x})", pc);
+    void ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) override {
+        if (!record_exceptions)
+            UNREACHABLE(); //ASSERT(false && "ExceptionRaised({:016x})", pc);
+        interrupts.emplace_back("exception " + std::to_string(pc) + " " + std::to_string(int(exception)));
     }
 
     void AddTicks(std::uint64_t ticks) override {

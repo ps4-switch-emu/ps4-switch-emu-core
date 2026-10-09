@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <tuple>
 #include <type_traits>
@@ -668,4 +669,100 @@ TEST_CASE("A32: Test thumb IT instruction", "[thumb]") {
         regs[15] = start_address;
         RunTestInstance(jit, uni, jit_env, uni_env, regs, ext_reg, instructions, cpsr, fpcr, pre_instructions + 1 + post_instructions);
     }
+}
+
+// Differential tests for OptimizationFlag::HostRegisterLocality on A32/Thumb code (see the A64 ones
+// in fuzz_with_unicorn.cpp): the same random blocks in JITs with and without it must leave the
+// same registers, extension registers, CPSR, FPSCR, memory and exceptions.
+template<typename TestEnv, typename GenBlock>
+static void RunA32HostRegisterLocalityDifferential(u32 cpsr_mode_bits, size_t iterations, GenBlock gen_block) {
+    TestEnv env_a{};
+    TestEnv env_b{};
+    env_a.record_exceptions = env_b.record_exceptions = true;
+    Dynarmic::A32::UserConfig conf_a{GetUserConfig(env_a)};
+    Dynarmic::A32::UserConfig conf_b{GetUserConfig(env_b)};
+    conf_a.optimizations |= OptimizationFlag::HostRegisterLocality;
+    conf_b.optimizations &= ~OptimizationFlag::HostRegisterLocality;
+    if (std::getenv("DIFF_CONTROL"))
+        conf_a.optimizations &= ~OptimizationFlag::HostRegisterLocality;
+    Dynarmic::A32::Jit jit_a{conf_a};
+    Dynarmic::A32::Jit jit_b{conf_b};
+
+    typename A32Unicorn<TestEnv>::RegisterArray regs;
+    typename A32Unicorn<TestEnv>::ExtRegArray ext_regs;
+    for (size_t iteration = 0; iteration < iterations; ++iteration) {
+        std::generate(regs.begin(), regs.end(), [] { return RandInt<u32>(0, ~u32(0)); });
+        std::generate(ext_regs.begin(), ext_regs.end(), [] { return RandInt<u32>(0, ~u32(0)); });
+        const u32 start_address = 100;
+        const u32 cpsr = (RandInt<u32>(0, 0xF) << 28) | cpsr_mode_bits;
+        const u32 fpscr = RandomFpcr();
+        size_t ticks = 0;
+        const std::vector<typename TestEnv::InstructionType> instructions = gen_block(start_address, ticks);
+        regs[15] = start_address;
+
+        std::string listing;
+        for (const auto instruction : instructions)
+            listing += fmt::format("{:x} ", instruction);
+        INFO("Instructions: " << listing << " fpscr " << std::hex << fpscr << " cpsr " << cpsr);
+
+        for (auto [jit, env] : {std::pair{&jit_a, &env_a}, std::pair{&jit_b, &env_b}}) {
+            const u32 num_words = start_address / sizeof(typename TestEnv::InstructionType);
+            env->code_mem.resize(num_words + instructions.size());
+            std::fill(env->code_mem.begin(), env->code_mem.end(), TestEnv::infinite_loop);
+            std::copy(instructions.begin(), instructions.end(), env->code_mem.begin() + num_words);
+            env->PadCodeMem();
+            env->modified_memory.clear();
+            env->interrupts.clear();
+            env->code_mem_modified_by_guest = false;
+            jit->Regs() = regs;
+            jit->ExtRegs() = ext_regs;
+            jit->SetFpscr(fpscr);
+            jit->SetCpsr(cpsr);
+            jit->ClearCache();
+            env->ticks_left = ticks;
+            CheckedRun([&]() { jit->Run(); });
+        }
+
+        REQUIRE(env_a.code_mem_modified_by_guest == env_b.code_mem_modified_by_guest);
+        REQUIRE(jit_a.Regs() == jit_b.Regs());
+        REQUIRE(jit_a.ExtRegs() == jit_b.ExtRegs());
+        REQUIRE(jit_a.Cpsr() == jit_b.Cpsr());
+        REQUIRE(jit_a.Fpscr() == jit_b.Fpscr());
+        REQUIRE(env_a.modified_memory == env_b.modified_memory);
+        REQUIRE(env_a.interrupts == env_b.interrupts);
+    }
+}
+
+static auto ArmBlock(size_t count) {
+    return [count](u32 start_address, size_t& ticks) {
+        std::vector<u32> instructions(count);
+        for (size_t i = 0; i < count; ++i)
+            instructions[i] = GenRandomArmInst(start_address + u32(i * 4), i + 1 == count);
+        ticks = count;
+        return instructions;
+    };
+}
+
+static auto ThumbBlock(size_t count) {
+    return [count](u32 start_address, size_t& ticks) {
+        std::vector<u16> instructions;
+        for (size_t i = 0; i < count; ++i) {
+            const std::vector<u16> inst = GenRandomThumbInst(start_address + u32(instructions.size() * 2), i + 1 == count);
+            instructions.insert(instructions.end(), inst.begin(), inst.end());
+        }
+        ticks = count;
+        return instructions;
+    };
+}
+
+TEST_CASE("A32: HostRegisterLocality differential: single arm instructions", "[a32][differential]") {
+    RunA32HostRegisterLocalityDifferential<ArmTestEnv>(0x10, 100000, ArmBlock(1));
+}
+
+TEST_CASE("A32: HostRegisterLocality differential: arm blocks", "[a32][differential]") {
+    RunA32HostRegisterLocalityDifferential<ArmTestEnv>(0x10, 20000, ArmBlock(12));
+}
+
+TEST_CASE("A32: HostRegisterLocality differential: thumb blocks", "[a32][differential]") {
+    RunA32HostRegisterLocalityDifferential<ThumbTestEnv>(0x1F0, 20000, ThumbBlock(8));
 }

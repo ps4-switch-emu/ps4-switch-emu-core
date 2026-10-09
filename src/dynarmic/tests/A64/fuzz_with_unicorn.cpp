@@ -7,7 +7,9 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -35,6 +37,27 @@
 #include <fmt/ostream.h>
 
 using namespace Dynarmic;
+
+// Instructions the generators skip: ones whose translation hits a fatal assert in this tree
+// (FP16 forms of the complex-number instructions).
+static bool SkipInFuzzing(u32 instruction) {
+    static const std::vector<InstructionGenerator> skipped = [] {
+        const std::vector<std::tuple<std::string, const char*>> list{
+#define INST(fn, name, bitstring) {#fn, bitstring},
+#include "dynarmic/frontend/A64/decoder/a64.inc"
+#undef INST
+        };
+        std::vector<InstructionGenerator> result;
+        for (const auto& [fn, bitstring] : list)
+            if (fn.starts_with("FCADD") || fn.starts_with("FCMLA"))
+                result.emplace_back(InstructionGenerator{bitstring});
+        return result;
+    }();
+    // The 0xCE crypto group (SHA512, SM3, SM4, ...): its emitters use absolute addresses that
+    // do not encode when the code buffer is far from the binary's data.
+    return (instruction >> 24) == 0xCE
+        || std::any_of(skipped.begin(), skipped.end(), [&](const auto& g) { return g.Match(instruction); });
+}
 
 static bool ShouldTestInst(u32 instruction, u64 pc, bool is_last_inst) {
     const A64::LocationDescriptor location{pc, {}};
@@ -114,7 +137,7 @@ static u32 GenRandomInst(u64 pc, bool is_last_inst) {
         if (std::any_of(instructions.invalid.begin(), instructions.invalid.end(), [inst](const auto& invalid) { return invalid.Match(inst); })) {
             continue;
         }
-        if (ShouldTestInst(inst, pc, is_last_inst)) {
+        if (!SkipInFuzzing(inst) && ShouldTestInst(inst, pc, is_last_inst)) {
             return inst;
         }
     }
@@ -151,7 +174,7 @@ static u32 GenFloatInst(u64 pc, bool is_last_inst) {
         const size_t index = RandInt<size_t>(0, instruction_generators.size() - 1);
         const u32 instruction = instruction_generators[index].Generate();
 
-        if (ShouldTestInst(instruction, pc, is_last_inst)) {
+        if (!SkipInFuzzing(instruction) && ShouldTestInst(instruction, pc, is_last_inst)) {
             return instruction;
         }
     }
@@ -512,4 +535,155 @@ TEST_CASE("A64: Large random block", "[a64][unicorn]") {
 
         RunTestInstance(jit, uni, jit_env, uni_env, conf, regs, vecs, start_address, instructions, pstate, fpcr);
     }
+}
+
+// Differential tests for OptimizationFlag::HostRegisterLocality: the same random blocks run in a
+// JIT with the optimization and in one without it must leave exactly the same state (registers,
+// vectors, flags, FPSR, memory). Needs no reference emulator, so it checks the optimization alone.
+static void RunHostRegisterLocalityDifferentialWith(const std::function<void(std::vector<u32>&)>& gen_block, bool floats, size_t iterations);
+
+static void RunHostRegisterLocalityDifferential(size_t block_size, bool floats, size_t iterations) {
+    RunHostRegisterLocalityDifferentialWith([&](std::vector<u32>& instructions) {
+        instructions.resize(block_size);
+        for (size_t i = 0; i < block_size; ++i) {
+            const bool last = i + 1 == block_size;
+            instructions[i] = floats && RandInt<size_t>(0, 3) != 0 ? GenFloatInst(i * 4, last) : GenRandomInst(i * 4, last);
+        }
+    }, floats, iterations);
+}
+
+static void RunHostRegisterLocalityDifferentialWith(const std::function<void(std::vector<u32>&)>& gen_block, bool floats, size_t iterations) {
+    A64TestEnv env_a{};
+    A64TestEnv env_b{};
+    Dynarmic::A64::UserConfig conf_a{GetUserConfig(env_a)};
+    Dynarmic::A64::UserConfig conf_b{GetUserConfig(env_b)};
+    conf_a.optimizations |= OptimizationFlag::HostRegisterLocality;
+    conf_b.optimizations &= ~OptimizationFlag::HostRegisterLocality;
+    if (std::getenv("DIFF_CONTROL"))  // both without: shows what differs without the optimization
+        conf_a.optimizations &= ~OptimizationFlag::HostRegisterLocality;
+    Dynarmic::A64::Jit jit_a{conf_a};
+    Dynarmic::A64::Jit jit_b{conf_b};
+    env_a.record_exceptions = env_b.record_exceptions = true;
+
+    static constexpr std::array<u64, 16> special_floats{
+        0x00000000, 0x80000000, 0x00000001, 0x007fffff, 0x00800000, 0x7f7fffff, 0x7f800000, 0xff800000,
+        0x7f800001, 0x7fbfffff, 0x7fc00000, 0xffffffff, 0x3f800000, 0xbf800000, 0x3f000000, 0x4b000001,
+    };
+    const auto gen_u64 = [floats] {
+        if (!floats || RandInt<size_t>(0, 2) == 0)
+            return RandInt<u64>(0, ~u64(0));
+        const auto half = [] { return RandInt<size_t>(0, 1) ? RandInt<u64>(0, 0xffffffff) : special_floats[RandInt<size_t>(0, special_floats.size() - 1)]; };
+        return (half() << 32) | half();
+    };
+
+    std::array<u64, 31> regs;
+    std::array<Vector, 32> vecs;
+    std::vector<u32> instructions;
+    for (size_t iteration = 0; iteration < iterations; ++iteration) {
+        std::generate(regs.begin(), regs.end(), gen_u64);
+        std::generate(vecs.begin(), vecs.end(), [&] { return Vector{gen_u64(), gen_u64()}; });
+        gen_block(instructions);
+        const u64 start_address = RandInt<u64>(0, 0x10'0000'0000) * 4;
+        const u64 initial_sp = RandInt<u64>(0x30'0000'0000, 0x40'0000'0000) * 4;
+        const u32 pstate = RandInt<u32>(0, 0xF) << 28;
+        const u32 fpcr = RandomFpcr();
+
+        std::string listing;
+        for (u32 instruction : instructions)
+            listing += fmt::format("{:08x} ", instruction);
+        INFO("Instructions: " << listing << " fpcr " << std::hex << fpcr);
+        if (std::getenv("DIFF_TRACE"))
+            fmt::print(stderr, "{}\n", listing);
+
+        for (auto [jit, env] : {std::pair{&jit_a, &env_a}, std::pair{&jit_b, &env_b}}) {
+            env->code_mem = instructions;
+            env->code_mem.emplace_back(0x14000000);  // B .
+            env->code_mem_start_address = start_address;
+            env->modified_memory.clear();
+            env->interrupts.clear();
+            env->code_mem_modified_by_guest = false;
+            jit->SetRegisters(regs);
+            jit->SetVectors(vecs);
+            jit->SetPC(start_address);
+            jit->SetSP(initial_sp);
+            jit->SetFpcr(fpcr);
+            jit->SetFpsr(0);
+            jit->SetPstate(pstate);
+            jit->ClearCache();
+            env->ticks_left = instructions.size();
+            CheckedRun([&]() { jit->Run(); });
+        }
+
+        if (std::getenv("DIFF_EXPLAIN") && jit_a.GetFpsr() != jit_b.GetFpsr()) {
+            // Print both optimized IRs of the block that differs.
+            for (const bool locality : {true, false}) {
+                IR::Block ir_block{A64::LocationDescriptor{start_address, FP::FPCR{fpcr}}};
+                A64::Translate(ir_block, A64::LocationDescriptor{start_address, FP::FPCR{fpcr}}, [&](u64 vaddr) { return env_a.MemoryReadCode(vaddr); }, {});
+                Optimization::Optimize(ir_block, locality ? conf_a : conf_b, {});
+                fmt::print("== {} (fpsr {:08x}):\n{}\n", locality ? "with" : "without", locality ? jit_a.GetFpsr() : jit_b.GetFpsr(), IR::DumpBlock(ir_block));
+            }
+        }
+        REQUIRE(env_a.code_mem_modified_by_guest == env_b.code_mem_modified_by_guest);
+        REQUIRE(jit_a.GetPC() == jit_b.GetPC());
+        REQUIRE(jit_a.GetRegisters() == jit_b.GetRegisters());
+        REQUIRE(jit_a.GetVectors() == jit_b.GetVectors());
+        REQUIRE(jit_a.GetSP() == jit_b.GetSP());
+        REQUIRE(jit_a.GetPstate() == jit_b.GetPstate());
+        REQUIRE(jit_a.GetFpsr() == jit_b.GetFpsr());
+        REQUIRE(env_a.modified_memory == env_b.modified_memory);
+        REQUIRE(env_a.interrupts == env_b.interrupts);
+    }
+}
+
+TEST_CASE("A64: HostRegisterLocality differential: single instructions", "[a64][differential]") {
+    RunHostRegisterLocalityDifferential(1, false, 100000);
+}
+
+TEST_CASE("A64: HostRegisterLocality differential: single FP instructions", "[a64][differential]") {
+    RunHostRegisterLocalityDifferential(1, true, 100000);
+}
+
+TEST_CASE("A64: HostRegisterLocality differential: small blocks", "[a64][differential]") {
+    RunHostRegisterLocalityDifferential(6, false, 30000);
+}
+
+TEST_CASE("A64: HostRegisterLocality differential: small FP blocks", "[a64][differential]") {
+    RunHostRegisterLocalityDifferential(6, true, 30000);
+}
+
+TEST_CASE("A64: HostRegisterLocality differential: large blocks", "[a64][differential]") {
+    RunHostRegisterLocalityDifferential(60, false, 3000);
+}
+
+TEST_CASE("A64: HostRegisterLocality differential: large FP blocks", "[a64][differential]") {
+    RunHostRegisterLocalityDifferential(60, true, 3000);
+}
+
+// Blocks ending in a flag-setting add/subtract (optionally followed by plain register writes)
+// and a conditional branch: the case where the branch reuses the host flags (all 16 conditions).
+TEST_CASE("A64: HostRegisterLocality differential: add/sub flags then B.cond", "[a64][differential]") {
+    static const std::vector<InstructionGenerator> flag_ops{
+        InstructionGenerator{"z0111010000mmmmm000000nnnnnddddd"},  // ADCS
+        InstructionGenerator{"z1111010000mmmmm000000nnnnnddddd"},  // SBCS
+        InstructionGenerator{"z0101011001mmmmmxxxiiinnnnnddddd"},  // ADDS (extended register)
+        InstructionGenerator{"z1101011001mmmmmxxxiiinnnnnddddd"},  // SUBS (extended register)
+        InstructionGenerator{"z0101011ss0mmmmmiiiiiinnnnnddddd"},  // ADDS (shifted register)
+        InstructionGenerator{"z1101011ss0mmmmmiiiiiinnnnnddddd"},  // SUBS (shifted register)
+        InstructionGenerator{"z0110001ssiiiiiiiiiiiinnnnnddddd"},  // ADDS (immediate)
+        InstructionGenerator{"z1110001ssiiiiiiiiiiiinnnnnddddd"},  // SUBS (immediate)
+    };
+    static const InstructionGenerator movz{"z10100101ssiiiiiiiiiiiiiiiiddddd"};
+    static const InstructionGenerator orr{"z0101010ss0mmmmmiiiiiinnnnnddddd"};
+    static const InstructionGenerator b_cond{"01010100iiiiiiiiiiiiiiiiiii0cccc"};
+    RunHostRegisterLocalityDifferentialWith([](std::vector<u32>& instructions) {
+        instructions.clear();
+        for (size_t i = RandInt<size_t>(0, 2); i > 0; --i)
+            instructions.push_back(GenRandomInst(instructions.size() * 4, false));
+        instructions.push_back(flag_ops[RandInt<size_t>(0, flag_ops.size() - 1)].Generate());
+        if (RandInt<size_t>(0, 2) == 0)  // a plain register write in between (no flag change)
+            instructions.push_back(movz.Generate());
+        if (RandInt<size_t>(0, 5) == 0)  // or one that changes the host flags
+            instructions.push_back(orr.Generate());
+        instructions.push_back(b_cond.Generate());
+    }, false, 200000);
 }

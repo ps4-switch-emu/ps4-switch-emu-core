@@ -300,6 +300,15 @@ HostLoc RegAlloc::UseScratchImpl(BlockOfCode& code, IR::Value use_value, std::bi
         if (LocInfo(current_location).IsLastUse()) {
             LocInfo(current_location).is_set_last_use = true;
         } else {
+            // The value is still needed: scratch a copy in a free register if there is one,
+            // instead of spilling the value to the stack and reloading it at every later use
+            // (store-forwarded loads are slow, especially on the PS4's Jaguar cores).
+            const HostLoc free_location = scratch_into_free_registers ? SelectARegister(desired_locations) : current_location;
+            if (free_location != current_location && HostLocIsRegister(free_location) && LocInfo(free_location).IsEmpty()) {
+                CopyToScratch(code, bit_width, free_location, current_location);
+                LocInfo(free_location).WriteLock();
+                return free_location;
+            }
             MoveOutOfTheWay(code, current_location);
         }
         LocInfo(current_location).WriteLock();

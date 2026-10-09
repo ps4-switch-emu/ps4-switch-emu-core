@@ -42,6 +42,29 @@ void OpenFile() {
 
     std::setvbuf(file, nullptr, _IONBF, 0);
 }
+
+// EDEN_JIT_DUMP=<file>: also saves each registered block's machine code (u64 address, u32 size,
+// u32 name length, name, code) so the hottest blocks of a perf profile can be disassembled.
+std::FILE* dump_file = nullptr;
+bool dump_opened = false;
+
+void DumpCode(const void* start, const void* end, std::string_view friendly_name) {
+    if (!dump_opened) {
+        dump_opened = true;
+        if (const char* path = std::getenv("EDEN_JIT_DUMP"))
+            dump_file = std::fopen(path, "wb");
+    }
+    if (!dump_file)
+        return;
+    const u64 address = reinterpret_cast<u64>(start);
+    const u32 size = u32(reinterpret_cast<u64>(end) - address);
+    const u32 name_size = u32(friendly_name.size());
+    std::fwrite(&address, sizeof address, 1, dump_file);
+    std::fwrite(&size, sizeof size, 1, dump_file);
+    std::fwrite(&name_size, sizeof name_size, 1, dump_file);
+    std::fwrite(friendly_name.data(), 1, name_size, dump_file);
+    std::fwrite(start, 1, size, dump_file);
+}
 }  // anonymous namespace
 
 namespace detail {
@@ -52,6 +75,7 @@ void PerfMapRegister(const void* start, const void* end, std::string_view friend
     }
 
     std::lock_guard guard{mutex};
+    DumpCode(start, end, friendly_name);
 
     if (!file) {
         OpenFile();

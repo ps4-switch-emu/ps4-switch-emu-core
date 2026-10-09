@@ -111,6 +111,7 @@ A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
             gprs.reset(size_t(HostLoc::R14));
         return gprs;
     }(), any_xmm);
+    reg_alloc.scratch_into_free_registers = conf.HasOptimization(OptimizationFlag::HostRegisterLocality);
 
     A32EmitContext ctx{conf, reg_alloc, block, shared_labels};
 

@@ -14,6 +14,7 @@
 
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/emit_x64.h"
+#include "dynarmic/interface/optimization_flags.h"
 #include "dynarmic/ir/basic_block.h"
 #include "dynarmic/ir/microinstruction.h"
 #include "dynarmic/ir/opcodes.h"
@@ -928,6 +929,31 @@ static void EmitAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, size_t 
 
     // Consider using LEA.
     if (!carry_inst && !overflow_inst && !nzcv_inst && carry_in.IsImmediate() && !carry_in.GetImmediateU1()) {
+        if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate()) {
+            // LEA from the source into a fresh register: one instruction whether or not the
+            // source is still needed (UseScratchGpr would first copy a still-live base address).
+            // A 64-bit address with a 32-bit destination gives the same zero-extended sum.
+            const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
+            if (args[1].IsImmediate() && args[1].FitsInImmediateS32()) {
+                const Xbyak::Reg result = ctx.reg_alloc.ScratchGpr(code).changeBit(bitsize);
+                code.lea(result, code.ptr[source + args[1].GetImmediateS32()]);
+                ctx.reg_alloc.DefineValue(code, inst, result);
+                return;
+            }
+            if (!args[1].IsImmediate()) {
+                const Xbyak::Reg64 op2 = ctx.reg_alloc.UseGpr(code, args[1]);
+                const Xbyak::Reg result = ctx.reg_alloc.ScratchGpr(code).changeBit(bitsize);
+                code.lea(result, code.ptr[source + op2]);
+                ctx.reg_alloc.DefineValue(code, inst, result);
+                return;
+            }
+            // Immediate too large for a displacement: materialise it and add.
+            const Xbyak::Reg result = ctx.reg_alloc.ScratchGpr(code).changeBit(bitsize);
+            code.mov(result, args[1].GetImmediateU64());
+            code.add(result, source.changeBit(bitsize));
+            ctx.reg_alloc.DefineValue(code, inst, result);
+            return;
+        }
         if (args[1].IsImmediate() && args[1].FitsInImmediateS32()) {
             Xbyak::Reg const result = ctx.reg_alloc.UseScratchGpr(code, args[0]).changeBit(bitsize);
             code.lea(result, code.ptr[result + args[1].GetImmediateS32()]);
@@ -1034,10 +1060,16 @@ static void EmitSub(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bit
 
     bool invert_output_carry = true;
 
+    // A 64-bit immediate that fits a sign-extended imm32 can be encoded directly instead of
+    // being loaded into a register first.
+    const bool imm_s32 = bitsize == 64 && args[1].IsImmediate() && args[1].FitsInImmediateS32()
+        && ctx.HasOptimization(OptimizationFlag::HostRegisterLocality);
     if (is_cmp) {
         if (args[1].IsImmediate() && args[1].GetType() == IR::Type::U32) {
             const u32 op_arg = args[1].GetImmediateU32();
             code.cmp(result, op_arg);
+        } else if (imm_s32) {
+            code.cmp(result, u32(args[1].GetImmediateS32()));  // sign-extended back by the CPU
         } else {
             OpArg op_arg = ctx.reg_alloc.UseOpArg(code, args[1]);
             op_arg.setBit(bitsize);
@@ -1057,6 +1089,8 @@ static void EmitSub(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, int bit
             code.adc(result, ~op_arg);
             invert_output_carry = false;
         }
+    } else if (imm_s32 && carry_in.IsImmediate() && carry_in.GetImmediateU1()) {
+        code.sub(result, u32(args[1].GetImmediateS32()));  // sign-extended back by the CPU
     } else {
         OpArg op_arg = ctx.reg_alloc.UseOpArg(code, args[1]);
         op_arg.setBit(bitsize);
@@ -1509,6 +1543,14 @@ void EmitX64::EmitZeroExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (args[0].IsInXmm(ctx.reg_alloc) && code.HasHostFeature(HostFeature::SSE41) && ctx.HasOptimization(OptimizationFlag::HostRegisterLocality)) {
+        // A scalar FP result on its way back into a vector register (ZeroExtendToQuad): stay in
+        // the vector register instead of a movd to a GPR and a movq back.
+        const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(code, args[0]);
+        code.insertps(result, result, 0b00001110);
+        ctx.reg_alloc.DefineValue(code, inst, result);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(code, args[0]);
     code.mov(result.cvt32(), result.cvt32());  // x64 zeros upper 32 bits on a 32-bit move
     ctx.reg_alloc.DefineValue(code, inst, result);
@@ -1516,6 +1558,13 @@ void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendLongToQuad(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && args[0].IsInXmm(ctx.reg_alloc)
+        && !inst->GetArg(0).IsImmediate() && inst->GetArg(0).GetInstRecursive()->GetOpcode() == IR::Opcode::ZeroExtendWordToLong) {
+        // A zero-extended word in a vector register is zero above bit 31 already (insertps in
+        // EmitZeroExtendWordToLong, or movq/movsd when the allocator moved it there).
+        ctx.reg_alloc.DefineValue(code, inst, args[0]);
+        return;
+    }
     if (args[0].IsInGpr(ctx.reg_alloc)) {
         const Xbyak::Reg64 source = ctx.reg_alloc.UseGpr(code, args[0]);
         const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm(code);

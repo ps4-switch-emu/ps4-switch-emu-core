@@ -39,6 +39,12 @@ enum class OptimizationFlag : std::uint32_t {
     CodeSpeed = 0x00000040,
     /// Disable verification passes
     DisableVerification = 0x00000080,
+    /// Keeps values in the kind of host register they are used in: scalar FP lanes stay in
+    /// vector registers instead of crossing to general-purpose registers and back, and scratch
+    /// copies of values that are still needed go into free registers instead of the stack.
+    /// GPR<->XMM transfers and store-forwarded reloads are slow on low-power x86 cores (the PS4's
+    /// Jaguar). This is a safe optimization.
+    HostRegisterLocality = 0x00000100,
 
     /// This is an UNSAFE optimization that reduces accuracy of fused multiply-add operations.
     /// This unfuses fused instructions to improve performance on host CPUs without FMA support.

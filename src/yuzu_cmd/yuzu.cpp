@@ -51,6 +51,7 @@
 #include "input_common/drivers/virtual_gamepad.h"
 #include <cmath>
 #include <cstdlib>
+#include <condition_variable>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -534,6 +535,22 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         PS4_TRACE("main: cpu {:.0f} MHz measured, {} MHz reported, Pro mode {} (has {}), cpu mode {}, TSC {} MHz",
                   double(kIterations) / seconds / 1e6, u32(sceKernelGetCpuFrequency()) / 1000000,
                   sceKernelIsNeoMode(), sceKernelHasNeoMode(), sceKernelGetCpumode(), tsc / 1000000);
+    }
+    {
+        // How precisely a timed wait wakes up (the emulated timers - vsync among them - fire from
+        // one): average and worst lateness of 20 waits of 1 ms.
+        std::mutex mutex;
+        std::condition_variable cv;
+        double total_us = 0, worst_us = 0;
+        for (int i = 0; i < 20; i++) {
+            std::unique_lock lock{mutex};
+            const auto t0 = std::chrono::steady_clock::now();
+            cv.wait_for(lock, std::chrono::milliseconds(1));
+            const double late = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() - 1000.0;
+            total_us += late;
+            worst_us = std::max(worst_us, late);
+        }
+        PS4_TRACE("main: 1 ms timed waits late by {:.0f} us on average, {:.0f} us at worst", total_us / 20, worst_us);
     }
     {
         // What the JIT can use on this CPU (dynarmic picks slower fallbacks for what's missing).
