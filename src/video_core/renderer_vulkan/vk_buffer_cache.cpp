@@ -368,7 +368,7 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
 #ifdef __OPENORBIS__
     // The PS4's GPU memory is the CPU's (unified): idle buffers can be written in place. Opt-in
     // (an empty file /data/switch-emu/direct-upload) until tested on the console - on the PC it
-    // renders identically, but Mario's opening uploads only ~0.7 MB/s of buffers, so the copy it
+    // renders identically, but a 3D game's opening uploaded only ~0.7 MB/s of buffers, so the copy it
     // saves is small there; the perf trace's "uploads" figures show what a game moves.
     if (std::FILE* f = std::fopen("/data/switch-emu/direct-upload", "r")) {
         std::fclose(f);
