@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <cstdio>
 
 #include "common/scope_exit.h"
@@ -318,14 +319,22 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
 
     // Determine random placements for each region.
     size_t alias_rnd = 0, heap_rnd = 0, stack_rnd = 0, kmap_rnd = 0;
-    if (enable_aslr) {
+    // The PS4 keeps every region low, even for games that ask for ASLR (one 2D game's heap
+    // landed at 133 GiB, far above the 16 GiB fastmem arena: every heap access took the slow
+    // path, ~7x the CPU time). Randomizing protects nothing in an emulator; games read their
+    // regions from svcGetInfo. EDEN_LOW_LAYOUT=1 does the same on a PC (to test it there).
+#ifdef __OPENORBIS__
+    constexpr bool low_layout = true;
+#else
+    static const bool low_layout = std::getenv("EDEN_LOW_LAYOUT") != nullptr;
+#endif
+    if (enable_aslr && !low_layout) {
         alias_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
         heap_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
         stack_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
         kmap_rnd = KSystemControl::GenerateRandomRange(0, remaining_size / RegionAlignment) * RegionAlignment;
     }
-#ifdef __OPENORBIS__
-    else if (remaining_size >= 3 * RegionAlignment) {
+    else if (low_layout && remaining_size >= 3 * RegionAlignment) {
         // Order heap, stack, kernel map, then alias (the rnd values only decide the order here):
         // the busy regions sit right after the code, inside the PS4's fastmem arena (16 GiB on
         // hardware), with the 64+ GiB alias region last instead of first.
@@ -334,7 +343,6 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
         kmap_rnd = 2 * RegionAlignment;
         alias_rnd = 3 * RegionAlignment;
     }
-#endif
 
     // Setup heap and alias regions.
     m_alias_region_start = alloc_start + alias_rnd;

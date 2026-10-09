@@ -403,9 +403,10 @@ constexpr uint32_t kUp = 0x0010, kDown = 0x0040, kLeft = 0x0080, kRight = 0x0020
                    kOptions = 0x0008, kL1 = 0x0400, kR1 = 0x0800, kTriangle = 0x1000, kCircle = 0x2000,
                    kSquare = 0x8000;
 
-struct PadData { // OrbisPadData: only the button word and the connected flag are used
+struct PadData { // OrbisPadData: the button word and the left stick are used
     uint32_t buttons;
-    uint8_t rest[0x200]; // larger than the real struct, whatever its size in this SDK version
+    uint8_t left_x, left_y; // 0..255, 128 centre (up is 0)
+    uint8_t rest[0x200];    // larger than the real struct, whatever its size in this SDK version
 };
 
 bool FileExists(const char* name) {
@@ -647,12 +648,15 @@ public:
             return 0;
         }
         PadData data{};
+        data.left_x = data.left_y = 128;
         if (scePadReadState(handle, &data) != 0)
             return 0;
-        uint32_t pressed = data.buttons & ~previous;
-        previous = data.buttons;
+        // The left stick works like the D-pad (and repeats like it when held).
+        const uint32_t buttons = data.buttons | StickDirection(data.left_x, data.left_y);
+        uint32_t pressed = buttons & ~previous;
+        previous = buttons;
         constexpr uint32_t kDirections = 0x0010 | 0x0020 | 0x0040 | 0x0080;
-        const uint32_t held = data.buttons & kDirections;
+        const uint32_t held = buttons & kDirections;
         const double t = Now();
         if (held == 0 || (pressed & kDirections)) {
             repeat_at = t + 0.40;
@@ -667,6 +671,20 @@ public:
     }
 
 private:
+    // The stick as one D-pad direction: the larger axis wins (no diagonals); pushed past ~55%
+    // it counts, and it lets go below ~30% (so it doesn't flicker at the edge).
+    uint32_t StickDirection(uint8_t x, uint8_t y) {
+        constexpr uint32_t kUpBit = 0x0010, kRightBit = 0x0020, kDownBit = 0x0040, kLeftBit = 0x0080;
+        const int dx = int(x) - 128, dy = int(y) - 128;
+        const int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+        const int amount = ax > ay ? ax : ay;
+        if (amount >= 70)
+            stick = ax >= ay ? (dx < 0 ? kLeftBit : kRightBit) : (dy < 0 ? kUpBit : kDownBit);
+        else if (amount < 38)
+            stick = 0;
+        return stick;
+    }
+
     void Open() {
         int32_t user = -1;
         if (sceUserServiceGetInitialUser(&user) == 0 && user >= 0)
@@ -682,6 +700,7 @@ private:
     uint32_t previous = ~0u; // ignore buttons already held at start
     int retry = 0;
     double repeat_at = 0;
+    uint32_t stick = 0; // the stick's current direction bit
 };
 
 // Navigation sounds while the launcher shows: short synthesized tones on their own audio port,

@@ -69,7 +69,7 @@ new file mode 100644
 index 0000000..1111111
 --- /dev/null
 +++ b/src/joystick/ps4/SDL_sysjoystick.c
-@@ -0,0 +1,408 @@
+@@ -0,0 +1,410 @@
 +/*
 +Simple DirectMedia Layer
 +Copyright (C) 1997-2019 Sam Lantinga <slouken@libsdl.org>
@@ -315,10 +315,12 @@ index 0000000..1111111
 +	return true;
 +}
 +
-+/* 0..255 stick (128 centre) to -32768..32767 */
++/* 0..255 stick (128 centre) to -32768..32767: each half scaled on its own (one formula for both
++ * overflowed at 0 - fully left or up - and wrapped to fully right or down) */
 +static Sint16 StickAxis(uint8_t v)
 +{
-+	return (Sint16)(((int)v - 128) * 257 + ((v >= 128) ? 127 : 0));
++	const int d = (int)v - 128;
++	return (Sint16)(d < 0 ? d * 256 : d * 32767 / 127);
 +}
 +
 +/* 0..255 trigger to the trigger axis range -32768..32767 that SDL's mappings expect */

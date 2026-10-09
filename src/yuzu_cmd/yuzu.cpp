@@ -48,6 +48,7 @@
 #include "input_common/main.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -1039,10 +1040,24 @@ static u32 PS4GamepadButtons() {
     int count = 0;
     if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
         if (count > 0)
-            if (SDL_Gamepad* gp = SDL_GetGamepadFromID(ids[0]))
+            if (SDL_Gamepad* gp = SDL_GetGamepadFromID(ids[0])) {
                 for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT && b < 32; b++)
                     if (SDL_GetGamepadButton(gp, SDL_GamepadButton(b)))
                         bits |= 1u << b;
+                // The left stick works like the D-pad: the larger axis wins, counted past ~55%,
+                // let go below ~30% (as in the launcher, ps4_menu.cpp).
+                static u32 s_stick = 0;
+                const int x = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX);
+                const int y = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTY);
+                const int amount = std::max(std::abs(x), std::abs(y));
+                if (amount >= 18000)
+                    s_stick = 1u << (std::abs(x) >= std::abs(y)
+                                         ? (x < 0 ? SDL_GAMEPAD_BUTTON_DPAD_LEFT : SDL_GAMEPAD_BUTTON_DPAD_RIGHT)
+                                         : (y < 0 ? SDL_GAMEPAD_BUTTON_DPAD_UP : SDL_GAMEPAD_BUTTON_DPAD_DOWN));
+                else if (amount < 10000)
+                    s_stick = 0;
+                bits |= s_stick;
+            }
         SDL_free(ids);
     }
     return bits;
