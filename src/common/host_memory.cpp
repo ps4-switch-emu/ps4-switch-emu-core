@@ -776,6 +776,10 @@ public:
             Trace("fastmem: off (no direct memory aliasing)");
             return;
         }
+        if (stat("/data/switch-emu/eager-fastmem", &st) == 0) {
+            lazy_map = false;
+            Trace("fastmem: lazy mapping off (/data/switch-emu/eager-fastmem)");
+        }
         // The whole 39-bit guest space (512 GiB) is refused (0x8002000c on hardware): take the
         // largest power of two the kernel gives. dynarmic then bounds-checks against it and sends
         // accesses above it down the slow path (ArmDynarmic64/32 set fastmem_address_space_bits).
@@ -876,9 +880,49 @@ public:
     /// Fault on the backing range: commit the chunk and retry. False for any other address.
     bool HandleFault(uintptr_t address) {
         const uintptr_t offset = address - uintptr_t(backing_base);
-        if (!backing_base || offset >= backing_bytes)
+        if (backing_base && offset < backing_bytes)
+            return Commit(offset / Chunk) >= 0;
+        return HandleDeferredFault(address);
+    }
+
+    /// A JIT access to a deferred block of the fastmem view: commit its chunk and map every
+    /// deferred block backed by that chunk, then retry. (Runs in the SIGSEGV handler on a thread
+    /// in JIT code, which holds neither lock; takes them in Update's order and allocates nothing.)
+    bool HandleDeferredFault(uintptr_t address) {
+        const uintptr_t offset = address - uintptr_t(virtual_base);
+        if (!virtual_base || offset >= arena_size || !lazy_map)
             return false;
-        return Commit(offset / Chunk) >= 0;
+        std::scoped_lock lk{mutex};
+        const auto it = blocks.find(offset / HostPage);
+        if (it == blocks.end() || !it->second.deferred)
+            return false;
+        const size_t chunk_index = size_t(it->second.applied_page - 1) * GuestPage / Chunk;
+        const off_t phys = Commit(chunk_index);
+        if (phys < 0)
+            return false;
+        const auto map_deferred = [&](u64 index, Block& b) {
+            const size_t host_offset = size_t(b.applied_page - 1) * GuestPage;
+            if (!b.deferred || host_offset / Chunk != chunk_index)
+                return; // remapped or unmapped since
+            void* addr = virtual_base + index * HostPage;
+            sceKernelMunmap(addr, HostPage); // the reservation
+            void* target = addr;
+            const int32_t r = sceKernelMapDirectMemory(&target, HostPage, b.applied_prot, MapFixed,
+                                                       phys + off_t(host_offset % Chunk), HostPage);
+            if (r != 0 && failures++ < 16)
+                Trace("fastmem: deferred map at %p failed (%#x)", addr, unsigned(r));
+            b.deferred = false;
+            deferred_blocks--;
+            deferred_mapped++;
+        };
+        map_deferred(it->first, it->second); // the faulting block first, list or not
+        if (const auto list = deferred_by_chunk.find(chunk_index); list != deferred_by_chunk.end()) {
+            for (const u64 index : list->second)
+                if (const auto bit = blocks.find(index); bit != blocks.end())
+                    map_deferred(index, bit->second);
+            list->second.clear(); // keeps its storage: nothing is freed in the signal handler
+        }
+        return true;
     }
 
     u8* backing_base{};
@@ -957,6 +1001,9 @@ private:
         u8 perm[Sub]{};    ///< MemoryPermission per guest page
         u32 applied_page{}; ///< first backing page index + 1 currently mapped here; 0 = none
         u8 applied_prot{};
+        /// Mapping wanted (applied_page/prot) but not made yet: its DRAM chunk is uncommitted.
+        /// The first access faults; HandleFault commits the chunk and maps it then.
+        bool deferred{};
     };
 
     /// What a block should be: the backing page index + 1 of its first guest page and the
@@ -1003,7 +1050,26 @@ private:
                 sceKernelMunmap(addr, size);
                 void* target = addr;
                 const size_t host_offset = size_t(run_page - 1) * GuestPage;
-                const off_t chunk = Commit(host_offset / Chunk);
+                const size_t chunk_index = host_offset / Chunk;
+                bool committed = true;
+                if (lazy_map) {
+                    std::scoped_lock lk{commit_mutex};
+                    committed = chunk_phys[chunk_index] >= 0;
+                }
+                if (!committed) {
+                    // Nothing has used this DRAM yet: don't commit it just to map it (mapping a
+                    // game's whole heap committed ~3 GiB of direct memory at boot, leaving little
+                    // for the GPU). Keep the range reserved; the first access commits and maps it.
+                    void* hole = addr;
+                    r = sceKernelReserveVirtualRange(&hole, size, MapFixed, HostPage);
+                    for (u64 i = 0; i < run_count; i++) {
+                        blocks[run_start + i].deferred = true;
+                        deferred_by_chunk[chunk_index].push_back(run_start + i);
+                    }
+                    deferred_blocks += run_count;
+                    break;
+                }
+                const off_t chunk = Commit(chunk_index);
                 r = chunk < 0 ? -1
                               : sceKernelMapDirectMemory(&target, size, run_prot, MapFixed,
                                                          chunk + off_t(host_offset % Chunk), HostPage);
@@ -1042,6 +1108,17 @@ private:
                 action = Action::Map;
             else if (page != 0 && prot != b.applied_prot)
                 action = Action::Protect;
+            if (b.deferred) {
+                // Not mapped yet: a new protection only needs remembering; mapping elsewhere or
+                // unmapping replaces the deferral (the range is a reserved hole either way).
+                if (action == Action::Protect) {
+                    b.applied_prot = prot;
+                    action = Action::None;
+                } else if (action != Action::None) {
+                    b.deferred = false;
+                    deferred_blocks--;
+                }
+            }
             if (action == Action::None) {
                 flush();
             } else {
@@ -1103,6 +1180,11 @@ public:
               when, (unsigned long long)updates, (unsigned long long)calls, (unsigned long long)mapped_blocks,
               (unsigned long long)(mapped_blocks * HostPage >> 20), blocks.size(), incomplete, misaligned, mixed,
               no_read);
+        Trace("fastmem (%s): lazy mapping %s: %llu blocks (%llu MiB) waiting for first use, %llu mapped on use; "
+              "%zu MiB of emulated DRAM committed",
+              when, lazy_map ? "on" : "off", (unsigned long long)deferred_blocks,
+              (unsigned long long)(deferred_blocks * HostPage >> 20), (unsigned long long)deferred_mapped,
+              committed_chunks * Chunk >> 20);
     }
 
 private:
@@ -1222,6 +1304,12 @@ private:
     size_t arena_size{};
     std::mutex mutex;
     std::unordered_map<u64, Block> blocks;
+    /// Deferred blocks per DRAM chunk (indices; stale entries are skipped).
+    std::unordered_map<size_t, std::vector<u64>> deferred_by_chunk;
+    /// Map fastmem blocks of uncommitted DRAM on first access instead of committing it to map
+    /// it. /data/switch-emu/eager-fastmem turns it off.
+    bool lazy_map{true};
+    u64 deferred_blocks{}, deferred_mapped{};
     u64 updates{}, calls{}, mapped_blocks{}, failures{};
     int logged_maps{};
 };

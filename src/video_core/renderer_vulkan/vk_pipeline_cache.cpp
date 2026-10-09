@@ -5,8 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -814,27 +816,31 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
 #ifdef __OPENORBIS__
-    // Geometry shaders hang/kill the PS4 GPU through RADV-on-GNM (its ES->GS ring overruns into
-    // the next buffer; DolphinPS4 hit the same). Skip such draws (a null pipeline makes the
-    // rasterizer skip them) instead of losing the whole session.
-    // Tessellation goes the same way: its factor and off-chip rings are kernel-owned state that
-    // nothing sets up through GNM (deko3d's tessellation example died silently at its first draw).
-    const auto uses = [&key](Maxwell::ShaderType type) {
-        return key.unique_hashes[static_cast<size_t>(type)] != 0;
-    };
-    if (uses(Maxwell::ShaderType::Geometry)) {
-        static bool s_logged = false;
-        if (!std::exchange(s_logged, true))
-            LOG_WARNING(Render_Vulkan, "PS4: skipping draws that use a geometry shader");
-        return nullptr;
-    }
-    if (uses(Maxwell::ShaderType::TessellationInit) || uses(Maxwell::ShaderType::Tessellation)) {
-        static bool s_logged = false;
-        if (!std::exchange(s_logged, true))
-            LOG_WARNING(Render_Vulkan, "PS4: skipping draws that use tessellation");
-        return nullptr;
-    }
+    constexpr bool ps4_gpu_limits = true;
+#else
+    // PC test of what the PS4 renders: EDEN_PS4_GPU_LIMITS=1 skips the same draws.
+    static const bool ps4_gpu_limits = std::getenv("EDEN_PS4_GPU_LIMITS") != nullptr;
 #endif
+    if (ps4_gpu_limits) {
+        // Geometry shaders hang/kill the PS4 GPU through RADV-on-GNM (its ES->GS ring overruns into
+        // the next buffer; DolphinPS4 hit the same). Skip such draws (a null pipeline makes the
+        // rasterizer skip them) instead of losing the whole session.
+        // Tessellation goes the same way: its factor and off-chip rings are kernel-owned state that
+        // nothing sets up through GNM (deko3d's tessellation example died silently at its first draw).
+        const auto uses = [&key](Maxwell::ShaderType type) {
+            return key.unique_hashes[static_cast<size_t>(type)] != 0;
+        };
+        const bool geometry = uses(Maxwell::ShaderType::Geometry);
+        const bool tessellation = uses(Maxwell::ShaderType::TessellationInit) || uses(Maxwell::ShaderType::Tessellation);
+        if (geometry || tessellation) {
+            static std::atomic<u32> s_skipped{0};
+            const u32 n = ++s_skipped;
+            if (n <= 64 || n % 64 == 0)
+                LOG_WARNING(Render_Vulkan, "PS4: skipping draws of pipeline {:016x} ({}), {} pipelines skipped so far",
+                            hash, geometry ? "geometry shader" : "tessellation", n);
+            return nullptr;
+        }
+    }
     size_t env_index{0};
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     const bool uses_vertex_a{key.unique_hashes[0] != 0};
