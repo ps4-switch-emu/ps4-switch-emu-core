@@ -185,10 +185,13 @@ finish_this_inst:
     code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
     nzcv_in_host_flags = conf.HasOptimization(OptimizationFlag::HostRegisterLocality) && !conf.enable_cycle_counting
         && NzcvInHostFlagsAtBlockEnd(block);
+    check_bit_in_flags = conf.HasOptimization(OptimizationFlag::HostRegisterLocality) && !conf.enable_cycle_counting
+        && !block.instructions.empty() && block.instructions.back().GetOpcode() == IR::Opcode::A64SetCheckBit;
     block_writes_fpcr = std::any_of(block.instructions.begin(), block.instructions.end(),
                                     [](const IR::Inst& i) { return i.GetOpcode() == IR::Opcode::A64SetFPCR; });
     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
     nzcv_in_host_flags = false;
+    check_bit_in_flags = false;
     code.int3();
     for (auto& deferred_emit : ctx.deferred_emits)
         deferred_emit();
@@ -310,6 +313,11 @@ void A64EmitX64::EmitA64SetCheckBit(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     const Xbyak::Reg8 to_store = ctx.reg_alloc.UseGpr(code, args[0]).cvt8();
     code.mov(code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], to_store);
+    if (inst == &ctx.block.instructions.back() && ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !conf.enable_cycle_counting) {
+        // The block's last instruction: leave the flags testing the bit for the CheckBit terminal
+        // (nothing after this changes them), so its branch doesn't wait on the store above.
+        code.test(to_store, to_store);
+    }
 }
 
 void A64EmitX64::EmitA64GetCFlag(A64EmitContext& ctx, IR::Inst* inst) {
@@ -812,7 +820,8 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::If terminal, IR::LocationDescript
 
 bool EmitTerminalImpl(A64EmitX64& e, IR::Term::CheckBit terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
     Xbyak::Label fail;
-    e.code.cmp(e.code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
+    if (!std::exchange(e.check_bit_in_flags, false))
+        e.code.cmp(e.code.byte[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, check_bit)], u8(0));
     e.code.jz(fail);
     e.EmitLeafTerminal(terminal.then_, initial_location, is_single_step);
     e.code.L(fail);

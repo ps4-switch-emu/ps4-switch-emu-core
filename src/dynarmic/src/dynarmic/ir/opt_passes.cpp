@@ -1191,6 +1191,24 @@ static void ConstantPropagation(IR::Block& block) {
     }
 }
 
+// A vector register read only for its lane 0 (scalar FP reads it as VectorGetElement(GetQ, 0)) needs
+// only that lane: load it as GetS/GetD (movd/movq, zero above) instead of all 128 bits, so the
+// element needs no clearing above it (HostRegisterLocality). Runs after GetSetElimination, so it
+// narrows real loads only and changes nothing about which reads and writes are forwarded.
+static void A64NarrowScalarLoads(IR::Block& block) {
+    for (auto& inst : block.instructions) {
+        const auto opcode = inst.GetOpcode();
+        if (opcode != IR::Opcode::VectorGetElement32 && opcode != IR::Opcode::VectorGetElement64)
+            continue;
+        if (!inst.GetArg(1).IsImmediate() || inst.GetArg(1).GetU8() != 0 || inst.GetArg(0).IsImmediate())
+            continue;
+        IR::Inst* const load = inst.GetArg(0).GetInst();
+        if (load->GetOpcode() != IR::Opcode::A64GetQ || load->UseCount() != 1)
+            continue;
+        load->op = opcode == IR::Opcode::VectorGetElement32 ? IR::Opcode::A64GetS : IR::Opcode::A64GetD;
+    }
+}
+
 static void DeadCodeElimination(IR::Block& block) {
     // We iterate over the instructions in reverse order.
     // This is because removing an instruction reduces the number of uses for earlier instructions.
@@ -1468,6 +1486,9 @@ void Optimize(IR::Block& block, const A64::UserConfig& conf, const Optimization:
     if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && !conf.check_halt_on_memory_access) {
         Optimization::A64GetSetElimination(block);
         Optimization::DeadCodeElimination(block);
+    }
+    if (conf.HasOptimization(OptimizationFlag::HostRegisterLocality)) {
+        Optimization::A64NarrowScalarLoads(block);
     }
     if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
         Optimization::ConstantPropagation(block);

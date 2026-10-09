@@ -145,6 +145,9 @@ public:
     const void* terminal_handler_rsb_miss = nullptr;
     /// The fast dispatch handler's table-miss path (descriptor in rbx, table entry in r12).
     const void* terminal_handler_fast_dispatch_miss = nullptr;
+    /// Set around EmitTerminal when the block's last instruction stored the check bit and left
+    /// the host flags testing it (ZF = bit is 0): the CheckBit terminal branches on them.
+    bool check_bit_in_flags = false;
     /// Whether the block being emitted writes FPCR (its exit descriptor's FPCR is then unknown).
     bool block_writes_fpcr = false;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;

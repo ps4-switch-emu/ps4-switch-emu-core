@@ -1411,7 +1411,15 @@ static Xbyak::Reg64 SetFpscrNzcvFromFlags(BlockOfCode& code, EmitContext& ctx) {
 
     code.mov(nzcv, 0x0101'4100'8000'0100);
     code.sete(cl);
-    code.rcl(cl, 5);  // cl = ZF:CF:0000
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality)) {
+        // The same shift count from single-cycle instructions: rcl by more than 1 is microcoded
+        // on AMD's small cores (Jaguar), and every FCMP pays for it.
+        code.movzx(ecx, cl);    // ZF (movzx leaves CF alone)
+        code.adc(ecx, ecx);     // ZF:CF
+        code.shl(ecx, 4);       // ZF:CF:0000
+    } else {
+        code.rcl(cl, 5);  // cl = ZF:CF:0000
+    }
     code.shr(nzcv, cl);
 
     return nzcv;

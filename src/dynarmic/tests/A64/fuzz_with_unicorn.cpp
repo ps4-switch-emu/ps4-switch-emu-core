@@ -871,3 +871,27 @@ TEST_CASE("A64: HostRegisterLocality differential: blocks (wall clock)", "[a64][
 TEST_CASE("A64: HostRegisterLocality differential: FP blocks (wall clock)", "[a64][differential]") {
     RunWallClockBlocks(8, true, 30000);
 }
+
+// Compare-and-branch / test-bit-and-branch ending a block (the CheckBit terminal, which branches on
+// the host flags when the check bit was the block's last store), with the emulator's settings.
+TEST_CASE("A64: HostRegisterLocality differential: CBZ / TBZ (wall clock)", "[a64][differential]") {
+    RunHostRegisterLocalityDifferentialWith([](std::vector<u32>& instructions) {
+        instructions.clear();
+        for (size_t i = RandInt<size_t>(0, 3); i > 0; --i)
+            instructions.push_back(GenRandomInst(instructions.size() * 4, false));
+        const u32 rt = RandInt<u32>(0, 31);
+        switch (RandInt<u32>(0, 3)) {
+        case 0:  // CBZ / CBNZ Wt|Xt, +8
+        case 1:
+            instructions.push_back((RandInt<u32>(0, 1) << 31) | 0x34000000 | (RandInt<u32>(0, 1) << 24) | (2 << 5) | rt);
+            break;
+        default: {  // TBZ / TBNZ Rt, #bit, +8
+            const u32 bit = RandInt<u32>(0, 63);
+            instructions.push_back(((bit >> 5) << 31) | 0x36000000 | (RandInt<u32>(0, 1) << 24) | ((bit & 31) << 19) | (2 << 5) | rt);
+            break;
+        }
+        }
+        instructions.push_back(0xD4000001);  // SVC #0 (not taken)
+        instructions.push_back(0xD4000021);  // SVC #1 (taken)
+    }, false, 200000, {.fast_dispatch = true, .wall_clock = true});
+}
