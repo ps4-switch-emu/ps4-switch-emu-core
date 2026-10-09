@@ -11,6 +11,7 @@
 // in /data/switch-emu/suite.txt. Each run adds one summary line to /data/switch-emu/logs/bench-results.txt.
 
 #include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -293,14 +294,20 @@ void MarkPlayed(const std::string& file) {
 }
 
 // Play time across sessions (/data/switch-emu/titles/<file>.play: "<seconds> <sessions>", kept by
-// the emulator while a game runs), as "played 12 h 31 min".
-std::string PlayedDetail(const std::string& file) {
+// the emulator while a game runs).
+long PlaySeconds(const std::string& file) {
     long seconds = 0, sessions = 0;
     if (FILE* f = fopen((std::string(kTitlesDir) + file + ".play").c_str(), "r")) {
         if (fscanf(f, "%ld %ld", &seconds, &sessions) != 2)
             seconds = 0;
         fclose(f);
     }
+    return seconds;
+}
+
+// As "  -  played 12 h 31 min" (nothing under a minute).
+std::string PlayedDetail(const std::string& file) {
+    const long seconds = PlaySeconds(file);
     char text[48];
     if (seconds >= 3600)
         snprintf(text, sizeof(text), "  -  played %ld h %ld min", seconds / 3600, seconds / 60 % 60);
@@ -479,22 +486,35 @@ struct Options {
     bool pin_threads = false; ///< busiest threads each on a PS4 core of their own (common/thread.cpp)
 };
 
-// /data/switch-emu/launcher.txt: the games tab's layout (Ps4LauncherLayout), for all games.
+// /data/switch-emu/launcher.txt: the games tab's layout (Ps4LauncherLayout) and order, for all games.
 constexpr const char* kLauncherFile = "/data/switch-emu/launcher.txt";
+enum GameSort { kSortRecent = 0, kSortMostPlayed = 1, kSortName = 2, kSortCount = 3 };
+const char* const kSortNames[kSortCount] = {"Recently played", "Most played", "A to Z"};
 
-int ReadLayout() {
+struct LauncherPrefs {
     int layout = kLayoutGrid;
+    int sort = kSortRecent;
+};
+
+LauncherPrefs ReadLauncherPrefs() {
+    LauncherPrefs p;
     if (FILE* f = fopen(kLauncherFile, "r")) {
-        if (fscanf(f, "layout %d", &layout) != 1)
-            layout = kLayoutGrid;
+        char key[32];
+        int value = 0;
+        while (fscanf(f, "%31s %d", key, &value) == 2) {
+            if (strcmp(key, "layout") == 0)
+                p.layout = std::clamp(value, 0, kLayoutCount - 1);
+            else if (strcmp(key, "sort") == 0)
+                p.sort = std::clamp(value, 0, kSortCount - 1);
+        }
         fclose(f);
     }
-    return std::clamp(layout, 0, kLayoutCount - 1);
+    return p;
 }
 
-void SaveLayout(int layout) {
+void SaveLauncherPrefs(const LauncherPrefs& p) {
     if (FILE* f = fopen(kLauncherFile, "w")) {
-        fprintf(f, "layout %d\n", layout);
+        fprintf(f, "layout %d\nsort %d\n", p.layout, p.sort);
         fclose(f);
     }
 }
@@ -826,15 +846,27 @@ void ps4_menu_run() {
 
     Options global = LoadGlobalOptions();
     std::vector<std::string> games = ListGames();
-    // Recently played first, then the rest by name (ListGames sorts by name).
-    {
-        std::vector<std::pair<long, std::string>> order;
-        for (const std::string& file : games)
-            order.emplace_back(LastPlayed(file), file);
-        std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    LauncherPrefs prefs = ReadLauncherPrefs();
+    // The chosen order (ties, and games never played, stay by file name: ListGames sorts by it).
+    const auto sort_games = [&] {
+        std::vector<std::pair<std::string, std::string>> order; // key, file
+        for (const std::string& file : games) {
+            char key[32] = "";
+            if (prefs.sort == kSortRecent)
+                snprintf(key, sizeof(key), "%020ld", LONG_MAX - LastPlayed(file));
+            else if (prefs.sort == kSortMostPlayed)
+                snprintf(key, sizeof(key), "%020ld", LONG_MAX - PlaySeconds(file));
+            std::string k = key;
+            if (prefs.sort == kSortName)
+                for (const char c : CachedTitle(file))
+                    k += char(tolower(static_cast<unsigned char>(c)));
+            order.emplace_back(k, file);
+        }
+        std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
         for (size_t i = 0; i < games.size(); i++)
             games[i] = order[i].second;
-    }
+    };
+    sort_games();
     int game = 0;
     {
         const std::string chosen = ReadGameChoice();
@@ -842,25 +874,30 @@ void ps4_menu_run() {
             if (games[i] == chosen)
                 game = int(i);
     }
-    // Library: titles, details and icons (kept alive while the launcher shows them).
+    // Library: titles, details and icons (kept alive while the launcher shows them; a new list is
+    // handed over before the old one is freed - the drawing thread may be using its icons).
     static std::vector<std::string> titles, details;
     static std::vector<std::vector<uint32_t>> icons;
-    titles.clear();
-    details.clear();
-    icons.clear();
-    for (const std::string& file : games) {
-        titles.push_back(CachedTitle(file));
-        std::string detail = FileDetail(file) + PlayedDetail(file);
-        if (const long played = LastPlayed(file); played > 0)
-            if (const std::string when = PlayedWhen(played); !when.empty())
-                detail += "  -  last played " + when;
-        details.push_back(detail);
-        icons.push_back(CachedIcon(file));
-    }
-    std::vector<Ps4LauncherGame> entries;
-    for (size_t i = 0; i < games.size(); i++)
-        entries.push_back({titles[i].c_str(), details[i].c_str(), icons[i].empty() ? nullptr : icons[i].data()});
-    ps4_launcher_set_games(entries.data(), int(entries.size()));
+    const auto publish_library = [&] {
+        std::vector<std::string> new_titles, new_details;
+        std::vector<std::vector<uint32_t>> new_icons;
+        for (const std::string& file : games) {
+            new_titles.push_back(CachedTitle(file));
+            std::string detail = FileDetail(file) + PlayedDetail(file);
+            if (const long played = LastPlayed(file); played > 0)
+                if (const std::string when = PlayedWhen(played); !when.empty())
+                    detail += "  -  last played " + when;
+            new_details.push_back(detail);
+            new_icons.push_back(CachedIcon(file));
+        }
+        std::vector<Ps4LauncherGame> entries;
+        for (size_t i = 0; i < games.size(); i++)
+            entries.push_back({new_titles[i].c_str(), new_details[i].c_str(),
+                               new_icons[i].empty() ? nullptr : new_icons[i].data()});
+        ps4_launcher_set_games(entries.data(), int(entries.size()));
+        titles.swap(new_titles), details.swap(new_details), icons.swap(new_icons);
+    };
+    publish_library();
 
     Pad pad;
     ps4_sound_open(); // already open from the start screen, or opened now (back from a game)
@@ -875,9 +912,9 @@ void ps4_menu_run() {
     ps4_launcher_show(true);
 
     enum Row { kGraphics, kMode, kResolution, kGpuAccuracy, kButtons, kSpread, kPin, kMulticore, kFastmem, kAccuracy, kAsync, kProfiler, kBenchmarks, kInstall,
-               kBackup, kUseGlobal, kOverlay, kOverlayCorner, kKeys, kFirmware, kLayout, kAppVersion, kPs4Firmware };
+               kBackup, kUseGlobal, kOverlay, kOverlayCorner, kKeys, kFirmware, kLayout, kSort, kAppVersion, kPs4Firmware };
     const std::string app_version = AppVersion(), ps4_firmware = Ps4Firmware();
-    int layout = ReadLayout();
+    int& layout = prefs.layout;
     int shortcut = -1; // row layout: the selected shortcut below the games (-1: a game)
     static const char* const kOverlayModes[] = {"Off", "FPS", "Detailed"};
     static const char* const kCorners[] = {"Top left", "Top right", "Bottom left", "Bottom right"};
@@ -906,7 +943,7 @@ void ps4_menu_run() {
         std::vector<int> ids = {kGraphics, kMode, kResolution, kGpuAccuracy, kButtons, kSpread, kPin, kMulticore, kFastmem,
                                 kAccuracy, kAsync, kOverlay, kOverlayCorner, kProfiler};
         if (!game_scope) // the launcher's own setting, for all games
-            ids.insert(ids.begin() + 4, kLayout);
+            ids.insert(ids.begin() + 4, {kLayout, kSort});
         if (game_scope)
             ids.push_back(kUseGlobal);
         else
@@ -1020,6 +1057,11 @@ void ps4_menu_run() {
                                     "with shortcuts below (Down to reach them), like a console's home screen. List "
                                     "shows the games as rows with the selected one large, with its play time."});
                 break;
+            case kSort:
+                settings.push_back({"Sort games", kSortNames[prefs.sort],
+                                    "The order of the games tab: the one played last first, the most hours "
+                                    "first (play time is counted while a game runs), or by name."});
+                break;
             case kAppVersion:
                 settings.push_back({"Version", app_version.c_str(),
                                     "PS4 Switch Emu, an unofficial port of the Eden emulator. Please include this "
@@ -1051,7 +1093,7 @@ void ps4_menu_run() {
         // Sections and how each value is drawn.
         for (size_t j = 0; j < ids.size(); j++) {
             switch (ids[j]) {
-            case kGraphics: case kMode: case kResolution: case kGpuAccuracy: case kLayout:
+            case kGraphics: case kMode: case kResolution: case kGpuAccuracy: case kLayout: case kSort:
                 settings[j].group = "Display";
                 settings[j].kind = kSettingChoice;
                 break;
@@ -1208,8 +1250,20 @@ void ps4_menu_run() {
                 switch (ids[size_t(row)]) {
                 case kLayout:
                     layout = (pressed & kLeft) ? (layout + kLayoutCount - 1) % kLayoutCount : (layout + 1) % kLayoutCount;
-                    SaveLayout(layout);
+                    SaveLauncherPrefs(prefs);
                     break;
+                case kSort: { // re-sorted now, the same game kept selected
+                    prefs.sort = (pressed & kLeft) ? (prefs.sort + kSortCount - 1) % kSortCount : (prefs.sort + 1) % kSortCount;
+                    SaveLauncherPrefs(prefs);
+                    const std::string selected = games.empty() ? "" : games[size_t(game)];
+                    sort_games();
+                    publish_library();
+                    for (size_t i = 0; i < games.size(); i++)
+                        if (games[i] == selected)
+                            game = int(i);
+                    game_opts_for = -1;
+                    break;
+                }
                 case kGraphics:
                     o.graphics = !o.graphics;
                     break;
