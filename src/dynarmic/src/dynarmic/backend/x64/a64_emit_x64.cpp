@@ -8,6 +8,8 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
+#include <algorithm>
+
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include "common/assert.h"
@@ -183,6 +185,8 @@ finish_this_inst:
     code.mov(rbp, code.qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, abi_base_pointer)]);
     nzcv_in_host_flags = conf.HasOptimization(OptimizationFlag::HostRegisterLocality) && !conf.enable_cycle_counting
         && NzcvInHostFlagsAtBlockEnd(block);
+    block_writes_fpcr = std::any_of(block.instructions.begin(), block.instructions.end(),
+                                    [](const IR::Inst& i) { return i.GetOpcode() == IR::Opcode::A64SetFPCR; });
     EmitTerminal(block.terminal, ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
     nzcv_in_host_flags = false;
     code.int3();
@@ -261,6 +265,7 @@ void A64EmitX64::GenTerminalHandlers() {
         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
         calculate_location_descriptor();
         code.L(rsb_cache_miss);
+        terminal_handler_rsb_miss = code.getCurr<const void*>();
         code.mov(r8, u64(fast_dispatch_table.data()));
         //code.mov(r12, qword[code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
         code.mov(r12, rbx);
@@ -273,6 +278,7 @@ void A64EmitX64::GenTerminalHandlers() {
         code.jne(fast_dispatch_cache_miss, code.T_NEAR);
         code.jmp(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)]);
         code.L(fast_dispatch_cache_miss);
+        terminal_handler_fast_dispatch_miss = code.getCurr<const void*>();
         code.mov(qword[r12 + offsetof(FastDispatchEntry, location_descriptor)], rbx);
         code.LookupBlock();
         code.mov(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)], rax);
@@ -718,7 +724,34 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlockFast terminal, IR::Locat
     return true;
 }
 
-bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
+bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescriptor initial_location, bool is_single_step) {
+    if (e.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step
+        && e.conf.HasOptimization(OptimizationFlag::HostRegisterLocality) && !e.block_writes_fpcr) {
+        // The RSB check inline (terminal_handler_pop_rsb_hint's code), with the FPCR part of the
+        // descriptor known (the block's own, it does not change it) and an indirect jump of this
+        // return's own, which the host predicts far better than one jump shared by every return.
+        using Descriptor = A64::LocationDescriptor;
+        const u64 fpcr_bits = u64(Descriptor{initial_location}.FPCR().Value() & Descriptor::fpcr_mask) << Descriptor::fpcr_shift;
+        e.code.mov(rbx, qword[e.code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
+        e.code.shl(rbx, int(64 - Descriptor::pc_bit_count));
+        e.code.shr(rbx, int(64 - Descriptor::pc_bit_count));
+        if (fpcr_bits != 0) {
+            e.code.mov(rax, fpcr_bits);
+            e.code.or_(rbx, rax);
+        }
+        e.code.mov(eax, dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)]);
+        e.code.sub(eax, 1);
+        e.code.and_(eax, u32(A64JitState::RSB_PTR_MASK));
+        e.code.mov(dword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_ptr)], eax);
+        e.code.cmp(rbx, qword[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_location_descriptors) + rax * sizeof(u64)]);
+        if (e.terminal_handler_rsb_miss) {
+            e.code.jne(e.terminal_handler_rsb_miss);
+        } else {
+            e.code.jne(e.code.GetReturnFromRunCodeAddress());
+        }
+        e.code.jmp(e.code.ptr[e.code.ABI_JIT_PTR + offsetof(A64JitState, rsb_codeptrs) + rax * sizeof(u64)]);
+        return true;
+    }
     if (e.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
         e.code.jmp(e.terminal_handler_pop_rsb_hint);
     } else {
@@ -727,7 +760,32 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::PopRSBHint, IR::LocationDescripto
     return true;
 }
 
-bool EmitTerminalImpl(A64EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
+bool EmitTerminalImpl(A64EmitX64& e, IR::Term::FastDispatchHint, IR::LocationDescriptor initial_location, bool is_single_step) {
+    if (e.conf.HasOptimization(OptimizationFlag::FastDispatch) && !is_single_step
+        && e.conf.HasOptimization(OptimizationFlag::HostRegisterLocality) && !e.block_writes_fpcr) {
+        // terminal_handler_fast_dispatch_hint's lookup inline, with the FPCR part of the descriptor
+        // known, and an indirect jump of this site's own (see PopRSBHint).
+        using Descriptor = A64::LocationDescriptor;
+        const u64 fpcr_bits = u64(Descriptor{initial_location}.FPCR().Value() & Descriptor::fpcr_mask) << Descriptor::fpcr_shift;
+        e.code.mov(rbx, qword[e.code.ABI_JIT_PTR + offsetof(A64JitState, pc)]);
+        e.code.shl(rbx, int(64 - Descriptor::pc_bit_count));
+        e.code.shr(rbx, int(64 - Descriptor::pc_bit_count));
+        if (fpcr_bits != 0) {
+            e.code.mov(rax, fpcr_bits);
+            e.code.or_(rbx, rax);
+        }
+        e.code.mov(r8, u64(e.fast_dispatch_table.data()));
+        e.code.mov(r12, rbx);
+        if (e.code.HasHostFeature(HostFeature::SSE42)) {
+            e.code.crc32(r12, r8);
+        }
+        e.code.and_(r12d, A64EmitX64::fast_dispatch_table_mask);
+        e.code.lea(r12, e.code.ptr[r8 + r12]);
+        e.code.cmp(rbx, qword[r12 + offsetof(A64EmitX64::FastDispatchEntry, location_descriptor)]);
+        e.code.jne(e.terminal_handler_fast_dispatch_miss);
+        e.code.jmp(e.code.ptr[r12 + offsetof(A64EmitX64::FastDispatchEntry, code_ptr)]);
+        return true;
+    }
     if (!e.conf.HasOptimization(OptimizationFlag::FastDispatch) || is_single_step) {
         e.code.ReturnFromRunCode();
     } else {

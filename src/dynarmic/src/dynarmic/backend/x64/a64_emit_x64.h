@@ -140,6 +140,13 @@ public:
     boost::container::stable_vector<Xbyak::Label> shared_labels;
     const void* terminal_handler_pop_rsb_hint = nullptr;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
+    /// The fast dispatch handler past its descriptor calculation (descriptor in rbx), where an
+    /// inline RSB check goes on a miss; nullptr without FastDispatch.
+    const void* terminal_handler_rsb_miss = nullptr;
+    /// The fast dispatch handler's table-miss path (descriptor in rbx, table entry in r12).
+    const void* terminal_handler_fast_dispatch_miss = nullptr;
+    /// Whether the block being emitted writes FPCR (its exit descriptor's FPCR is then unknown).
+    bool block_writes_fpcr = false;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
     A64::Jit* jit_interface = nullptr;
     void (*memory_read_128)() = nullptr;

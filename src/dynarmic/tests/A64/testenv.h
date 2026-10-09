@@ -23,6 +23,7 @@ public:
     ::Common::unordered_map<u64, u8> modified_memory;
     std::vector<std::string> interrupts;
     bool record_exceptions = false;  // record SVCs/exceptions in interrupts instead of aborting
+    Dynarmic::A64::Jit* halt_on_svc = nullptr;  // SVC stops this JIT (runs without cycle counting)
     std::vector<u32> code_mem;
     u64 ticks_left = 0;
     u64 code_mem_start_address = 0;
@@ -108,12 +109,16 @@ public:
         if (!record_exceptions)
             UNREACHABLE(); //ASSERT(false && "CallSVC({})", swi);
         interrupts.emplace_back("svc " + std::to_string(swi));
+        if (halt_on_svc)
+            halt_on_svc->HaltExecution();
     }
 
     void ExceptionRaised(u64 pc, Dynarmic::A64::Exception exception) override {
         if (!record_exceptions)
             UNREACHABLE(); //ASSERT(false && "ExceptionRaised({:016x})", pc);
         interrupts.emplace_back("exception " + std::to_string(pc) + " " + std::to_string(int(exception)));
+        if (halt_on_svc)
+            halt_on_svc->HaltExecution();
     }
 
     void AddTicks(std::uint64_t ticks) override {

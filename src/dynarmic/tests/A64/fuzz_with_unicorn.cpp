@@ -540,7 +540,12 @@ TEST_CASE("A64: Large random block", "[a64][unicorn]") {
 // Differential tests for OptimizationFlag::HostRegisterLocality: the same random blocks run in a
 // JIT with the optimization and in one without it must leave exactly the same state (registers,
 // vectors, flags, FPSR, memory). Needs no reference emulator, so it checks the optimization alone.
-static void RunHostRegisterLocalityDifferentialWith(const std::function<void(std::vector<u32>&)>& gen_block, bool floats, size_t iterations);
+struct DifferentialOptions {
+    bool fast_dispatch = false;
+    bool wall_clock = false;  // no cycle counting (as in the emulator): blocks must end in an SVC
+};
+
+static void RunHostRegisterLocalityDifferentialWith(const std::function<void(std::vector<u32>&)>& gen_block, bool floats, size_t iterations, DifferentialOptions options = {});
 
 static void RunHostRegisterLocalityDifferential(size_t block_size, bool floats, size_t iterations) {
     RunHostRegisterLocalityDifferentialWith([&](std::vector<u32>& instructions) {
@@ -552,7 +557,7 @@ static void RunHostRegisterLocalityDifferential(size_t block_size, bool floats, 
     }, floats, iterations);
 }
 
-static void RunHostRegisterLocalityDifferentialWith(const std::function<void(std::vector<u32>&)>& gen_block, bool floats, size_t iterations) {
+static void RunHostRegisterLocalityDifferentialWith(const std::function<void(std::vector<u32>&)>& gen_block, bool floats, size_t iterations, DifferentialOptions options) {
     A64TestEnv env_a{};
     A64TestEnv env_b{};
     Dynarmic::A64::UserConfig conf_a{GetUserConfig(env_a)};
@@ -561,9 +566,21 @@ static void RunHostRegisterLocalityDifferentialWith(const std::function<void(std
     conf_b.optimizations &= ~OptimizationFlag::HostRegisterLocality;
     if (std::getenv("DIFF_CONTROL"))  // both without: shows what differs without the optimization
         conf_a.optimizations &= ~OptimizationFlag::HostRegisterLocality;
+    for (auto* conf : {&conf_a, &conf_b}) {
+        if (options.fast_dispatch)
+            conf->optimizations |= OptimizationFlag::FastDispatch;
+        if (options.wall_clock) {
+            conf->enable_cycle_counting = false;
+            conf->wall_clock_cntpct = true;
+        }
+    }
     Dynarmic::A64::Jit jit_a{conf_a};
     Dynarmic::A64::Jit jit_b{conf_b};
     env_a.record_exceptions = env_b.record_exceptions = true;
+    if (options.wall_clock) {
+        env_a.halt_on_svc = &jit_a;
+        env_b.halt_on_svc = &jit_b;
+    }
 
     static constexpr std::array<u64, 16> special_floats{
         0x00000000, 0x80000000, 0x00000001, 0x007fffff, 0x00800000, 0x7f7fffff, 0x7f800000, 0xff800000,
@@ -686,4 +703,171 @@ TEST_CASE("A64: HostRegisterLocality differential: add/sub flags then B.cond", "
             instructions.push_back(orr.Generate());
         instructions.push_back(b_cond.Generate());
     }, false, 200000);
+}
+
+// The same with the emulator's settings: no cycle counting (the host-flags branch only applies
+// then) and fast dispatch on (the inline RSB check's miss path). Every way out of the block
+// reaches an SVC, which halts the JIT, so the runs stop at the same point.
+TEST_CASE("A64: HostRegisterLocality differential: add/sub flags then B.cond (wall clock)", "[a64][differential]") {
+    static const std::vector<InstructionGenerator> flag_ops{
+        InstructionGenerator{"z0111010000mmmmm000000nnnnnddddd"},  // ADCS
+        InstructionGenerator{"z1111010000mmmmm000000nnnnnddddd"},  // SBCS
+        InstructionGenerator{"z0101011001mmmmmxxxiiinnnnnddddd"},  // ADDS (extended register)
+        InstructionGenerator{"z1101011001mmmmmxxxiiinnnnnddddd"},  // SUBS (extended register)
+        InstructionGenerator{"z0101011ss0mmmmmiiiiiinnnnnddddd"},  // ADDS (shifted register)
+        InstructionGenerator{"z1101011ss0mmmmmiiiiiinnnnnddddd"},  // SUBS (shifted register)
+        InstructionGenerator{"z0110001ssiiiiiiiiiiiinnnnnddddd"},  // ADDS (immediate)
+        InstructionGenerator{"z1110001ssiiiiiiiiiiiinnnnnddddd"},  // SUBS (immediate)
+    };
+    static const InstructionGenerator movz{"z10100101ssiiiiiiiiiiiiiiiiddddd"};
+    static const InstructionGenerator orr{"z0101010ss0mmmmmiiiiiinnnnnddddd"};
+    RunHostRegisterLocalityDifferentialWith([](std::vector<u32>& instructions) {
+        instructions.clear();
+        for (size_t i = RandInt<size_t>(0, 2); i > 0; --i)
+            instructions.push_back(GenRandomInst(instructions.size() * 4, false));
+        instructions.push_back(flag_ops[RandInt<size_t>(0, flag_ops.size() - 1)].Generate());
+        if (RandInt<size_t>(0, 2) == 0)
+            instructions.push_back(movz.Generate());
+        if (RandInt<size_t>(0, 5) == 0)
+            instructions.push_back(orr.Generate());
+        instructions.push_back(0x54000040 | RandInt<u32>(0, 15));  // B.<random cond> +8
+        instructions.push_back(0xD4000001);                         // SVC #0 (not taken)
+        instructions.push_back(0xD4000021);                         // SVC #1 (taken)
+    }, false, 200000, {.fast_dispatch = true, .wall_clock = true});
+}
+
+// Calls and returns with the emulator's settings (no cycle counting, fast dispatch): BL into a
+// function of random instructions that ends with ADR X30 + RET (the inline RSB check). Each case
+// runs three times without clearing the cache, so the RSB holds real code pointers: returning to
+// the instruction after the BL (hit), then to the one after that (miss: fast dispatch), then
+// back (hit). Only the ADR changes between runs (its range is invalidated). Both targets are SVCs.
+static u32 AdrTo(size_t at, size_t target, u32 reg) {
+    const u32 imm = u32((s32(target) - s32(at)) * 4) & 0x1FFFFF;
+    return 0x10000000 | ((imm & 3) << 29) | ((imm >> 2) << 5) | reg;
+}
+
+// layout(instructions, target) builds the code for a run, returning the index of the instruction
+// that changes between runs.
+static void RunThreeRunDifferential(const std::function<size_t(std::vector<u32>&)>& layout, const std::function<u32(size_t at, size_t target)>& variant, size_t iterations) {
+    A64TestEnv env_a{};
+    A64TestEnv env_b{};
+    Dynarmic::A64::UserConfig conf_a{GetUserConfig(env_a)};
+    Dynarmic::A64::UserConfig conf_b{GetUserConfig(env_b)};
+    conf_a.optimizations |= OptimizationFlag::HostRegisterLocality;
+    conf_b.optimizations &= ~OptimizationFlag::HostRegisterLocality;
+    if (std::getenv("DIFF_CONTROL"))
+        conf_a.optimizations &= ~OptimizationFlag::HostRegisterLocality;
+    for (auto* conf : {&conf_a, &conf_b}) {
+        conf->optimizations |= OptimizationFlag::FastDispatch;
+        conf->enable_cycle_counting = false;
+        conf->wall_clock_cntpct = true;
+    }
+    Dynarmic::A64::Jit jit_a{conf_a};
+    Dynarmic::A64::Jit jit_b{conf_b};
+    env_a.record_exceptions = env_b.record_exceptions = true;
+    env_a.halt_on_svc = &jit_a;
+    env_b.halt_on_svc = &jit_b;
+
+    std::array<u64, 31> regs;
+    std::array<Vector, 32> vecs;
+    std::vector<u32> instructions;
+    for (size_t iteration = 0; iteration < iterations; ++iteration) {
+        std::generate(regs.begin(), regs.end(), [] { return RandInt<u64>(0, ~u64(0)); });
+        std::generate(vecs.begin(), vecs.end(), RandomVector);
+        instructions.clear();
+        const size_t adr_at = layout(instructions);
+        const u64 start_address = RandInt<u64>(0, 0x10'0000'0000) * 4;
+        const u64 initial_sp = RandInt<u64>(0x30'0000'0000, 0x40'0000'0000) * 4;
+        const u32 pstate = RandInt<u32>(0, 0xF) << 28;
+        const u32 fpcr = RandomFpcr();
+
+        std::string listing;
+        for (u32 instruction : instructions)
+            listing += fmt::format("{:08x} ", instruction);
+        INFO("Instructions: " << listing << " fpcr " << std::hex << fpcr);
+
+        for (size_t run = 0; run < 3; ++run) {
+            const size_t target = run == 1 ? 2 : 1;
+            for (auto [jit, env] : {std::pair{&jit_a, &env_a}, std::pair{&jit_b, &env_b}}) {
+                env->code_mem = instructions;
+                env->code_mem[adr_at] = variant(adr_at, target);
+                env->code_mem.emplace_back(0x14000000);  // B .
+                env->code_mem_start_address = start_address;
+                env->modified_memory.clear();
+                env->interrupts.clear();
+                env->code_mem_modified_by_guest = false;
+                if (run == 0)
+                    jit->ClearCache();
+                else
+                    jit->InvalidateCacheRange(start_address + adr_at * 4, 4);
+                jit->SetRegisters(regs);
+                jit->SetVectors(vecs);
+                jit->SetPC(start_address);
+                jit->SetSP(initial_sp);
+                jit->SetFpcr(fpcr);
+                jit->SetFpsr(0);
+                jit->SetPstate(pstate);
+                CheckedRun([&]() { jit->Run(); });
+            }
+            INFO("run " << run);
+            REQUIRE(jit_a.GetPC() == jit_b.GetPC());
+            REQUIRE(jit_a.GetRegisters() == jit_b.GetRegisters());
+            REQUIRE(jit_a.GetVectors() == jit_b.GetVectors());
+            REQUIRE(jit_a.GetSP() == jit_b.GetSP());
+            REQUIRE(jit_a.GetPstate() == jit_b.GetPstate());
+            REQUIRE(jit_a.GetFpsr() == jit_b.GetFpsr());
+            REQUIRE(env_a.modified_memory == env_b.modified_memory);
+            REQUIRE(env_a.interrupts == env_b.interrupts);
+        }
+    }
+}
+
+// Calls and returns with the emulator's settings: BL into random instructions, then ADR X30 + RET
+// (the inline RSB check) to the instruction after the BL (hit) or the one after that (miss).
+TEST_CASE("A64: HostRegisterLocality differential: BL / RET (wall clock)", "[a64][differential]") {
+    RunThreeRunDifferential([](std::vector<u32>& instructions) {
+        instructions.push_back(0x94000003);  // BL +12
+        instructions.push_back(0xD4000001);  // SVC #0 (the return address)
+        instructions.push_back(0xD4000041);  // SVC #2
+        for (size_t i = RandInt<size_t>(0, 5); i > 0; --i)
+            instructions.push_back(GenRandomInst(instructions.size() * 4, false));
+        const size_t adr_at = instructions.size();
+        instructions.push_back(AdrTo(adr_at, 1, 30));
+        instructions.push_back(0xD65F03C0);  // RET
+        return adr_at;
+    }, [](size_t at, size_t target) { return AdrTo(at, target, 30); }, 30000);
+}
+
+// Indirect branches (BR/BLR, the inline fast dispatch lookup) to one of two SVCs, the target
+// changing between runs: table misses and hits with real code pointers.
+TEST_CASE("A64: HostRegisterLocality differential: BR / BLR (wall clock)", "[a64][differential]") {
+    RunThreeRunDifferential([](std::vector<u32>& instructions) {
+        instructions.push_back(0x14000003);  // B +12
+        instructions.push_back(0xD4000001);  // SVC #0
+        instructions.push_back(0xD4000041);  // SVC #2
+        for (size_t i = RandInt<size_t>(0, 5); i > 0; --i)
+            instructions.push_back(GenRandomInst(instructions.size() * 4, false));
+        const size_t adr_at = instructions.size();
+        instructions.push_back(AdrTo(adr_at, 1, 16));
+        instructions.push_back(RandInt<size_t>(0, 1) ? 0xD61F0200 : 0xD63F0200);  // BR X16 / BLR X16
+        return adr_at;
+    }, [](size_t at, size_t target) { return AdrTo(at, target, 16); }, 30000);
+}
+
+// Random straight-line blocks (integer and FP) ending in an SVC, with the emulator's settings.
+static void RunWallClockBlocks(size_t count, bool floats, size_t iterations) {
+    RunHostRegisterLocalityDifferentialWith([count, floats](std::vector<u32>& instructions) {
+        instructions.clear();
+        for (size_t i = 0; i < count; ++i)
+            instructions.push_back(floats && RandInt<size_t>(0, 3) != 0 ? GenFloatInst(i * 4, false) : GenRandomInst(i * 4, false));
+        instructions.push_back(0xD4000001);  // SVC #0
+    }, floats, iterations, {.fast_dispatch = true, .wall_clock = true});
+}
+
+TEST_CASE("A64: HostRegisterLocality differential: blocks (wall clock)", "[a64][differential]") {
+    RunWallClockBlocks(8, false, 30000);
+}
+
+TEST_CASE("A64: HostRegisterLocality differential: FP blocks (wall clock)", "[a64][differential]") {
+    RunWallClockBlocks(8, true, 30000);
 }
