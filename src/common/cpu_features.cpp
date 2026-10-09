@@ -411,10 +411,21 @@ u64 WallClock::NsToTicks(std::chrono::nanoseconds ns) const {
 }
 #endif
 
+#ifdef __OPENORBIS__
+extern "C" u64 sceKernelGetTscFrequency();
+#endif
+
 // Wall clock MUST be initialized AFTER g_cpu_caps
 // C++ only guarantees ctor init in the order they appear in TU
 const WallClock g_wall_clock = [] {
-#if defined(ARCHITECTURE_x86_64)
+#if defined(__OPENORBIS__)
+    // The PS4's AMD CPU has no CPUID leaf 0x15, so the frequency check below always failed and
+    // every clock read (each guest CNTPCT read, core timing) became clock_gettime - a system call
+    // here, 5-16% of the CPU core running a 2D game. The PS4's TSC runs at a constant rate
+    // and the system reports it.
+    const u64 tsc_frequency = sceKernelGetTscFrequency();
+    return WallClock(tsc_frequency >= std::nano::den / 2, tsc_frequency);
+#elif defined(ARCHITECTURE_x86_64)
     auto const& caps = Common::g_cpu_caps;
     return WallClock(caps.invariant_tsc && caps.tsc_frequency >= std::nano::den, caps.tsc_frequency);
 #elif defined(HAS_NCE)

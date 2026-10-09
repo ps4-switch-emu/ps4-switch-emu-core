@@ -25,6 +25,7 @@
 #include "common/settings_enums.h"
 #include "common/string_util.h"
 #include "common/sparse_large_vector.h"
+#include "common/cpu_features.h"
 #include "core/core.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/acc/profile_manager.h"
@@ -517,6 +518,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // How this jailbreak lets us map JIT code (0 = plain RWX mmap ... 4 = JIT shared memory,
     // -1 = none works); dynarmic's PS4ExecAllocator maps through the method found here.
     PS4_TRACE("main: executable memory method {}", ps4_exec_probe());
+    PS4_TRACE("main: clock {}", Common::g_wall_clock.IsNative() ? "TSC (fast)" : "clock_gettime (slow)");
     if (struct stat st; stat("/data/switch-emu/test-crash", &st) == 0) {
         // Test switch: checks that crash.log gets written.
         PS4_TRACE("main: test-crash: writing to address 0x10");
