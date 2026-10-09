@@ -174,6 +174,16 @@ void* samplerThread(void*) {
 
 } // namespace
 
+// The calling thread's name as registered below (for crash.log), or nullptr.
+extern "C" const char* ps4_sampler_thread_name() {
+    const pthread_t self = pthread_self();
+    const int threads = g_thread_count.load(std::memory_order_acquire);
+    for (int i = 0; i < threads; i++)
+        if (g_threads[i].thread.load(std::memory_order_relaxed) == self)
+            return g_threads[i].name;
+    return nullptr;
+}
+
 // Called by Common::SetCurrentThreadName: every named Eden thread can be sampled.
 extern "C" void ps4_sampler_register_thread(const char* name) {
     const int index = g_thread_count.load();

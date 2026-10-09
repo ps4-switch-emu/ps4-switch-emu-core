@@ -27,7 +27,8 @@
 #include <exception>
 #include <typeinfo>
 
-extern "C" char __text_start[];  // defined by the OpenOrbis link.x at the start of .text
+extern "C" char __text_start[];
+extern "C" const char* ps4_sampler_thread_name(); // sampler.cpp  // defined by the OpenOrbis link.x at the start of .text
 extern "C" int sceKernelInternalMemoryGetAvailableSize(size_t* size);
 extern "C" uint32_t sceSysmoduleLoadModuleInternal(uint32_t id);
 // externals/ps4sup/status_screen.cpp (weak: optional)
@@ -98,6 +99,8 @@ void createFolders() {
 int traceFd() {
     if (g_traceFd < 0) {
         createFolders();
+        // Keep the last run's trace (after a crash, the next start would overwrite it).
+        rename("/data/switch-emu/logs/boot-trace.log", "/data/switch-emu/logs/boot-trace.prev.log");
         g_traceFd = open("/data/switch-emu/logs/boot-trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     }
     return g_traceFd;
@@ -155,9 +158,10 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
         const uint64_t rip = regs[kRipIndex];
         const uint64_t rsp = regs[kRspIndex];
         const uint64_t address = *reinterpret_cast<const uint64_t*>(reinterpret_cast<char*>(info) + 24);
-        writeFormat(fd, "\n=== signal %d (code %d), fault address 0x%llx\n", sig,
+        const char* thread = ps4_sampler_thread_name();
+        writeFormat(fd, "\n=== signal %d (code %d), fault address 0x%llx, thread %s\n", sig,
                     *reinterpret_cast<const int*>(reinterpret_cast<char*>(info) + 8),
-                    static_cast<unsigned long long>(address));
+                    static_cast<unsigned long long>(address), thread ? thread : "main (or unnamed)");
         writeFormat(fd, "rip 0x%llx%s elf 0x%llx, rsp 0x%llx, text at %p\n",
                     static_cast<unsigned long long>(rip), isCode(rip) ? "" : " (not eboot code)",
                     static_cast<unsigned long long>(toElf(rip)), static_cast<unsigned long long>(rsp),

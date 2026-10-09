@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -384,6 +385,10 @@ void Filter::ParseFilterString(std::string_view filter_view) {
 // Constructor shall NOT depend upon Settings() or whatever
 // it's ran at global static ctor() time... so BE CAREFUL MFER!
 static std::optional<Common::Log::Impl> logging_instance{};
+// Backends write from whichever thread logs, and their files aren't safe to share across threads
+// (on the PS4, concurrent writes overran the file buffer into the heap: SDL's event list).
+static std::recursive_mutex log_write_mutex; // recursive: a failed flush logs an error
+
 
 void Initialize() {
     if (logging_instance) {
@@ -406,6 +411,7 @@ void Start() {
 }
 
 void Stop() {
+    std::scoped_lock lock{log_write_mutex};
     if (logging_instance)
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
 }
@@ -422,6 +428,7 @@ void SetColorConsoleBackendEnabled(bool enabled) {
 
 void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) {
     if (logging_instance && logging_instance->filter.CheckMessage(log_class, log_level)) {
+        std::scoped_lock lock{log_write_mutex};
         auto const flush = ::Settings::values.log_flush_line.GetValue();
         char buffer[BUFSIZ];
         auto result = fmt::vformat_to_n(buffer, sizeof(buffer) - 1, format, args);

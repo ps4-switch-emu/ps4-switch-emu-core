@@ -786,7 +786,16 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Null)
         ps4_status_stop();
 #endif
+#ifdef __OPENORBIS__
+    // Warnings and errors only: thousands of debug lines a second cost the PS4's CPU real time.
+    // /data/switch-emu/verbose-log brings back everything (for chasing a bug).
+    if (struct stat st; stat("/data/switch-emu/verbose-log", &st) == 0)
+        Common::Log::SetGlobalFilter(Common::Log::Filter(Common::Log::Level::Trace));
+    else
+        Common::Log::SetGlobalFilter(Common::Log::Filter(Common::Log::Level::Warning));
+#else
     Common::Log::SetGlobalFilter(Common::Log::Filter(Common::Log::Level::Trace));
+#endif
 
     switch (Settings::values.renderer_backend.GetValue()) {
 #ifdef HAS_OPENGL
