@@ -1339,6 +1339,261 @@ void DrawPause(const Ps4HomeMenu& m) {
     Hint(hx, hy, "Resume");
 }
 
+// Everything shown while no game picture is: benchmark runs and their results, installing
+// updates and DLC, reading game info, programs run without graphics, errors. What it is comes from
+// the current stage text (ps4_status_set_stage); the right card shows a watched file (benchmark
+// results, test.nro's output) when there is one, the activity card the latest trace lines.
+struct StatusView {
+    char title[96] = "";
+    char detail[kLineLen] = "";
+    float progress = -1;  // 0..1, or -1: none
+    bool error = false, finished = false;
+};
+
+// "a/b" or "a of b" in the text as a fraction (the first one found); -1 if none.
+float ParseFraction(const char* text, int* a_out = nullptr, int* b_out = nullptr) {
+    for (const char* p = text; *p; p++) {
+        if (*p < '0' || *p > '9' || (p > text && p[-1] >= '0' && p[-1] <= '9'))
+            continue;
+        char* end = nullptr;
+        const long a = strtol(p, &end, 10);
+        const char* q = end;
+        if (*q == '/')
+            q++;
+        else if (strncmp(q, " of ", 4) == 0)
+            q += 4;
+        else
+            continue;
+        if (*q < '0' || *q > '9')
+            continue;
+        const long b = strtol(q, nullptr, 10);
+        if (b <= 0 || a < 0 || a > b)
+            continue;
+        if (a_out)
+            *a_out = int(a);
+        if (b_out)
+            *b_out = int(b);
+        return float(a) / float(b);
+    }
+    return -1;
+}
+
+StatusView ReadStatus(const char* stage) {
+    StatusView v;
+    const auto starts = [&](const char* prefix) { return strncmp(stage, prefix, strlen(prefix)) == 0; };
+    const auto after = [&](const char* marker) {
+        const char* p = strstr(stage, marker);
+        return p ? p + strlen(marker) : stage;
+    };
+    if (g_crashed) {
+        CopyText(v.title, sizeof(v.title), "Something went wrong");
+        CopyText(v.detail, sizeof(v.detail),
+                 "The emulator crashed. crash.log is in /data/switch-emu/logs - close the app with the PS button.");
+        v.error = true;
+    } else if (starts("Benchmark suite finished")) {
+        CopyText(v.title, sizeof(v.title), "Benchmarks finished");
+        CopyText(v.detail, sizeof(v.detail), "Real seconds per test - lower is faster.");
+        v.progress = 1, v.finished = true;
+    } else if (starts("Benchmark suite")) {
+        CopyText(v.title, sizeof(v.title), "Running benchmarks");
+        int run = 0, runs = 0;
+        if (ParseFraction(stage, &run, &runs) >= 0) {
+            v.progress = float(run - 1) / float(runs);
+            snprintf(v.detail, sizeof(v.detail), "Run %d of %d%s%s", run, runs, strchr(stage, ':') ? ":" : "",
+                     strchr(stage, ':') ? after(":") : "");
+            if (strstr(stage, "press any button"))
+                snprintf(v.detail, sizeof(v.detail), "Run %d of %d next - press any button to stop the benchmarks", run, runs);
+        } else {
+            const char* rest = after("suite");
+            while (*rest == ':' || *rest == ' ')
+                rest++;
+            CopyText(v.detail, sizeof(v.detail), rest);
+        }
+    } else if (starts("Installing")) {
+        CopyText(v.title, sizeof(v.title), "Installing updates and DLC");
+        int file = 0, files = 0;
+        const char* percent = strrchr(stage, ':');
+        if (ParseFraction(stage, &file, &files) >= 0) {
+            const float done = percent ? float(atoi(percent + 1)) / 100.0f : 0.0f;
+            v.progress = (float(file - 1) + done) / float(files);
+            char name[kLineLen];
+            CopyText(name, sizeof(name), stage + strlen("Installing "));
+            if (char* paren = strstr(name, " (")) // "<file> (i/n): p%"
+                *paren = 0;
+            snprintf(v.detail, sizeof(v.detail), "%s - file %d of %d%s%s", name, file, files, percent ? "," : "",
+                     percent ? percent + 1 : "");
+        } else {
+            CopyText(v.detail, sizeof(v.detail), "Getting ready...");
+        }
+    } else if (starts("Installed") || strstr(stage, "back to the menu")) {
+        CopyText(v.title, sizeof(v.title), strstr(stage, "fail") || strstr(stage, "Could not") ? "Couldn't finish" : "Done");
+        CopyText(v.detail, sizeof(v.detail), stage);
+        v.finished = true;
+        v.error = strstr(stage, "fail") || strstr(stage, "Could not");
+    } else if (starts("Reading game info")) {
+        CopyText(v.title, sizeof(v.title), "Reading your games");
+        int game = 0, games = 0;
+        v.progress = ParseFraction(stage, &game, &games);
+        snprintf(v.detail, sizeof(v.detail), "Names and icons: game %d of %d", game, games);
+    } else if (starts("Running")) {
+        CopyText(v.title, sizeof(v.title), "Running without graphics");
+        CopyText(v.detail, sizeof(v.detail), stage + strlen("Running "));
+        if (char* paren = strstr(v.detail, " (null renderer"))
+            *paren = 0;
+    } else if (starts("Loading failed") || starts("Could not load")) {
+        CopyText(v.title, sizeof(v.title), "Couldn't start the game");
+        CopyText(v.detail, sizeof(v.detail), stage);
+        v.error = true;
+    } else if (starts("Finished")) {
+        CopyText(v.title, sizeof(v.title), "Finished");
+        CopyText(v.detail, sizeof(v.detail), "The program exited.");
+        v.finished = true;
+    } else {
+        CopyText(v.title, sizeof(v.title), stage[0] ? stage : "Starting");
+    }
+    return v;
+}
+
+// Eight dots around a circle, one bright, turning.
+void DrawSpinner(int cx, int cy, double t) {
+    const int lead = int(t * 8) % 8;
+    for (int i = 0; i < 8; i++) {
+        const float a = float(i) * 3.14159265f / 4;
+        const int age = (lead - i + 8) % 8;
+        Disc(cx + int(std::cos(a) * 14), cy + int(std::sin(a) * 14), 4, Mix(kAccent, Rgb(40, 52, 80), float(age) / 7));
+    }
+}
+
+void DrawStatus(int tick) {
+    (void)tick;
+    char stage[kLineLen], path[256], heading[64];
+    Lock();
+    CopyText(stage, sizeof(stage), g_stage);
+    CopyText(path, sizeof(path), g_watch_path);
+    CopyText(heading, sizeof(heading), g_watch_heading);
+    Unlock();
+    const StatusView v = ReadStatus(stage);
+    const double now = Elapsed();
+
+    DrawBackground(v.error ? Rgb(150, 50, 60) : kAccent);
+    DrawBrand();
+    {
+        const time_t clock_now = time(nullptr);
+        if (const tm* local = localtime(&clock_now)) {
+            char clock_text[16];
+            snprintf(clock_text, sizeof(clock_text), "%d:%02d", local->tm_hour, local->tm_min);
+            DrawText(kBold, kWidth - 80 - TextWidth(kBold, clock_text), 54, clock_text, kText);
+        }
+    }
+
+    PollWatchedFile(path);
+    const bool side = g_watch_count > 0 || heading[0];
+    const int left_w = side ? 960 : kWidth - 200;
+
+    // Title, detail, progress.
+    constexpr int kX = 100, kTitleY = 170;
+    int tx = kX;
+    if (!v.finished && !v.error) {
+        DrawSpinner(kX + 22, kTitleY + kTitleFontHeight / 2, now);
+        tx += 64;
+    }
+    char title[96];
+    CopyText(title, sizeof(title), v.title);
+    Ellipsize(kTitleFont, title, sizeof(title), kX + left_w - tx);
+    DrawText(kTitleFont, tx, kTitleY, title, v.error ? kBad : kWhite);
+    int y = kTitleY + kTitleFontHeight + 16;
+    if (v.detail[0]) {
+        char detail[kLineLen];
+        CopyText(detail, sizeof(detail), v.detail);
+        Ellipsize(kBold, detail, sizeof(detail), left_w);
+        DrawText(kBold, kX, y, detail, kText);
+        y += kBoldFontHeight + 22;
+    }
+    if (v.progress >= 0) {
+        RoundRect(kX, y, left_w, 12, 6, Rgb(40, 50, 76));
+        const int fill = std::max(12, int(float(left_w) * std::clamp(v.progress, 0.0f, 1.0f)));
+        RoundRect(kX, y, fill, 12, 6, v.error ? kBad : kAccent);
+        y += 12 + 34;
+    } else {
+        y += 10;
+    }
+
+    // Activity: the latest trace lines.
+    const int card_y = std::max(y, 400), card_h = 900 - card_y;
+    Shadow(kX, card_y, left_w, card_h, 24);
+    RoundRect(kX, card_y, left_w, card_h, 24, kCard);
+    DrawText(kRegular, kX + 30, card_y + 22, "Activity", kAccent);
+    {
+        const int line_h = kStatusFontHeight + 4;
+        const int top = card_y + 22 + line_h + 8, bottom = card_y + card_h - 20;
+        const int visible = std::max(0, (bottom - top) / line_h);
+        char lines[kLines][kLineLen];
+        Lock();
+        const int count = g_line_count < kLines ? g_line_count : kLines;
+        const int first = count > visible ? count - visible : 0;
+        for (int i = first; i < count; i++)
+            memcpy(lines[i - first], g_lines[(g_line_count - count + i) % kLines], kLineLen);
+        Unlock();
+        for (int i = 0; i < count - first; i++) {
+            Ellipsize(kRegular, lines[i], sizeof(lines[i]), left_w - 60);
+            const bool newest = i == count - first - 1;
+            DrawText(kRegular, kX + 30, top + i * line_h, lines[i], newest ? kText : kDim, kX + left_w - 30);
+        }
+    }
+
+    // Results / output on the right.
+    if (side) {
+        const int px = kX + left_w + 60, pw = kWidth - px - 100, py = kTitleY, ph = 900 - kTitleY;
+        Shadow(px, py, pw, ph, 24);
+        RoundRect(px, py, pw, ph, 24, kCard);
+        DrawText(kBold, px + 30, py + 26, heading[0] ? heading : "Output", kWhite, px + pw - 30);
+        const int line_h = kStatusFontHeight + 6;
+        int ly = py + 26 + kBoldFontHeight + 18;
+        if (g_watch_count == 0)
+            DrawText(kRegular, px + 30, ly, "Nothing yet", kDim);
+        for (int i = 0; i < g_watch_count && i < kWatchLines && ly < py + ph - line_h; i++) {
+            const char* text = g_watch_lines[i];
+            const bool done = strncmp(text, "done", 4) == 0, total = strncmp(text, "end ", 4) == 0;
+            const bool first_line = i == 0 && strstr(text, "lower is faster");
+            if (first_line)
+                continue; // the detail line says it
+            char shown[kLineLen];
+            CopyText(shown, sizeof(shown), text);
+            // "name: values" too wide for one line: the name, then the values under it.
+            char* split = strstr(shown, ": ");
+            if (split && TextWidth(kRegular, shown) > pw - 60) {
+                *split = 0;
+                Ellipsize(kBold, shown, sizeof(shown), pw - 60);
+                DrawText(kBold, px + 30, ly, shown, kWhite, px + pw - 30);
+                ly += kBoldFontHeight + 2;
+                char values[kLineLen];
+                CopyText(values, sizeof(values), split + 2);
+                Ellipsize(kRegular, values, sizeof(values), pw - 60);
+                DrawText(kRegular, px + 30, ly, values, done ? kGood : kText, px + pw - 30);
+                ly += line_h + 8;
+                continue;
+            }
+            Ellipsize(kRegular, shown, sizeof(shown), pw - 60);
+            DrawText(kRegular, px + 30, ly, shown, done ? kGood : total ? kWhite : kText, px + pw - 30);
+            ly += line_h;
+        }
+    }
+
+    // Hints.
+    int hx = kX;
+    const int hy = 936;
+    if (v.finished && strstr(stage, "Benchmark")) {
+        hx = DrawButton(hx, hy, Button::Cross);
+        Hint(hx, hy, "Back to the launcher");
+    } else if (strstr(stage, "press any button")) {
+        Hint(hx, hy, "Press any button to stop");
+    } else {
+        Hint(hx, hy, "Close the app with the PS button");
+    }
+    const char* logs = "Logs: /data/switch-emu/logs";
+    DrawText(kRegular, kWidth - 100 - TextWidth(kRegular, logs), hy + 8, logs, kDim);
+}
+
 void DrawFrame(int tick) {
     if (g_launcher_on) {
         DrawLauncher();
@@ -1351,89 +1606,7 @@ void DrawFrame(int tick) {
         DrawLoading("Starting...");
         return;
     }
-    const int line_h = kStatusFontHeight + 2;
-    FillRect(0, 0, kWidth, kHeight, kBackground);
-    FillRect(0, 0, kWidth, 6, kAccent);
-
-    char stage[kLineLen], title[64];
-    Lock();
-    CopyText(stage, sizeof(stage), g_stage);
-    CopyText(title, sizeof(title), g_title);
-    Unlock();
-
-    // Header: title, stage with a spinner, elapsed time.
-    DrawText(60, 40, title, kAccent);
-    static const char* const kSpinner[] = {"|", "/", "-", "\\"};
-    const double t = Elapsed();
-    char header[256];
-    snprintf(header, sizeof(header), "%s  %s", g_crashed ? "!" : kSpinner[tick % 4], stage);
-    DrawText(60, 40 + line_h + 8, header, g_crashed ? kBad : kText);
-    char clock_text[48];
-    snprintf(clock_text, sizeof(clock_text), "running %d:%02d", int(t) / 60, int(t) % 60);
-    DrawText(kWidth - 320, 40, clock_text, kDim);
-
-    // Watched file (e.g. benchmark results) on the right.
-    const int panel_x = 1120, panel_y = 170, panel_w = kWidth - panel_x - 60, panel_h = kHeight - panel_y - 110;
-    FillRect(panel_x, panel_y, panel_w, panel_h, kPanel);
-    char path[256], heading[64];
-    Lock();
-    CopyText(path, sizeof(path), g_watch_path);
-    CopyText(heading, sizeof(heading), g_watch_heading);
-    Unlock();
-    int y = panel_y + 20;
-    DrawText(panel_x + 24, y, heading[0] ? heading : "Output", kAccent, panel_x + panel_w - 20);
-    y += line_h + 10;
-    PollWatchedFile(path);
-    if (g_watch_count == 0)
-        DrawText(panel_x + 24, y, "(nothing yet)", kDim, panel_x + panel_w - 20);
-    for (int i = 0; i < g_watch_count && i < kWatchLines && y < panel_y + panel_h - line_h; i++) {
-        const char* text = g_watch_lines[i];
-        const uint32_t color = strncmp(text, "done", 4) == 0   ? kGood
-                               : strncmp(text, "end ", 4) == 0 ? kText
-                                                               : kDim;
-        DrawText(panel_x + 24, y, text, color, panel_x + panel_w - 20);
-        y += line_h;
-    }
-
-    // Menu on the left (instead of the log) while one is shown.
-    Lock();
-    const int menu_count = g_menu_count;
-    char menu[kMenuLines][kLineLen];
-    memcpy(menu, g_menu, sizeof(menu));
-    Unlock();
-    if (menu_count > 0) {
-        for (int i = 0; i < menu_count; i++) {
-            const bool selected = strncmp(menu[i], "> ", 2) == 0;
-            if (selected)
-                FillRect(48, 170 + i * line_h - 2, panel_x - 90, line_h, kPanel);
-            DrawText(60, 170 + i * line_h, menu[i], selected ? kAccent : (menu[i][0] == ' ' ? kDim : kText),
-                     panel_x - 30);
-        }
-        DrawText(60, kHeight - 70, "D-pad: choose   Cross: change / start   Results: /data/switch-emu/logs/bench-results.txt",
-                 kDim);
-        return;
-    }
-
-    // Recent trace lines on the left, newest at the bottom.
-    const int log_top = 170, log_bottom = kHeight - 110;
-    const int visible = (log_bottom - log_top) / line_h;
-    Lock();
-    const int count = g_line_count < kLines ? g_line_count : kLines;
-    const int first = count > visible ? count - visible : 0;
-    char lines[kLines][kLineLen];
-    for (int i = first; i < count; i++) {
-        const int index = (g_line_count - count + i) % kLines;
-        memcpy(lines[i - first], g_lines[index], kLineLen);
-    }
-    Unlock();
-    for (int i = 0; i < count - first; i++)
-        DrawText(60, log_top + i * line_h, lines[i], kDim, panel_x - 30);
-
-    // Footer.
-    DrawText(60, kHeight - 70,
-             g_crashed ? "The emulator crashed - crash.log is in /data/switch-emu/logs/"
-                       : "Logs: /data/switch-emu/logs/boot-trace.log   Close the app with the PS button.",
-             g_crashed ? kBad : kDim);
+    DrawStatus(tick);
 }
 
 // --- VideoOut ----------------------------------------------------------------------------------

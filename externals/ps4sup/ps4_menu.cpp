@@ -601,16 +601,8 @@ void AppendResult(int index, const char* text) {
     }
 }
 
-// Shows the results and waits for the user to close the app.
-[[noreturn]] void ShowResultsForever() {
-    WriteSuiteIndex(-1);
-    WriteOptions(kSuite[kSuiteCount - 1].options);
-    ps4_status_watch_file(kResults, "Benchmark suite results");
-    ps4_status_set_stage("Benchmark suite finished - results on the right. Close the app with the PS button.");
-    ps4_boot_trace("menu: benchmark suite finished");
-    for (;;)
-        sleep(1);
-}
+// Shows the results until a button is pressed, then goes back to the launcher (below Pad).
+[[noreturn]] void ShowResultsForever();
 
 // "end integer: ...  -> 6.0 s real" -> "6.0 s"
 void FindResult(const char* text, const char* test, char* out, size_t size) {
@@ -702,6 +694,23 @@ private:
     double repeat_at = 0;
     uint32_t stick = 0; // the stick's current direction bit
 };
+
+[[noreturn]] void ShowResultsForever() {
+    WriteSuiteIndex(-1);
+    WriteOptions(kSuite[kSuiteCount - 1].options);
+    ps4_status_watch_file(kResults, "Benchmark suite results");
+    ps4_status_set_stage("Benchmark suite finished - results on the right. Press any button for the launcher.");
+    ps4_boot_trace("menu: benchmark suite finished");
+    Pad pad;
+    for (;;) {
+        if (pad.Pressed() != 0) {
+            if (FILE* f = fopen(kBackToMenu, "w"))
+                fclose(f);
+            sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
+        }
+        usleep(50 * 1000);
+    }
+}
 
 // Navigation sounds while the launcher shows: short synthesized tones on their own audio port,
 // closed again before Eden opens the audio output for the game.
