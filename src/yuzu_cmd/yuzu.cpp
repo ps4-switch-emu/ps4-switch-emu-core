@@ -126,6 +126,8 @@ extern "C" int ps4_overlay_mode();
 extern "C" void ps4_swapchain_show_loading(const char* progress); // vk_swapchain.cpp
 extern "C" void ps4_loading_cache(unsigned done, unsigned total);    // status_screen.cpp
 extern "C" void ps4_loading_starting_game();
+extern "C" unsigned ps4_cpu_mhz();   // externals/ps4sup/stub.cpp
+extern "C" bool ps4_is_pro_mode();
 static u64 g_ps4_session_start = 0; // SDL ticks when the game started, for the Home menu's play time
 
 // Play time across sessions: /data/switch-emu/titles/<file>.play holds "<seconds> <sessions>" (the
@@ -558,6 +560,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     ps4_status_watch_file("/data/switch-emu/sdmc/cpu-benchmark.txt", "test.nro output");
     PS4_STAGE("Starting up");
     PS4_TRACE("main: eden-cli starting, heap {} MiB from {}", ps4rt_heap_size() >> 20, ps4rt_heap_source());
+    PS4_TRACE("main: CPU clock ~{} MHz, PS4 Pro enhanced mode {}", ps4_cpu_mhz(), ps4_is_pro_mode() ? "ON" : "off");
     // How this jailbreak lets us map JIT code (0 = plain RWX mmap ... 4 = JIT shared memory,
     // -1 = none works); dynarmic's PS4ExecAllocator maps through the method found here.
     PS4_TRACE("main: executable memory method {}", ps4_exec_probe());

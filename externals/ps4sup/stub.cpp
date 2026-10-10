@@ -65,7 +65,10 @@ std::ios_base::Init init;
 
 // Lag spike diagnostics (vk_swapchain.cpp reports them with long frames): fastmem faults that
 // dynarmic handled, and new pipelines built by the Vulkan pipeline cache.
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <time.h>
 std::atomic<unsigned long long> ps4_fastmem_faults{0};
 std::atomic<unsigned long long> ps4_pipelines_built{0};
 extern "C" void ps4_count_fastmem_fault() {
@@ -80,4 +83,37 @@ extern "C" void ps4_jit_cache_full(unsigned core, unsigned long long size) {
     snprintf(line, sizeof(line), "jit: core %u code cache full (%llu MiB), cleared - %u so far", core,
              size >> 20, count.fetch_add(1, std::memory_order_relaxed) + 1);
     ps4_boot_trace(line);
+}
+
+// The CPU's clock, measured (~50 ms, once): a chain of dependent adds runs at one per cycle, so
+// adds per second is the clock. A PS4 Pro runs its cores at ~2.1 GHz instead of 1.6 in its
+// enhanced mode (the PRO package) or with Boost Mode on - this shows which one a run got.
+extern "C" int32_t sceKernelIsNeoMode();
+extern "C" unsigned ps4_cpu_mhz() {
+    static unsigned mhz = 0;
+    if (mhz != 0)
+        return mhz;
+    const auto run = [](unsigned long long iterations) {
+        timespec t0{}, t1{};
+        unsigned long long x = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (unsigned long long i = 0; i < iterations; i++) {
+            asm volatile("add $1, %0\n\tadd $1, %0\n\tadd $1, %0\n\tadd $1, %0\n\t"
+                         "add $1, %0\n\tadd $1, %0\n\tadd $1, %0\n\tadd $1, %0"
+                         : "+r"(x));
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        return double(t1.tv_sec - t0.tv_sec) + double(t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    };
+    run(1'000'000); // warm up (the core may be clocked down while idle)
+    constexpr unsigned long long kIterations = 12'000'000; // 96M adds: ~45 ms at 2.1 GHz
+    double best = 1e9;
+    for (int i = 0; i < 3; i++)
+        best = std::min(best, run(kIterations));
+    mhz = unsigned(double(kIterations) * 8.0 / best / 1e6 + 0.5);
+    return mhz;
+}
+
+extern "C" bool ps4_is_pro_mode() {
+    return sceKernelIsNeoMode() != 0;
 }

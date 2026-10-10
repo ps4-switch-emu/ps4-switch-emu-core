@@ -126,17 +126,26 @@ std::string AppVersion() {
 }
 
 // Settings > About: the console's system software version.
+extern "C" unsigned ps4_cpu_mhz(); // stub.cpp
+extern "C" bool ps4_is_pro_mode();
+
+// Firmware, and what this run gets from the hardware: the CPU clock (Boost Mode / the Pro's
+// enhanced mode raise it) and whether the PS4 Pro's enhanced mode is on.
 std::string Ps4Firmware() {
+    std::string text = "Unknown";
 #ifdef __OPENORBIS__
     SceKernelSwVersion v{};
     v.size = sizeof(v);
     if (sceKernelGetSystemSwVersion(&v) == 0 && v.version != 0) {
-        char text[16];
-        snprintf(text, sizeof(text), "%x.%02x", v.version >> 24, (v.version >> 16) & 0xFF);
-        return text;
+        char version[16];
+        snprintf(version, sizeof(version), "%x.%02x", v.version >> 24, (v.version >> 16) & 0xFF);
+        text = version;
     }
+    char hw[64];
+    snprintf(hw, sizeof(hw), "  -  CPU %.1f GHz%s", ps4_cpu_mhz() / 1000.0, ps4_is_pro_mode() ? ", Pro mode" : "");
+    text += hw;
 #endif
-    return "Unknown";
+    return text;
 }
 
 // What commercial games need from the user's own Switch, for Settings > Setup.
@@ -1068,8 +1077,10 @@ void ps4_menu_run() {
                                     "version and the PS4 firmware below in bug reports."});
                 break;
             case kPs4Firmware:
-                settings.push_back({"PS4 firmware", ps4_firmware.c_str(),
-                                    "The console's system software version, as the console reports it."});
+                settings.push_back({"PS4", ps4_firmware.c_str(),
+                                    "The console's system software version, its CPU clock as measured at "
+                                    "start (a PS4 Pro runs ~2.1 GHz with Boost Mode or in its enhanced mode, "
+                                    "1.6 GHz otherwise) and whether the Pro's enhanced mode is on."});
                 break;
             case kKeys:
                 settings.push_back({"Keys", keys_value,
