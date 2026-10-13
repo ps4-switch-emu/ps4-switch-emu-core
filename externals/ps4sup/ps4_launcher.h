@@ -82,6 +82,8 @@ void ps4_launcher_set_loading(const char* title, const uint32_t* icon);
 // first frame - the swap chain redraws the screen meanwhile, see vk_swapchain.cpp).
 void ps4_loading_cache(unsigned done, unsigned total);
 void ps4_loading_starting_game();
+// The game stopped responding before its first frame: the loading screen shows it (detail: why).
+void ps4_loading_failed(const char* detail);
 // In-game Home menu into a swap image (see vk_swapchain.cpp's overlay); capture: take src as the
 // new background.
 void ps4_status_draw_home(uint32_t* dst, const uint32_t* src, int pitch, const Ps4HomeMenu* menu, bool capture);

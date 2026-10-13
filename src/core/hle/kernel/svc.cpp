@@ -1,3 +1,4 @@
+#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
@@ -2496,7 +2497,10 @@ static void Call64(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
     default: UNREACHABLE_MSG("Unhandled SVC {:#x}!", imm);
     }
 }
+std::atomic<u64> g_svc_count{0};
+
 void Call(Core::System& system, u32 imm) {
+    g_svc_count.fetch_add(1, std::memory_order_relaxed); // guest activity (yuzu_cmd: a stalled boot)
     auto& kernel = system.Kernel();
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;

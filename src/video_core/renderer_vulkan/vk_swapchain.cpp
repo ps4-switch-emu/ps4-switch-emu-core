@@ -765,4 +765,9 @@ extern "C" void ps4_swapchain_overlay_end() {
 extern "C" unsigned long long ps4_gpu_wait_us() {
     return Vulkan::g_ps4_gpu_wait_us.load(std::memory_order_relaxed);
 }
+
+// Whether a game frame has reached the screen yet (yuzu_cmd: a boot that stalls before it).
+extern "C" bool ps4_first_frame_shown() {
+    return Vulkan::g_ps4_presented.load(std::memory_order_relaxed);
+}
 #endif

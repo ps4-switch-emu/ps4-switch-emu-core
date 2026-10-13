@@ -162,6 +162,14 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
 #undef A64OPC
     };
 
+    if (conf.trace_blocks) { // as a host call from block code (nothing is live yet)
+        ctx.reg_alloc.HostCall(code, nullptr);
+        Devirtualize<&A64::UserCallbacks::TraceBlock>(conf.callbacks).EmitCall(code, [&](RegList param) {
+            code.mov(param[0], A64::LocationDescriptor{block.Location()}.PC());
+        });
+        ctx.reg_alloc.EndOfAllocScope();
+    }
+
     FoldFastmemAddresses(ctx);
 
     for (auto& inst : block.instructions) {

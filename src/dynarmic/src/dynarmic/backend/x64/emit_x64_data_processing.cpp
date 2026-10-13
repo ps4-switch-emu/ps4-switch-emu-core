@@ -1573,6 +1573,14 @@ void EmitX64::EmitSignExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality)) {
+        // Already zero-extended (a memory read's movzx, an earlier extend): reuse the register.
+        // GPRs only - a read straight into a vector register has its own rules for the upper lanes.
+        if (const int bits = ZeroExtendedFromBits(inst->GetArg(0)); bits != 0 && args[0].IsInGpr(ctx.reg_alloc) && bits <= 8) {
+            ctx.reg_alloc.DefineValue(code, inst, args[0]);
+            return;
+        }
+    }
     if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate()) {
         // Extend from the source into a fresh register: one instruction whether or not the
         // source is still needed (UseScratchGpr would copy a live source first).
@@ -1589,6 +1597,14 @@ void EmitX64::EmitZeroExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendHalfToWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality)) {
+        // Already zero-extended (a memory read's movzx, an earlier extend): reuse the register.
+        // GPRs only - a read straight into a vector register has its own rules for the upper lanes.
+        if (const int bits = ZeroExtendedFromBits(inst->GetArg(0)); bits != 0 && args[0].IsInGpr(ctx.reg_alloc) && bits <= 16) {
+            ctx.reg_alloc.DefineValue(code, inst, args[0]);
+            return;
+        }
+    }
     if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality) && !args[0].IsImmediate()) {
         // Extend from the source into a fresh register: one instruction whether or not the
         // source is still needed (UseScratchGpr would copy a live source first).
@@ -1615,6 +1631,14 @@ void EmitX64::EmitZeroExtendHalfToLong(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (ctx.HasOptimization(OptimizationFlag::HostRegisterLocality)) {
+        // Already zero-extended (a memory read's movzx, an earlier extend): reuse the register.
+        // GPRs only - a read straight into a vector register has its own rules for the upper lanes.
+        if (const int bits = ZeroExtendedFromBits(inst->GetArg(0)); bits != 0 && args[0].IsInGpr(ctx.reg_alloc) && bits <= 32) {
+            ctx.reg_alloc.DefineValue(code, inst, args[0]);
+            return;
+        }
+    }
     if (args[0].IsInXmm(ctx.reg_alloc) && code.HasHostFeature(HostFeature::SSE41) && ctx.HasOptimization(OptimizationFlag::HostRegisterLocality)) {
         // A scalar FP result on its way back into a vector register (ZeroExtendToQuad): stay in
         // the vector register instead of a movd to a GPR and a movq back.

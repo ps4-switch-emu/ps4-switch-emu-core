@@ -8,6 +8,9 @@
 #include <memory>
 #include <mutex>
 #include <regex>
+#include <functional>
+#include <chrono>
+#include <cstdio>
 #include <string>
 #include "common/settings_enums.h"
 #ifdef __EMSCRIPTEN__
@@ -18,6 +21,8 @@
 
 #include <fmt/ostream.h>
 
+#include "common/cityhash.h"
+#include "common/fs/file.h"
 #include "common/logging.h"
 #include "common/param_package.h"
 #include "common/scm_rev.h"
@@ -28,6 +33,7 @@
 #include "common/cpu_features.h"
 #include "common/x64/rdtsc.h"
 #include "core/core.h"
+#include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/perf_stats.h"
@@ -39,11 +45,18 @@
 #include "core/hle/service/am/applet_manager.h"
 #include "core/device_memory.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/filesystem/romfs_controller.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/svc.h"
+#include "core/arm/debug.h"
+#include "video_core/host1x/host1x.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
 #include <algorithm>
 #include <strings.h>
 #include <dirent.h>
+#include "common/stb.h"
 #include "frontend_common/content_manager.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
@@ -96,6 +109,11 @@
 #include <pthread.h>
 #include <pthread_np.h>
 extern "C" void ps4_boot_trace(const char* stage); // externals/ps4sup/crashlog.cpp
+extern "C" void ps4_heartbeat();            // externals/ps4sup/sampler.cpp: the hang watchdog
+extern "C" void ps4_hang_watchdog_start();
+extern "C" void ps4_dump_host_threads(unsigned seconds);
+extern "C" void ps4_heap_usage(unsigned long long* main_used, unsigned long long* main_size,
+                               unsigned long long* overflow_used, unsigned long long* overflow_size); // dps4/ps4_runtime.cpp
 // externals/ps4sup/dps4/ps4_runtime.cpp (DolphinPS4)
 extern "C" int ps4_exec_probe();
 extern "C" const char* ps4rt_heap_source(void);
@@ -126,6 +144,9 @@ extern "C" int ps4_overlay_mode();
 extern "C" void ps4_swapchain_show_loading(const char* progress); // vk_swapchain.cpp
 extern "C" void ps4_loading_cache(unsigned done, unsigned total);    // status_screen.cpp
 extern "C" void ps4_loading_starting_game();
+extern "C" void ps4_loading_failed(const char* detail); // status_screen.cpp
+extern "C" bool ps4_first_frame_shown();               // vk_swapchain.cpp
+static bool g_ps4_boot_stalled = false;                // the loading screen says so; Circle leaves
 extern "C" unsigned ps4_cpu_mhz();   // externals/ps4sup/stub.cpp
 extern "C" bool ps4_is_pro_mode();
 static u64 g_ps4_session_start = 0; // SDL ticks when the game started, for the Home menu's play time
@@ -309,6 +330,86 @@ __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
 #endif
+
+// RomFS self-test (debugging): every file of the game's RomFS read the way a game reads it - through
+// the decrypting storage layers, in 2 MiB pieces - with a hash per file, so two machines' lists can
+// be diffed (a PS4-only data corruption shows up as the files that differ). PS4: an empty file
+// /data/switch-emu/romfs-test (output logs/romfs-hashes.txt); PC: EDEN_ROMFS_TEST=<output path>.
+static void RomfsSelfTest(Core::System& system, const std::string& filepath, const std::string& out_path) {
+    // The RomFS the game itself sees: the base with the installed update applied.
+    FileSys::VirtualFile romfs;
+    std::shared_ptr<Service::FileSystem::RomFsController> romfs_controller;
+    std::shared_ptr<Service::FileSystem::SaveDataController> save_controller;
+    u64 program_id = 0;
+    if (const auto* process = system.ApplicationProcess(); process &&
+        system.GetFileSystemController().OpenProcess(&program_id, &save_controller, &romfs_controller,
+                                                     process->GetProcessId()) == ResultSuccess &&
+        romfs_controller)
+        romfs = romfs_controller->OpenRomFSCurrentProcess();
+    {
+        // Which RomFS is this: the base's or an update's? (Sizes and the first 512 bytes of each.)
+        const auto file = system.GetFilesystem()->OpenFile(filepath, FileSys::OpenMode::Read);
+        const auto loader = file ? Loader::GetLoader(system, file) : nullptr;
+        FileSys::VirtualFile base;
+        if (loader)
+            loader->ReadRomFS(base);
+        const auto head = [](const FileSys::VirtualFile& f) -> u64 {
+            if (!f) return 0;
+            std::array<u8, 512> b{};
+            return Common::CityHash64(reinterpret_cast<const char*>(b.data()), f->Read(b.data(), b.size(), 0));
+        };
+        const auto base_nca = system.GetContentProvider().GetEntry(program_id, FileSys::ContentRecordType::Program);
+        LOG_WARNING(Loader, "romfs-test: program {:016X}; base romfs size {:#x} head {:016x}; patched size {:#x} head {:016x}; "
+                    "provider's program NCA {} (romfs size {:#x}, update {})", program_id,
+                    base ? base->GetSize() : 0, head(base), romfs ? romfs->GetSize() : 0, head(romfs),
+                    base_nca ? base_nca->GetName() : "none", base_nca && base_nca->GetRomFS() ? base_nca->GetRomFS()->GetSize() : 0,
+                    base_nca ? base_nca->IsUpdate() : false);
+    }
+    if (!romfs) {
+        const auto file = system.GetFilesystem()->OpenFile(filepath, FileSys::OpenMode::Read);
+        const auto loader = file ? Loader::GetLoader(system, file) : nullptr;
+        if (!loader || loader->ReadRomFS(romfs) != Loader::ResultStatus::Success || !romfs)
+            return;
+    }
+    const auto root = FileSys::ExtractRomFS(romfs);
+    std::FILE* out = std::fopen(out_path.c_str(), "w");
+    if (!root || !out)
+        return;
+    std::vector<u8> chunk(2u << 20);
+    u64 files = 0, bytes = 0;
+    const auto start = std::chrono::steady_clock::now();
+    std::function<void(const FileSys::VirtualDir&, const std::string&)> walk = [&](const FileSys::VirtualDir& dir,
+                                                                                   const std::string& path) {
+        auto subdirs = dir->GetSubdirectories();
+        std::sort(subdirs.begin(), subdirs.end(), [](const auto& a, const auto& b) { return a->GetName() < b->GetName(); });
+        auto entries = dir->GetFiles();
+        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a->GetName() < b->GetName(); });
+        for (const auto& f : entries) {
+            const u64 size = f->GetSize();
+            u64 h = 0;
+            size_t short_reads = 0;
+            char magic[9] = "-";
+            if (u8 head[4]{}; size >= 4 && f->Read(head, 4, 0) == 4)
+                std::snprintf(magic, sizeof(magic), "%02x%02x%02x%02x", head[0], head[1], head[2], head[3]);
+            for (u64 off = 0; off < size; off += chunk.size()) {
+                const size_t want = size_t(std::min<u64>(chunk.size(), size - off));
+                const size_t got = f->Read(chunk.data(), want, off);
+                short_reads += got != want;
+                h = Common::CityHash64WithSeed(reinterpret_cast<const char*>(chunk.data()), got, h);
+            }
+            std::fprintf(out, "%s/%s %llu %016llx %s%s\n", path.c_str(), f->GetName().c_str(), (unsigned long long)size,
+                         (unsigned long long)h, magic, short_reads ? " SHORT" : "");
+            files++, bytes += size;
+        }
+        for (const auto& d : subdirs)
+            walk(d, path + "/" + d->GetName());
+    };
+    walk(root, "");
+    std::fclose(out);
+    PS4_TRACE("romfs-test: {} files, {} MiB hashed in {:.0f} s -> {}", files, bytes >> 20,
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), out_path);
+}
+
 
 static void PrintHelp(const char* argv0) {
     std::cout << "Usage: " << argv0
@@ -518,6 +619,8 @@ static void StartAutopress(InputCommon::InputSubsystem& input, Core::HID::Emulat
 }
 
 struct SdlState {
+    // The booted file's contents (declared first: the system keeps a pointer to it until it's gone).
+    std::unique_ptr<FileSys::ManualContentProvider> manual_provider;
     Core::System system{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
 };
@@ -575,8 +678,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         asm volatile("mov %0, %%rcx\n1:\n\tdec %%rcx\n\tjnz 1b" : : "r"(kIterations) : "rcx", "cc");
         const u64 t1 = Common::X64::FencedRDTSC();
         const double seconds = double(t1 - t0) / double(tsc);
+        // The loop runs at one iteration per two cycles on Jaguar (one taken branch per two
+        // cycles): it read 1039 MHz on a console the add chain above measures at 2079.
         PS4_TRACE("main: cpu {:.0f} MHz measured, {} MHz reported, Pro mode {} (has {}), cpu mode {}, TSC {} MHz",
-                  double(kIterations) / seconds / 1e6, u32(sceKernelGetCpuFrequency()) / 1000000,
+                  2.0 * double(kIterations) / seconds / 1e6, u32(sceKernelGetCpuFrequency()) / 1000000,
                   sceKernelIsNeoMode(), sceKernelHasNeoMode(), sceKernelGetCpumode(), tsc / 1000000);
     }
     {
@@ -852,6 +957,27 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
               int(Settings::values.resolution_setup.GetValue()));
 #endif
     PS4_TRACE("main: game path {}", filepath);
+    // /data/switch-emu/io-test: read 1 MiB of the game file at several offsets through Eden's file
+    // code and trace an FNV-1a hash of each (compare with the same file on a PC): large-offset
+    // reads going wrong on the PS4 would feed a game corrupt data.
+#ifdef __OPENORBIS__
+    if (struct stat st; stat("/data/switch-emu/io-test", &st) == 0) {
+        Common::FS::IOFile file{filepath, Common::FS::FileAccessMode::Read, Common::FS::FileType::BinaryFile};
+        const u64 size = file.GetSize();
+        std::vector<u8> buf(1u << 20);
+        for (const u64 off : {u64(0), u64(0x7F000000), u64(0x81000000), u64(0xFF000000), u64(0x101000000),
+                              u64(0x147FE0000), u64(0x170000000)}) {
+            if (off + buf.size() > size)
+                continue;
+            const bool sought = file.Seek(s64(off));
+            const size_t got = file.ReadSpan(std::span<u8>(buf));
+            u64 h = 1469598103934665603ULL;
+            for (size_t i = 0; i < got; i++)
+                h = (h ^ buf[i]) * 1099511628211ULL;
+            PS4_TRACE("io-test: offset {:#x}: seek {}, read {} bytes, fnv1a {:016x}", off, sought, got, h);
+        }
+    }
+#endif
     PS4_STAGE("Initializing the emulated Switch");
     state->system.Initialize();
     PS4_TRACE("main: system initialized");
@@ -913,13 +1039,56 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     state->system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     state->system.GetFileSystemController().CreateFactories(*state->system.GetFilesystem());
+    state->manual_provider = std::make_unique<FileSys::ManualContentProvider>();
+    state->system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                          state->manual_provider.get());
     state->system.GetUserChannel().clear();
 #ifdef __OPENORBIS__
     if (struct stat st; stat("/data/switch-emu/install-now", &st) == 0) {
         remove("/data/switch-emu/install-now");
         PS4InstallPending(state->system);
     }
+#else
+    // EDEN_INSTALL_NSP=<file>: install an update/DLC into the NAND first (a PC running a game with
+    // the same update as a console).
+    if (const char* nsp = std::getenv("EDEN_INSTALL_NSP")) {
+        const auto result = ContentManager::InstallNSP(state->system, *state->system.GetFilesystem(), nsp,
+                                                       [](size_t, size_t) { return false; });
+        std::fprintf(stderr, "EDEN_INSTALL_NSP %s: result %d\n", nsp, int(result));
+    }
 #endif
+
+    // The game file's own NCAs go in the content provider (as on Android, and the Qt game list). An
+    // update installed in the NAND patches the RomFS on top of the base program NCA, and finds it
+    // there: without it the update's code ran on the original data and a game with
+    // its update crashed on a null object while loading.
+    // An update packed in the file (some cartridge dumps carry one) is only used when it's newer
+    // than the one installed in the NAND: the patch manager prefers this provider's updates.
+    if (const auto game_file = state->system.GetFilesystem()->OpenFile(filepath, FileSys::OpenMode::Read)) {
+        FileSys::ManualContentProvider packed;
+        u64 program_id = 0;
+        const auto loader = Loader::GetLoader(state->system, game_file);
+        if (packed.AddEntriesFromContainer(game_file) && loader &&
+            loader->ReadProgramId(program_id) == Loader::ResultStatus::Success) {
+            const u64 update_id = FileSys::GetUpdateTitleID(program_id);
+            u32 packed_version = 0;
+            for (const auto& entry : packed.ListUpdateVersions(update_id))
+                packed_version = std::max(packed_version, entry.version);
+            const auto installed_version = state->system.GetContentProvider().GetEntryVersion(update_id);
+            if (installed_version && *installed_version >= packed_version) {
+                LOG_INFO(Frontend, "Using the installed update (v{}) over the game file's (v{})",
+                         *installed_version, packed_version);
+                for (const auto type : {FileSys::ContentRecordType::Meta, FileSys::ContentRecordType::Program,
+                                        FileSys::ContentRecordType::Data, FileSys::ContentRecordType::Control,
+                                        FileSys::ContentRecordType::HtmlDocument,
+                                        FileSys::ContentRecordType::LegalInformation})
+                    if (auto file = packed.GetEntryRaw(program_id, type))
+                        state->manual_provider->AddEntry(FileSys::TitleType::Application, type, program_id, file);
+            } else {
+                state->manual_provider->AddEntriesFromContainer(game_file);
+            }
+        }
+    }
 
     Service::AM::FrontendAppletParameters load_parameters{
         .applet_id = Service::AM::AppletId::Application,
@@ -928,10 +1097,18 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     PS4_STAGE("Loading {}", filepath);
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, filepath, load_parameters);
     PS4_TRACE("main: load result {}", int(load_result));
+#ifndef __OPENORBIS__
+    if (const char* out = std::getenv("EDEN_ROMFS_TEST"); out && load_result == Core::SystemResultStatus::Success)
+        RomfsSelfTest(state->system, filepath, out);
+#endif
 #ifdef __OPENORBIS__
     if (load_result == Core::SystemResultStatus::Success) {
         // The launcher's library: remember this game's real title and icon.
         PS4CacheTitle(state->system, filepath);
+#ifdef __OPENORBIS__
+        if (struct stat st; stat("/data/switch-emu/romfs-test", &st) == 0)
+            RomfsSelfTest(state->system, filepath, "/data/switch-emu/logs/romfs-hashes.txt");
+#endif
         // Saves live per user and title: show which user is active and whether this game has saved
         // before (so a missing save after a restart can be told apart from a changed user).
         const auto user = state->system.GetProfileManager().GetUser(Settings::values.current_user.GetValue());
@@ -1187,6 +1364,7 @@ static void PS4HomeMenu(SdlState* state) {
                   kSticks = (1u << SDL_GAMEPAD_BUTTON_LEFT_STICK) | (1u << SDL_GAMEPAD_BUTTON_RIGHT_STICK);
     u32 previous = PS4GamepadButtons() | kSticks; // ignore what's still held from opening it
     for (;;) {
+        ps4_heartbeat(); // the menu's own loop: not a hang
         SDL_PumpEvents();
         SDL_UpdateGamepads();
         const u32 now = PS4GamepadButtons();
@@ -1244,39 +1422,84 @@ static void PS4HomeMenu(SdlState* state) {
 
 // EDEN_SCREENSHOTS=<dir>: saves the game's picture there every EDEN_SCREENSHOT_EVERY seconds
 // (default 5) as shot-<seconds>.ppm, to see where a game is when nobody watches the screen (PC
-// runs driven by EDEN_AUTOPRESS).
+// runs driven by EDEN_AUTOPRESS). On the PS4 the switch file /data/switch-emu/screenshots does the
+// same (its contents, if a number, are the seconds between shots) into logs/shots as JPEGs (a
+// session's shots replace the last session's): pictures of what a game looked like, over FTP.
 static void MaybeScreenshot(Core::System& system) {
-    static const char* const dir = std::getenv("EDEN_SCREENSHOTS");
-    if (!dir || !system.IsPoweredOn() || system.Renderer().IsScreenshotPending())
+    static int every_ms = -1;
+    static std::string dir;
+    if (every_ms < 0) {
+        every_ms = 0;
+#ifdef __OPENORBIS__
+        if (FILE* f = std::fopen("/data/switch-emu/screenshots", "r")) {
+            double seconds = 0;
+            if (std::fscanf(f, "%lf", &seconds) != 1 || seconds < 1)
+                seconds = 5;
+            std::fclose(f);
+            dir = "/data/switch-emu/logs/shots";
+            mkdir(dir.c_str(), 0777);
+            if (DIR* d = opendir(dir.c_str())) {
+                while (dirent* entry = readdir(d))
+                    if (std::strncmp(entry->d_name, "shot-", 5) == 0)
+                        unlink((dir + "/" + entry->d_name).c_str());
+                closedir(d);
+            }
+            every_ms = int(seconds * 1000);
+            PS4_TRACE("screenshots: every {:.0f} s to {}", seconds, dir);
+        }
+#else
+        if (const char* env = std::getenv("EDEN_SCREENSHOTS")) {
+            dir = env;
+            const char* every = std::getenv("EDEN_SCREENSHOT_EVERY");
+            every_ms = int((every ? std::atof(every) : 5.0) * 1000);
+        }
+#endif
+    }
+    if (every_ms <= 0 || !system.IsPoweredOn() || system.Renderer().IsScreenshotPending())
         return;
-    static const double every = std::getenv("EDEN_SCREENSHOT_EVERY") ? std::atof(std::getenv("EDEN_SCREENSHOT_EVERY")) : 5.0;
     static const auto start = std::chrono::steady_clock::now();
-    static double next = every;
-    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    if (now < next)
+    static int next_ms = every_ms;
+    const int now_ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - start).count());
+    if (now_ms < next_ms)
         return;
-    next = now + every;
+    next_ms = now_ms + every_ms;
     constexpr u32 kW = 1280, kH = 720;
     static std::vector<u8> pixels(size_t(kW) * kH * 4);
-    const int seconds = int(now);
+    const int seconds = now_ms / 1000;
     system.Renderer().RequestScreenshot(
         pixels.data(),
         [seconds](bool invert_y) {
-            const std::string path = fmt::format("{}/shot-{:04d}.ppm", dir, seconds);
-            if (FILE* f = std::fopen(path.c_str(), "wb")) {
-                std::fprintf(f, "P6 %u %u 255\n", kW, kH);
-                std::vector<u8> row(size_t(kW) * 3);
-                for (u32 y = 0; y < kH; y++) {
-                    const u8* src = pixels.data() + size_t(invert_y ? kH - 1 - y : y) * kW * 4;
-                    for (u32 x = 0; x < kW; x++) { // BGRA -> RGB
-                        row[x * 3] = src[x * 4 + 2];
-                        row[x * 3 + 1] = src[x * 4 + 1];
-                        row[x * 3 + 2] = src[x * 4];
-                    }
-                    std::fwrite(row.data(), 1, row.size(), f);
+            // Runs on the GPU thread: convert to RGB there (cheap), write the file on a thread of
+            // its own (a JPEG takes the Jaguar a while).
+            auto rgb = std::make_shared<std::vector<u8>>(size_t(kW) * kH * 3);
+            for (u32 y = 0; y < kH; y++) {
+                const u8* src = pixels.data() + size_t(invert_y ? kH - 1 - y : y) * kW * 4;
+                u8* dst = rgb->data() + size_t(y) * kW * 3;
+                for (u32 x = 0; x < kW; x++) { // BGRA -> RGB
+                    dst[x * 3] = src[x * 4 + 2];
+                    dst[x * 3 + 1] = src[x * 4 + 1];
+                    dst[x * 3 + 2] = src[x * 4];
                 }
-                std::fclose(f);
             }
+            std::thread([rgb, seconds] {
+#ifdef __OPENORBIS__
+                const std::string path = fmt::format("{}/shot-{:04d}.jpg", dir, seconds);
+                if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                    stbi_write_jpg_to_func([](void* file, void* data, int size) {
+                        std::fwrite(data, 1, size_t(size), static_cast<FILE*>(file));
+                    }, f, int(kW), int(kH), 3, rgb->data(), 85);
+                    std::fclose(f);
+                }
+#else
+                const std::string path = fmt::format("{}/shot-{:04d}.ppm", dir, seconds);
+                if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fprintf(f, "P6 %u %u 255\n", kW, kH);
+                    std::fwrite(rgb->data(), 1, rgb->size(), f);
+                    std::fclose(f);
+                }
+#endif
+            }).detach();
         },
         Layout::DefaultFrameLayout(kW, kH));
 }
@@ -1311,8 +1534,39 @@ static void MaybePrintUploadStats() {
 }
 #endif
 
+#ifdef __OPENORBIS__
+// Every guest thread of the game: state (and what it waits for), priority, core and backtrace, to
+// boot-trace.log. For games that stop making progress while the emulator itself still runs.
+static void DumpGuestThreads(Core::System& system, std::string_view why) {
+    Kernel::KProcess* const process = system.ApplicationProcess();
+    if (!process)
+        return;
+    // No kernel locks: this (host) thread isn't a guest thread, and the game's threads are quiet
+    // by now (that's why this runs).
+    PS4_TRACE("GPU syncpoints:{}", system.Host1x().GetSyncpointManager().DebugSummary());
+    PS4_TRACE("guest threads ({}):", why);
+    for (const auto& thread : process->GetThreadList()) {
+        const auto name = Core::GetThreadName(&thread);
+        std::string line = fmt::format("  thread {} {}: {}, priority {}, core {}", thread.GetThreadId(),
+                                       name ? *name : "", Core::GetThreadState(&thread), thread.GetPriority(),
+                                       thread.GetActiveCore());
+        const auto& ctx = thread.GetContext();
+        line += fmt::format(", pc {:#x} lr {:#x} sp {:#x} x0 {:#x} x1 {:#x} x2 {:#x}; backtrace:", ctx.pc, ctx.lr, ctx.sp,
+                            ctx.r[0], ctx.r[1], ctx.r[2]);
+        for (const auto& entry : Core::GetBacktrace(&thread))
+            line += fmt::format(" {}+{:#x}", entry.module, entry.offset);
+        PS4_TRACE("{}", line);
+    }
+}
+#endif
+
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
+#ifdef __OPENORBIS__
+    // From the first iteration on (booting blocks this thread for longer than a hang would).
+    ps4_hang_watchdog_start();
+    ps4_heartbeat();
+#endif
     MaybeScreenshot(state->system);
 #ifndef __OPENORBIS__
     MaybePrintUploadStats();
@@ -1345,6 +1599,10 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         s_buttons = buttons;
         if (pressed != 0 && Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Null)
             ps4_menu_activity_input(true, (pressed & (1u << SDL_GAMEPAD_BUTTON_EAST)) != 0);
+        if (g_ps4_boot_stalled && (pressed & (1u << SDL_GAMEPAD_BUTTON_EAST))) { // Circle: back to the launcher
+            PS4_TRACE("main: stalled boot left for the launcher");
+            ps4_menu_restart_now();
+        }
         const u64 now = SDL_GetTicks();
         if (!held) {
             s_combo_since = 0;
@@ -1392,9 +1650,47 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         static int s_reports = 0;
         if (++s_reports % 6 == 0) {
             state->system.DeviceMemory().buffer.LogFastmemStats("playing");
+            // The app's own heaps: the overflow heap is direct memory, shared with the GPU and
+            // the emulated DRAM - is its reservation earning its keep?
+            unsigned long long main_used = 0, main_size = 0, overflow_used = 0, overflow_size = 0;
+            ps4_heap_usage(&main_used, &main_size, &overflow_used, &overflow_size);
+            PS4_TRACE("heap: main {} of {} MiB in use, overflow {} of {} MiB", main_used >> 20, main_size >> 20,
+                      overflow_used >> 20, overflow_size >> 20);
             PS4PlaySave();
         }
         g_ps4_last_perf = fmt::format("Frame rate: {:.0f} fps (last 5 s)", perf.average_game_fps);
+        // A game that drew frames and then stops (0 fps for 20 s): what every guest thread waits
+        // for, to boot-trace.log - again 60 s later, to see what moved.
+        {
+            static bool s_had_frames = false;
+            static int s_zero = 0, s_dumps = 0;
+            s_had_frames |= perf.average_game_fps > 0.5;
+            s_zero = (s_had_frames && perf.average_game_fps < 0.5) ? s_zero + 1 : 0;
+            if ((s_zero == 4 || s_zero == 16) && s_dumps < 4) {
+                s_dumps++;
+                DumpGuestThreads(state->system, "the game stopped drawing frames 20 s ago");
+                // And the emulator's own threads (the display service, the compositor...): which
+                // of them the game's request is stuck behind. To logs/hang.log.
+                ps4_dump_host_threads(unsigned(s_zero * 5));
+            }
+        }
+        // A game that stops making progress before its first frame (a hang while booting): the
+        // guest's supervisor calls are the pulse - hundreds a second while a game loads, next to
+        // none once it waits for something that won't come. 30 s with fewer than 30: say so.
+        if (!g_ps4_boot_stalled && Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Null) {
+            static std::array<u64, 7> s_svc{};
+            static size_t s_samples = 0;
+            const u64 svc = Kernel::Svc::g_svc_count.load(std::memory_order_relaxed);
+            const u64 oldest = s_svc[s_samples % s_svc.size()]; // 30 s ago, once 7 samples are in
+            s_svc[s_samples % s_svc.size()] = svc;
+            s_samples++;
+            if (!ps4_first_frame_shown() && s_samples > s_svc.size() && svc - oldest < 30) {
+                g_ps4_boot_stalled = true;
+                PS4_TRACE("main: the game stopped responding before its first frame ({} supervisor calls in 30 s)",
+                          svc - oldest);
+                ps4_loading_failed("Nothing has happened for 30 seconds.\nIts logs are in /data/switch-emu/logs.");
+            }
+        }
     }
 #endif
     return state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;

@@ -1,3 +1,4 @@
+#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -29,6 +30,10 @@ namespace Core::NCE {
 class Patcher {};
 } // namespace Core::NCE
 #endif
+
+namespace Core {
+extern std::atomic<u64> g_main_module_base;
+}
 
 namespace Loader {
 
@@ -273,6 +278,11 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         next_load_addr = *tentative_next_load_addr;
         modules.insert_or_assign(load_addr, module);
         LOG_DEBUG(Loader, "loaded module {} @ {:#x}", module, load_addr);
+        if (std::strcmp(module, "main") == 0)
+        {
+            Core::g_main_module_base = load_addr; // for the JIT block trace (arm_dynarmic_64.cpp)
+            LOG_WARNING(Loader, "main module at {:#x}", load_addr);
+        }
     }
 
     is_loaded = true;

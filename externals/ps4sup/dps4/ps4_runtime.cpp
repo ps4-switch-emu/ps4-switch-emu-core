@@ -299,9 +299,22 @@ std::atomic_flag g_freeArenaLock = ATOMIC_FLAG_INIT;
 pthread_key_t g_arenaKey;
 std::atomic<bool> g_arenaKeyReady{false};
 
-void lockFreeArenas() {
-    while (g_freeArenaLock.test_and_set(std::memory_order_acquire))
+// A spin wait's pause: sched_yield() only gives the core to threads of the same or higher
+// priority, so a lower-priority holder could wait forever behind higher-priority spinners (see
+// ps4_dlmalloc.c). Every 8th pause sleeps, which lets any thread run.
+void backoff(unsigned& pauses) {
+    if ((++pauses & 7) == 0) {
+        const timespec rest = {0, 50000};
+        nanosleep(&rest, nullptr);
+    } else {
         sched_yield();
+    }
+}
+
+void lockFreeArenas() {
+    unsigned pauses = 0;
+    while (g_freeArenaLock.test_and_set(std::memory_order_acquire))
+        backoff(pauses);
 }
 void unlockFreeArenas() { g_freeArenaLock.clear(std::memory_order_release); }
 
@@ -367,6 +380,20 @@ void runThreadDtors(void* p) {
 
 void createThreadDtorKey() { pthread_key_create(&g_threadDtorKey, runThreadDtors); }
 
+// Bytes handed out by the wrappers, by heap: what the main heap and the overflow heap (direct
+// memory, shared with the GPU and the emulated DRAM) actually hold. Two atomic adds per call.
+std::atomic<long long> g_main_used{0}, g_overflow_used{0};
+void account(const void* p, long long sign) {
+    if (!p)
+        return;
+    const long long size = sign * static_cast<long long>(mspace_usable_size(p));
+    const uintptr_t address = reinterpret_cast<uintptr_t>(p);
+    if (g_overflowSize && address >= g_overflowBase && address < g_overflowBase + g_overflowSize)
+        g_overflow_used.fetch_add(size, std::memory_order_relaxed);
+    else
+        g_main_used.fetch_add(size, std::memory_order_relaxed);
+}
+
 }  // namespace
 
 extern "C" {
@@ -381,6 +408,15 @@ void ps4_heap_error(void* msp, void* chunk, int corruption) {
         abort();
 }
 
+// How full the app's heaps are, in bytes (see account()).
+void ps4_heap_usage(unsigned long long* main_used, unsigned long long* main_size, unsigned long long* overflow_used,
+                    unsigned long long* overflow_size) {
+    *main_used = static_cast<unsigned long long>(g_main_used.load(std::memory_order_relaxed));
+    *main_size = g_heapSize;
+    *overflow_used = static_cast<unsigned long long>(g_overflow_used.load(std::memory_order_relaxed));
+    *overflow_size = g_overflowSize;
+}
+
 void* __wrap_malloc(size_t size) {
     t_op = "malloc";
     t_caller = __builtin_return_address(0);
@@ -393,6 +429,7 @@ void* __wrap_malloc(size_t size) {
             p = mspace_malloc(overflow, size);
     if (!p)
         reportFailure("malloc", size);
+    account(p, 1);
     return p;
 }
 
@@ -410,6 +447,7 @@ void __wrap_free(void* ptr) {
         }
         return;
     }
+    account(ptr, -1);
     mspace_free(getHeap(), ptr);
 }
 
@@ -425,6 +463,7 @@ void* __wrap_calloc(size_t nelem, size_t size) {
             p = mspace_calloc(overflow, nelem, size);
     if (!p)
         reportFailure("calloc", nelem * size);
+    account(p, 1);
     return p;
 }
 
@@ -439,9 +478,11 @@ void* __wrap_realloc(void* ptr, size_t size) {
         return nullptr;
     }
     if (ptr && size == 0) {
+        account(ptr, -1);
         mspace_free(getHeap(), ptr);
         return nullptr;
     }
+    account(ptr, -1); // added back below (or, if the realloc fails, the old block still is)
     // With FOOTERS this grows the chunk inside the arena it came from (the mspace argument is
     // only used for new allocations); when that arena is full, move it to this thread's.
     void* p = ptr ? mspace_realloc(getHeap(), ptr, size) : nullptr;
@@ -458,8 +499,11 @@ void* __wrap_realloc(void* ptr, size_t size) {
             mspace_free(getHeap(), ptr);
         }
     }
-    if (!p)
+    if (!p) {
         reportFailure("realloc", size);
+        account(ptr, 1);
+    }
+    account(p, 1);
     return p;
 }
 
@@ -475,6 +519,7 @@ void* __wrap_memalign(size_t alignment, size_t size) {
             p = mspace_memalign(overflow, alignment, size);
     if (!p)
         reportFailure("memalign", size);
+    account(p, 1);
     return p;
 }
 
@@ -497,8 +542,9 @@ void ps4_heap_private_arena(const char* name) {
             pthread_key_create(&g_arenaKey, releaseArena);
             g_arenaKeyReady.store(true, std::memory_order_release);
         }
+        unsigned pauses = 0;
         while (!g_arenaKeyReady.load(std::memory_order_acquire))
-            sched_yield();
+            backoff(pauses);
     }
     // An exited thread's arena first.
     lockFreeArenas();
@@ -833,8 +879,9 @@ int __wrap_pthread_once(pthread_once_t* once, void (*init)(void)) {
         __atomic_store_n(state, 2, __ATOMIC_RELEASE);
         return 0;
     }
+    unsigned pauses = 0;
     while (__atomic_load_n(state, __ATOMIC_ACQUIRE) != 2)
-        sched_yield();
+        backoff(pauses);
     return 0;
 }
 

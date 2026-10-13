@@ -168,15 +168,38 @@ void TextureCache<P>::RunGarbageCollector() {
     }
 }
 
+#ifdef __OPENORBIS__
+extern "C" __attribute__((weak)) unsigned long long ps4_direct_memory_free(); // externals/ps4sup/stub.cpp
+#endif
+
 template <class P>
 void TextureCache<P>::TickFrame() {
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
         total_used_memory = runtime.GetDeviceMemoryUsage();
     }
+#ifdef __OPENORBIS__
+    // The PS4's GPU memory and the emulated DRAM share one pool, and the DRAM grows as the game
+    // touches more of it: what decides is what's free in that pool, not the GPU's nominal size.
+    // Little left: collect as if over budget (below 768 MiB) or critically so (below 384 MiB).
+    // (512/256 was too late: a new area grew GPU memory by ~400 MiB in a few seconds and free
+    // memory fell to 54 MiB, with the game's own memory still able to grow by ~860 MiB.)
+    static const u64 base_expected = expected_memory, base_critical = critical_memory;
+    bool short_of_memory = false;
+    if (ps4_direct_memory_free) {
+        const u64 free = ps4_direct_memory_free();
+        short_of_memory = free < 768_MiB;
+        expected_memory = short_of_memory ? (std::min)(base_expected, total_used_memory) : base_expected;
+        critical_memory = free < 384_MiB ? (std::min)(base_critical, total_used_memory) : base_critical;
+    }
+    if (total_used_memory > minimum_memory || short_of_memory) {
+        RunGarbageCollector();
+    }
+#else
     if (total_used_memory > minimum_memory) {
         RunGarbageCollector();
     }
+#endif
     sentenced_images.Tick();
     sentenced_framebuffers.Tick();
     sentenced_image_view.Tick();

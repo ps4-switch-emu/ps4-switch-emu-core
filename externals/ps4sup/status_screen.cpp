@@ -573,32 +573,21 @@ uint32_t TileColor(const char* title) {
     return kColors[h % (sizeof(kColors) / sizeof(kColors[0]))];
 }
 
-// Box-filtered downscale of a kLauncherIconSize icon to size x size.
+// stb_image_resize (its implementation is in Eden's common library; tools/ui-preview has its own).
+extern "C" int stbir_resize_uint8(const unsigned char* input_pixels, int input_w, int input_h, int input_stride_in_bytes,
+                                  unsigned char* output_pixels, int output_w, int output_h, int output_stride_in_bytes,
+                                  int num_channels);
+
+// Box-filtered downscale (or, enlarging, a Catmull-Rom resize) of a kLauncherIconSize icon to size x size.
 uint32_t* ScaleIcon(const uint32_t* icon, int size) {
     auto* out = static_cast<uint32_t*>(malloc(size_t(size) * size * 4));
     if (!out)
         return nullptr;
-    if (size > kLauncherIconSize) { // enlarging (the row layout's tiles): bilinear
-        constexpr int kMax = kLauncherIconSize - 1;
-        for (int y = 0; y < size; y++) {
-            const float fy = std::clamp((float(y) + 0.5f) * kLauncherIconSize / size - 0.5f, 0.0f, float(kMax));
-            const int y0 = int(fy), y1 = std::min(y0 + 1, kMax);
-            const float ty = fy - float(y0);
-            for (int x = 0; x < size; x++) {
-                const float fx = std::clamp((float(x) + 0.5f) * kLauncherIconSize / size - 0.5f, 0.0f, float(kMax));
-                const int x0 = int(fx), x1 = std::min(x0 + 1, kMax);
-                const float tx = fx - float(x0);
-                const uint32_t p00 = icon[y0 * kLauncherIconSize + x0], p01 = icon[y0 * kLauncherIconSize + x1],
-                               p10 = icon[y1 * kLauncherIconSize + x0], p11 = icon[y1 * kLauncherIconSize + x1];
-                const auto mix = [&](uint32_t c00, uint32_t c01, uint32_t c10, uint32_t c11) {
-                    const float top = float(c00) + (float(c01) - float(c00)) * tx;
-                    const float bottom = float(c10) + (float(c11) - float(c10)) * tx;
-                    return uint8_t(top + (bottom - top) * ty + 0.5f);
-                };
-                out[y * size + x] = Rgb(mix(R(p00), R(p01), R(p10), R(p11)), mix(G(p00), G(p01), G(p10), G(p11)),
-                                        mix(B(p00), B(p01), B(p10), B(p11)));
-            }
-        }
+    if (size > kLauncherIconSize) {
+        // Enlarging (the row layout's tiles, the loading screen's card): Catmull-Rom, stb's
+        // default for upsampling - sharper than bilinear, without nearest-neighbour's blocks.
+        stbir_resize_uint8(reinterpret_cast<const unsigned char*>(icon), kLauncherIconSize, kLauncherIconSize, 0,
+                           reinterpret_cast<unsigned char*>(out), size, size, 0, 4);
         return out;
     }
     for (int y = 0; y < size; y++) {
@@ -727,24 +716,29 @@ void DrawCard(GameEntry& g, int x, int y, int size, bool selected) {
     DrawCardImage(g, x, y, size);
 }
 void DrawCard(const GameEntry& g, int x, int y, int size, bool selected) {
+    // The loading screen's and the list's big card (larger than the 256-pixel icon): a smoothly
+    // enlarged copy (bilinear, ScaleIcon), kept for the icon and size in use - was nearest-neighbour
+    // from the icon, every source pixel a visible block.
+    static const uint32_t* s_icon = nullptr;
+    static uint32_t s_check = 0;
+    static int s_size = 0;
+    static uint32_t* s_pixels = nullptr;
     GameEntry copy = g;
     copy.small = copy.big = nullptr; // a temporary: don't cache into it
     copy.small_size = copy.big_size = 0;
     if (copy.icon && size != kCardSize && size != kCardBig) {
-        // Arbitrary size (loading screen): nearest-neighbour from the source icon.
-        Shadow(x, y, size, size, 22);
-        if (selected)
-            RoundRect(x - 6, y - 6, size + 12, size + 12, 28, kWhite);
-        for (int row = 0; row < size; row++)
-            for (int col = 0; col < size; col++) {
-                const int px = x + col, py = y + row;
-                if (px < 0 || px >= kWidth || py < 0 || py >= kHeight)
-                    continue;
-                const uint32_t a = RoundCoverage(px, py, x, y, size, size, 22);
-                const uint32_t c = copy.icon[(row * kLauncherIconSize / size) * kLauncherIconSize + col * kLauncherIconSize / size];
-                if (a)
-                    g_frame[py * kWidth + px] = Blend(g_frame[py * kWidth + px], c, a);
-            }
+        // An icon freed and another loaded at the same address: tell them apart by two pixels too.
+        const uint32_t check = copy.icon[0] ^ copy.icon[(kLauncherIconSize / 2) * (kLauncherIconSize + 1)];
+        if (s_icon != copy.icon || s_check != check || s_size != size) {
+            free(s_pixels);
+            s_pixels = ScaleIcon(copy.icon, size);
+            s_icon = copy.icon;
+            s_check = check;
+            s_size = s_pixels ? size : 0;
+        }
+        copy.big = s_pixels;
+        copy.big_size = s_size;
+        DrawCard(copy, x, y, size, selected);
         return;
     }
     DrawCard(copy, x, y, size, selected);
@@ -1333,9 +1327,18 @@ struct LoadingState {
     std::atomic<unsigned> cache_done{0}, cache_total{0};
     std::atomic<unsigned long long> shaders_at_start{0};
     double shown = NAN, stage_time = NAN; // Elapsed() when first drawn / when the stage began (NaN: not yet)
+    std::atomic<bool> failed{false};      // the game stopped responding (ps4_loading_failed)
+    char failed_detail[200] = "";
 } g_load;
 
 void DrawSpinner(int cx, int cy, double t); // below
+
+// A red disc with a cross (a step that failed).
+void DrawCross(int cx, int cy) {
+    Disc(cx, cy, 15, kBad);
+    Line(cx - 6, cy - 6, cx + 6, cy + 6, 4, kWhite);
+    Line(cx - 6, cy + 6, cx + 6, cy - 6, 4, kWhite);
+}
 
 // A green disc with a check mark.
 void DrawCheck(int cx, int cy) {
@@ -1385,6 +1388,8 @@ void DrawLoading(const char* /*progress*/) {
         const int cy = y + 18;
         if (stage > index)
             DrawCheck(tx + 15, cy);
+        else if (stage == index && g_load.failed)
+            DrawCross(tx + 15, cy);
         else if (stage == index)
             DrawSpinner(tx + 15, cy, now);
         else
@@ -1418,6 +1423,22 @@ void DrawLoading(const char* /*progress*/) {
         detail[0] = 0;
     }
     step(2, "Starting the game", detail);
+    if (g_load.failed) {
+        DrawText(kBold, tx + 50, y - 16, "The game stopped responding", kBad, right);
+        int ly = y + 26; // the detail, a line per '\n'
+        for (const char* line = g_load.failed_detail; line && *line;) {
+            const char* end = std::strchr(line, '\n');
+            char text[200];
+            CopyText(text, std::min(sizeof(text), size_t((end ? end : line + std::strlen(line)) - line) + 1), line);
+            DrawText(tx + 50, ly, text, kText, right);
+            ly += kStatusFontHeight + 6;
+            line = end ? end + 1 : nullptr;
+        }
+        RoundRect(tx, 900, right - tx, 64, 16, Rgb(10, 13, 24), 150);
+        const int hx = DrawButton(tx + 20, 900 + 12, Button::Circle);
+        Hint(hx, 900 + 12, "Back to the launcher");
+        return;
+    }
     if (stage == 2) {
         // No bar here: how long a game takes to boot isn't known. What it is doing is.
         if (built > 0)
@@ -2285,6 +2306,13 @@ void ps4_loading_cache(unsigned done, unsigned total) {
         g_load.stage_time = Elapsed();
     g_load.cache_done = done;
     g_load.cache_total = total;
+}
+
+// The game stopped making progress before its first frame (yuzu_cmd): the loading screen says so
+// and offers the way back to the launcher.
+void ps4_loading_failed(const char* detail) {
+    std::snprintf(g_load.failed_detail, sizeof(g_load.failed_detail), "%s", detail ? detail : ""); // keeps '\n's
+    g_load.failed = true;
 }
 
 void ps4_loading_starting_game() {

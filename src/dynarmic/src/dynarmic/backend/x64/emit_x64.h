@@ -102,6 +102,38 @@ inline bool IsCleanScalar32(const IR::Value& value, int depth = 0) {
     }
 }
 
+/// For a value in a host register, the width (8/16/32) it is known to be zero-extended from to all
+/// 64 bits, or 0 if that isn't known (HostRegisterLocality). Memory reads zero-extend on both their
+/// fastmem (movzx / 32-bit mov) and callback paths (ZeroExtendFrom); a zero-extend's result is
+/// clean by construction.
+inline int ZeroExtendedFromBits(const IR::Value& value) {
+    if (value.IsImmediate())
+        return 0;
+    switch (value.GetInstRecursive()->GetOpcode()) {
+    case IR::Opcode::A64ReadMemory8:
+    case IR::Opcode::A64ExclusiveReadMemory8:
+    case IR::Opcode::A32ReadMemory8:
+    case IR::Opcode::A32ExclusiveReadMemory8:
+    case IR::Opcode::ZeroExtendByteToWord:
+    case IR::Opcode::ZeroExtendByteToLong:
+        return 8;
+    case IR::Opcode::A64ReadMemory16:
+    case IR::Opcode::A64ExclusiveReadMemory16:
+    case IR::Opcode::A32ReadMemory16:
+    case IR::Opcode::A32ExclusiveReadMemory16:
+    case IR::Opcode::ZeroExtendHalfToWord:
+    case IR::Opcode::ZeroExtendHalfToLong:
+        return 16;
+    case IR::Opcode::A64ReadMemory32:
+    case IR::Opcode::A64ExclusiveReadMemory32:
+    case IR::Opcode::A32ReadMemory32:
+    case IR::Opcode::A32ExclusiveReadMemory32:
+        return 32;
+    default:
+        return 0;
+    }
+}
+
 struct EmitContext {
     EmitContext(RegAlloc& reg_alloc, IR::Block& block, boost::container::stable_vector<Xbyak::Label>& shared_labels);
     virtual ~EmitContext();

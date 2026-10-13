@@ -1,3 +1,8 @@
+#include <string>
+#include <mutex>
+#include <cstdio>
+#include <atomic>
+#include <sys/stat.h>
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -171,6 +176,97 @@ u64 DynarmicCallbacks64::GetTicksRemaining() {
     return std::max<s64>(m_parent.m_system.CoreTiming().downcount, 0);
 }
 
+// Block trace (debugging): once a guest thread enters main+offset, log the next N blocks it runs,
+// with registers - two runs of the same code (the PS4 and a PC) diffed show where they diverge.
+// PS4: /data/switch-emu/trace.txt "<offset> <blocks>", written to logs/trace.txt.
+// PC: EDEN_TRACE="<offset> <blocks>", written to EDEN_TRACE_OUT (default trace.txt).
+std::atomic<u64> g_main_module_base{0}; // set by the loader (deconstructed_rom_directory.cpp)
+namespace {
+struct BlockTrace {
+    bool enabled = false;
+    u64 offset = 0, blocks = 0;
+    std::string out_path;
+    std::mutex mutex;
+    std::FILE* out = nullptr;
+    bool done = false;
+    u64 tls = 0;
+    std::atomic<u64> remaining{0};
+};
+BlockTrace& GetBlockTrace() {
+    static BlockTrace t;
+    static const bool loaded = [](BlockTrace& c) {
+        std::string spec;
+#ifdef __OPENORBIS__
+        if (std::FILE* f = std::fopen("/data/switch-emu/trace.txt", "r")) {
+            char line[128] = {};
+            if (std::fgets(line, sizeof(line), f))
+                spec = line;
+            std::fclose(f);
+        }
+        c.out_path = "/data/switch-emu/logs/trace.txt";
+#else
+        if (const char* e = std::getenv("EDEN_TRACE"))
+            spec = e;
+        const char* o = std::getenv("EDEN_TRACE_OUT");
+        c.out_path = o ? o : "trace.txt";
+#endif
+        unsigned long long offset = 0, blocks = 0;
+        if (!spec.empty() && std::sscanf(spec.c_str(), "%llx %llu", &offset, &blocks) == 2 && blocks > 0) {
+            c.enabled = true;
+            c.offset = offset;
+            c.blocks = blocks;
+        }
+        LOG_WARNING(Core_ARM, "block trace: {} (spec \"{}\", offset {:#x}, {} blocks, to {})",
+                    c.enabled ? "armed" : "off", spec, c.offset, c.blocks, c.out_path);
+        return true;
+    }(t);
+    (void)loaded;
+    return t;
+}
+} // namespace
+
+void DynarmicCallbacks64::TraceBlock(u64 pc) {
+    BlockTrace& t = GetBlockTrace();
+    const u64 base = g_main_module_base.load(std::memory_order_relaxed);
+    static std::atomic<u64> calls{0};
+    if (const u64 n = calls.fetch_add(1, std::memory_order_relaxed); n < 4 || n == 1000000 || n == 10000000)
+        LOG_WARNING(Core_ARM, "block trace: call {} at {:#x} (base {:#x})", n, pc, base);
+    if (t.remaining.load(std::memory_order_relaxed) == 0) {
+        // Any block in the function (0x84 bytes from its start), not only its first.
+        if (t.done || base == 0 || pc < base + t.offset || pc >= base + t.offset + 0x84)
+            return;
+        std::scoped_lock lk{t.mutex};
+        if (t.done || t.out)
+            return;
+        t.out = std::fopen(t.out_path.c_str(), "w");
+        LOG_WARNING(Core_ARM, "block trace: triggered at {:#x} (base {:#x}), output {}", pc, base,
+                    t.out ? "open" : "FAILED to open");
+        if (!t.out) {
+            t.done = true;
+            return;
+        }
+        t.tls = m_tpidrro_el0;
+        t.remaining = t.blocks;
+    }
+    if (m_tpidrro_el0 != t.tls || !t.out)
+        return;
+    const auto show = [base](u64 v) {
+        return v >= base && v < base + 0x4000000 ? fmt::format("m+{:x}", v - base) : fmt::format("{:x}", v);
+    };
+    auto& jit = *m_parent.m_jit;
+    std::string line = fmt::format("{}", show(pc));
+    for (const int r : {0, 1, 2, 3, 4, 5, 8, 9, 19, 20, 21, 22, 23, 24, 30})
+        line += fmt::format(" x{}={}", r, show(jit.GetRegister(r)));
+    line += fmt::format(" v0={:x}_{:x}\n", jit.GetVector(0)[1], jit.GetVector(0)[0]);
+    std::fputs(line.c_str(), t.out);
+    if (t.remaining.fetch_sub(1) == 1) {
+        std::scoped_lock lk{t.mutex};
+        std::fclose(t.out);
+        t.out = nullptr;
+        t.done = true;
+    }
+}
+
 u64 DynarmicCallbacks64::GetCNTPCT() {
     return m_parent.m_system.CoreTiming().GetClockTicks();
 }
@@ -268,11 +364,15 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     config.wall_clock_cntpct = m_uses_wall_clock;
     config.enable_cycle_counting = !m_uses_wall_clock;
 
+    config.trace_blocks = GetBlockTrace().enabled;
+
     // Code cache size
 #if defined(__OPENORBIS__)
     // Executable memory comes from the system flexible pool (shared with the app heap); 32 MiB
-    // per core instead of 8 keeps hot code from being thrown away and recompiled.
-    config.code_cache_size = std::uint32_t(32_MiB);
+    // per core instead of 8 keeps hot code from being thrown away and recompiled. Core 0 gets 64:
+    // games run their main thread there (a 3D game filled 32 MiB 5 times in 11 minutes
+    // of play, every fill a recompile-everything hitch; cores 2-3 barely ran anything).
+    config.code_cache_size = std::uint32_t(m_core_index == 0 ? 64_MiB : 32_MiB);
 #elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     config.code_cache_size = std::uint32_t(128_MiB);
 #else
@@ -384,6 +484,22 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     if (const char* bits = std::getenv("EDEN_FASTMEM_BITS"); bits && config.fastmem_pointer) {
         config.fastmem_address_space_bits = u32(std::atoi(bits));
         config.silently_mirror_fastmem = false;
+    }
+#endif
+#ifndef __OPENORBIS__
+    if (std::getenv("EDEN_JIT_SAFE")) // the PC's jit-safe (below)
+        config.optimizations &= ~Dynarmic::OptimizationFlag::HostRegisterLocality;
+#endif
+#ifdef __OPENORBIS__
+    // /data/switch-emu/jit-safe: the translator without OptimizationFlag::HostRegisterLocality
+    // (the PS4-tuned code generation of v00.75 on), to tell whether a game's problem comes from it.
+    if (struct stat st; stat("/data/switch-emu/jit-safe", &st) == 0) {
+        config.optimizations &= ~Dynarmic::OptimizationFlag::HostRegisterLocality;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_WARNING(Core_ARM, "jit-safe: HostRegisterLocality off");
+        }
     }
 #endif
 #ifdef __OPENORBIS__

@@ -117,3 +117,25 @@ extern "C" unsigned ps4_cpu_mhz() {
 extern "C" bool ps4_is_pro_mode() {
     return sceKernelIsNeoMode() != 0;
 }
+
+// Free direct memory (the largest free block), refreshed at most twice a second: GPU memory and
+// the emulated DRAM come out of the same pool, so the texture cache trims itself by what's left
+// rather than by the GPU's nominal size (video_core/texture_cache/texture_cache.h).
+extern "C" int32_t sceKernelAvailableDirectMemorySize(off_t start, off_t end, size_t alignment, off_t* out_start,
+                                                      size_t* out_size);
+extern "C" size_t sceKernelGetDirectMemorySize();
+extern "C" unsigned long long ps4_direct_memory_free() {
+    static std::atomic<unsigned long long> s_free{~0ull};
+    static std::atomic<long long> s_when{0};
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const long long ms = (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    if (ms - s_when.load(std::memory_order_relaxed) >= 500) {
+        s_when.store(ms, std::memory_order_relaxed);
+        off_t at = 0;
+        size_t size = 0;
+        if (sceKernelAvailableDirectMemorySize(0, off_t(sceKernelGetDirectMemorySize()), 16 * 1024, &at, &size) == 0)
+            s_free.store(size, std::memory_order_relaxed);
+    }
+    return s_free.load(std::memory_order_relaxed);
+}

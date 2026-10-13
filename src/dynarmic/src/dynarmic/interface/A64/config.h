@@ -125,6 +125,9 @@ struct UserCallbacks {
     virtual void DataCacheOperationRaised(DataCacheOperation /*op*/, VAddr /*value*/) {}
     virtual void InstructionCacheOperationRaised(InstructionCacheOperation /*op*/, VAddr /*value*/) {}
     virtual void InstructionSynchronizationBarrierRaised() {}
+    // UserConfig::trace_blocks: called at the start of every block with its PC (guest registers
+    // are readable then). For finding where two runs of the same code diverge.
+    virtual void TraceBlock(VAddr /*pc*/) {}
 
     // Timing-related callbacks
     // ticks ticks have passed
@@ -136,6 +139,9 @@ struct UserCallbacks {
 };
 
 struct UserConfig {
+    /// Call UserCallbacks::TraceBlock at the start of every block (slow; debugging only).
+    bool trace_blocks = false;
+
     /// Fastmem Pointer
     /// This should point to the beginning of a 2^page_table_address_space_bits bytes
     /// address space which is in arranged just like what you wish for emulated memory to

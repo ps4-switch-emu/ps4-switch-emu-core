@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <fmt/format.h>
+
 #include "video_core/host1x/syncpoint_manager.h"
 
 namespace Tegra {
@@ -98,6 +100,27 @@ void SyncpointManager::Wait(std::atomic<u32>& syncpoint, std::condition_variable
 
     std::unique_lock lk(guard);
     wait_cv.wait(lk, pred);
+}
+
+std::string SyncpointManager::DebugSummary() {
+    std::string out;
+    // Only if free: a thread stuck holding it must not take the caller (the main loop) down too.
+    std::unique_lock lk{guard, std::try_to_lock};
+    if (!lk.owns_lock())
+        return " (syncpoint lock held by another thread)";
+    for (size_t id = 0; id < NUM_MAX_SYNCPOINTS; id++) {
+        const u32 guest = syncpoints_guest[id].load(std::memory_order_acquire);
+        const u32 host = syncpoints_host[id].load(std::memory_order_acquire);
+        if (guest == 0 && host == 0 && guest_action_storage[id].empty() && host_action_storage[id].empty())
+            continue;
+        out += fmt::format(" [{}: guest {} host {}", id, guest, host);
+        for (const auto& action : guest_action_storage[id])
+            out += fmt::format(", guest waits {}", action.expected_value);
+        for (const auto& action : host_action_storage[id])
+            out += fmt::format(", host waits {}", action.expected_value);
+        out += "]";
+    }
+    return out;
 }
 
 } // namespace Host1x

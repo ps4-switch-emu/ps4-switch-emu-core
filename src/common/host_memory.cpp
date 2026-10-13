@@ -35,6 +35,7 @@
 #elif defined(__OPENORBIS__)
 #include <orbis/libkernel.h>
 #include <sys/stat.h>
+#include <x86intrin.h>
 #include <atomic>
 #include <cstdarg>
 #include <ctime>
@@ -1055,6 +1056,7 @@ private:
     /// Brings the host mappings of the blocks covering [offset, offset + length) in line with
     /// their guest pages. Consecutive blocks needing the same action become one kernel call.
     void Update(size_t offset, size_t length) {
+        const u64 update_start = __rdtsc();
         enum class Action { None, Map, Unmap, Protect };
         const u64 first = offset / HostPage, last = (offset + length - 1) / HostPage;
         Action run_action = Action::None;
@@ -1064,6 +1066,7 @@ private:
         const auto flush = [&] {
             if (run_count == 0)
                 return;
+            const u64 kernel_start = __rdtsc();
             void* addr = virtual_base + run_start * HostPage;
             const size_t size = run_count * HostPage;
             int32_t r = 0;
@@ -1111,6 +1114,7 @@ private:
             case Action::None:
                 break;
             }
+            kernel_ticks += __rdtsc() - kernel_start;
             if (r != 0 && failures++ < 16)
                 Trace("fastmem: action %d on %zu KiB at %p failed (%#x)", int(run_action), size >> 10, addr, unsigned(r));
             calls++;
@@ -1169,10 +1173,21 @@ private:
                 blocks.erase(it);
         }
         flush();
-        if (++updates % 4096 == 0)
-            Trace("fastmem: %llu updates, %llu kernel calls, %llu blocks (%llu MiB) mapped, %zu tracked",
+        update_ticks += __rdtsc() - update_start;
+        if (++updates % 4096 == 0) {
+            // What keeping the fastmem view in step costs: CPU time in these updates (and in their
+            // kernel calls) per second since the last line.
+            const u64 now = __rdtsc();
+            const double tsc = double(sceKernelGetTscFrequency());
+            const double span = last_report_tsc ? double(now - last_report_tsc) / tsc : 0;
+            Trace("fastmem: %llu updates, %llu kernel calls, %llu blocks (%llu MiB) mapped, %zu tracked; "
+                  "%.1f ms in updates (%.1f ms of it in the kernel) over the last %.1f s",
                   (unsigned long long)updates, (unsigned long long)calls, (unsigned long long)mapped_blocks,
-                  (unsigned long long)(mapped_blocks * HostPage >> 20), blocks.size());
+                  (unsigned long long)(mapped_blocks * HostPage >> 20), blocks.size(), double(update_ticks) / tsc * 1e3,
+                  double(kernel_ticks) / tsc * 1e3, span);
+            update_ticks = kernel_ticks = 0;
+            last_report_tsc = now;
+        }
     }
 
 public:
@@ -1291,9 +1306,19 @@ private:
                                                   WbOnion, &phys);
         void* addr = backing_base + chunk * Chunk;
         if (r == 0) {
-            sceKernelMunmap(addr, Chunk); // the reservation
-            void* target = addr;
-            r = sceKernelMapDirectMemory(&target, Chunk, ProtReadWrite, MapFixed, phys, Chunk);
+            // Fresh DRAM reads as zero, as with Eden's memfd backing. Zero it through a mapping of
+            // its own before it appears in the backing view: zeroing it there afterwards raced with
+            // other threads (CPU cores, the GPU, services) that wrote to it the moment it was mapped,
+            // and wiped what they wrote (freezes while a game loaded).
+            void* scratch = nullptr;
+            r = sceKernelMapDirectMemory(&scratch, Chunk, ProtReadWrite, 0, phys, Chunk);
+            if (r == 0) {
+                std::memset(scratch, 0, Chunk);
+                sceKernelMunmap(scratch, Chunk);
+                sceKernelMunmap(addr, Chunk); // the reservation
+                void* target = addr;
+                r = sceKernelMapDirectMemory(&target, Chunk, ProtReadWrite, MapFixed, phys, Chunk);
+            }
             if (r != 0) {
                 sceKernelReleaseDirectMemory(phys, Chunk);
                 void* hole = addr;
@@ -1306,7 +1331,6 @@ private:
                       committed_chunks * Chunk >> 20);
             return -1;
         }
-        std::memset(addr, 0, Chunk); // fresh DRAM reads as zero, as with Eden's memfd backing
         chunk_phys[chunk] = phys;
         if (++committed_chunks % 128 == 0)
             Trace("host memory: %zu MiB of emulated DRAM committed", committed_chunks * Chunk >> 20);
@@ -1334,6 +1358,7 @@ private:
     bool lazy_map{true};
     u64 deferred_blocks{}, deferred_mapped{};
     u64 updates{}, calls{}, mapped_blocks{}, failures{};
+    u64 update_ticks{}, kernel_ticks{}, last_report_tsc{}; // TSC ticks: time in Update / in its kernel calls
     int logged_maps{};
 };
 

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -55,6 +56,10 @@ public:
     // Interrupt this core.
     void Interrupt();
 
+    /// Stops the running guest thread at the next block boundary and logs its backtrace there
+    /// (registers are only exact then), then lets it continue: for chasing a game's bad access.
+    void RequestBacktrace();
+
     // Clear this core's interrupt.
     void ClearInterrupt();
 
@@ -68,6 +73,7 @@ public:
 private:
     const std::size_t m_core_index;
     std::mutex m_guard;
+    std::atomic<bool> m_backtrace_pending{false};
     std::condition_variable m_on_interrupt;
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};

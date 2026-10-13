@@ -61,6 +61,7 @@ public:
     void AddTicks(u64 ticks) override;
     u64 GetTicksRemaining() override;
     u64 GetCNTPCT() override;
+    void TraceBlock(u64 pc) override;
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
 

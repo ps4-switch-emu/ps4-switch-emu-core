@@ -104,6 +104,9 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
 
             ExitContext();
         }
+        if (m_backtrace_pending.exchange(false)) {
+            interface->LogBacktrace(process); // RequestBacktrace: stopped at a block boundary
+        }
 
         // Determine why we stopped.
         // If a step completed successfully, skip other halt reason handlers
@@ -251,6 +254,15 @@ void PhysicalCore::Interrupt() {
 
     // Interrupt the CPU.
     arm_interface->SignalInterrupt(thread);
+}
+
+void PhysicalCore::RequestBacktrace() {
+    std::scoped_lock lk{m_guard};
+    if (m_arm_interface == nullptr) {
+        return;
+    }
+    m_backtrace_pending = true;
+    m_arm_interface->SignalInterrupt(m_current_thread);
 }
 
 void PhysicalCore::ClearInterrupt() {

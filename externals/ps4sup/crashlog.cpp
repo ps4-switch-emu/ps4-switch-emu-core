@@ -312,6 +312,7 @@ extern "C" __attribute__((noinline)) void ps4_trace_callers(const char* what) {
 
 // Appends a line to /data/switch-emu/logs/boot-trace.log (startup milestones), prefixed with the
 // seconds since the first trace line.
+extern "C" int32_t sceKernelDebugOutText(int32_t channel, const char* text, ...);
 extern "C" void ps4_boot_trace(const char* stage) {
     const int fd = traceFd();
     if (fd < 0)
@@ -348,6 +349,15 @@ extern "C" void ps4_boot_trace(const char* stage) {
                  newline ? "\n" : "");
     if (written >= static_cast<int>(sizeof(line)))
         line[sizeof(line) - 2] = '\n';
+    // Also to the kernel log (GoldHEN streams it on port 3232): it still gets out when file
+    // writes are what's stuck.
+    // No '%' (in case the kernel treats the text as a format).
+    char klog_line[sizeof(line)];
+    size_t k = 0;
+    for (const char* c = line; *c && k + 1 < sizeof(klog_line); c++)
+        klog_line[k++] = *c == '%' ? '#' : *c;
+    klog_line[k] = 0;
+    sceKernelDebugOutText(0, klog_line);
     writeAll(fd, line);
     if (ps4_status_push) {
         char shown[200];

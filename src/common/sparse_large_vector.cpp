@@ -13,9 +13,11 @@
 #endif
 
 #ifdef __OPENORBIS__
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <vector>
 extern "C" __attribute__((weak)) void ps4_boot_trace(const char* stage); // externals/ps4sup/crashlog.cpp
@@ -189,7 +191,14 @@ struct Ucontext {
 };
 }
 
-static boost::container::static_vector<std::pair<void*, size_t>, 16> swap_regions;
+// A void region and which of its 2 MiB pages are mapped (the flags are allocated with the region,
+// not in the fault handler).
+struct SwapRegion {
+    void* first;
+    size_t second;
+    std::unique_ptr<bool[]> mapped;
+};
+static boost::container::static_vector<SwapRegion, 16> swap_regions;
 static std::mutex evil_swap_mutex;
 static struct sigaction g_prev_segv, g_prev_bus;
 static unsigned swap_traced; // trace only the first few unhandled faults
@@ -216,11 +225,22 @@ static void SwapHandler(int sig, siginfo_t* info, void* raw_context) {
         if (auto const it = std::ranges::find_if(swap_regions, [addr](auto const& e) {
             return addr >= uintptr_t(e.first) && addr < uintptr_t(e.first) + e.second;
         }); it != swap_regions.end()) {
+            // 2 MiB pieces counted from the region's start, not from 2 MiB boundaries: a region may
+            // start off one (0x200020000), and rounding the address down then went below it - a
+            // wrapped index (a crash reading the flag) and a mapping over memory that isn't ours.
             size_t const page_size = Orbis::ORBIS_PAGE_SIZE * 128;
-            void* aligned_addr = reinterpret_cast<void*>(addr & ~(page_size - 1));
-            void* res = mmap(aligned_addr, page_size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
-            if (res != MAP_FAILED)
+            const size_t index = (addr - uintptr_t(it->first)) / page_size;
+            void* const aligned_addr = static_cast<char*>(it->first) + index * page_size;
+            const size_t length = std::min(page_size, it->second - index * page_size);
+            // Another thread faulted on this page first and mapped it while this one waited for the
+            // lock: mapping it again would swap in a fresh zeroed page and lose what was written.
+            if (it->mapped[index])
                 return; // retry the access
+            void* res = mmap(aligned_addr, length, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
+            if (res != MAP_FAILED) {
+                it->mapped[index] = true;
+                return; // retry the access
+            }
             if (ps4_boot_trace && swap_traced++ < 16) {
                 char line[160];
                 snprintf(line, sizeof(line), "swap: fault at %#lx in void region %p+%#zx, mapping 2 MiB failed (errno %d)",
@@ -318,8 +338,10 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
         base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_VOID | MAP_PRIVATE, -1, 0);
         LOG_WARNING(HW_Memory, "Using VoidMem for {} bytes area @ {}", size, base);
         ASSERT(base != MAP_FAILED);
+        std::scoped_lock lk{evil_swap_mutex};
         ASSERT_MSG(swap_regions.size() < swap_regions.capacity(), "too many void regions");
-        swap_regions.emplace_back(base, size);
+        const size_t pages = (size + Orbis::ORBIS_PAGE_SIZE * 128 - 1) / (Orbis::ORBIS_PAGE_SIZE * 128);
+        swap_regions.push_back({base, size, std::make_unique<bool[]>(pages)});
     }
     if (ps4_boot_trace) {
         char line[160];

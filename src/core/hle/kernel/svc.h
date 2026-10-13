@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <atomic>
+
 namespace Core {
 class System;
 }
@@ -533,5 +535,8 @@ void SvcWrap_CallSecureMonitor64(Core::System& system, std::span<uint64_t, 8> ar
 
 // Perform a supervisor call by index.
 void Call(Core::System& system, u32 imm);
+
+/// Supervisor calls made so far (all processes): how busy the guest is.
+extern std::atomic<u64> g_svc_count;
 
 } // namespace Kernel::Svc

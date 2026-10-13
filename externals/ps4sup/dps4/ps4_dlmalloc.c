@@ -9,6 +9,14 @@
 #define ONLY_MSPACES 1
 #define MSPACES 1
 #define USE_LOCKS 1
+/* Blocking mutexes, not dlmalloc's spin locks: those spin and sched_yield(), which on the PS4 only
+ * hands the core to threads of the same or higher priority. A lower-priority thread holding a heap
+ * lock, its core taken by higher-priority waiters, never got to release it: the whole app stopped
+ * with the waiters at 100% CPU (a 3D game: VulkanWorker and HostTiming in mspace_malloc /
+ * mspace_free for minutes, seen by the hang watchdog; sleeping every 8th yield didn't help). A
+ * mutex waiter sleeps in the kernel until the holder - whatever its priority - releases it. The
+ * mutex objects come from libkernel's own memory, not from this heap. */
+#define USE_SPIN_LOCKS 0
 #define HAVE_MMAP 0
 #define HAVE_MREMAP 0
 #define HAVE_MORECORE 0
@@ -25,6 +33,7 @@
 void ps4_heap_error(void* mspace, void* chunk, int corruption);
 #define CORRUPTION_ERROR_ACTION(m) ps4_heap_error((m), 0, 1)
 #define USAGE_ERROR_ACTION(m, p) ps4_heap_error((m), (p), 0)
+
 
 #include "third_party/dlmalloc/malloc.c"
 

@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <random>
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -317,7 +318,8 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
         // fastmem arena (the PS4 won't reserve the whole 512 GiB guest space).
         const bool enable_aslr = false;
 #else
-        const bool enable_aslr = True(params.flags & Svc::CreateProcessFlag::EnableAslr);
+        // EDEN_NO_ASLR=1: the PS4's choice on a PC (with EDEN_LOW_LAYOUT=1, its whole layout).
+        const bool enable_aslr = True(params.flags & Svc::CreateProcessFlag::EnableAslr) && !std::getenv("EDEN_NO_ASLR");
 #endif
         const bool enable_das_merge =
             False(params.flags & Svc::CreateProcessFlag::DisableDeviceAddressSpaceMerge);
@@ -425,7 +427,8 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
         // fastmem arena (the PS4 won't reserve the whole 512 GiB guest space).
         const bool enable_aslr = false;
 #else
-        const bool enable_aslr = True(params.flags & Svc::CreateProcessFlag::EnableAslr);
+        // EDEN_NO_ASLR=1: the PS4's choice on a PC (with EDEN_LOW_LAYOUT=1, its whole layout).
+        const bool enable_aslr = True(params.flags & Svc::CreateProcessFlag::EnableAslr) && !std::getenv("EDEN_NO_ASLR");
 #endif
         const bool enable_das_merge =
             False(params.flags & Svc::CreateProcessFlag::DisableDeviceAddressSpaceMerge);

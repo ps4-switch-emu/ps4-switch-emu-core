@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <span>
@@ -28,6 +29,7 @@
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/physical_core.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -636,6 +638,17 @@ struct Memory::Impl {
             GetInteger(vaddr), []() {}, []() {});
     }
 
+    /// A guest access near address 0 (a null pointer): the first one logs the guest backtrace
+    /// (the JIT stops at the end of the block; its registers are exact there).
+    void BacktraceNullAccess(u64 addr) {
+        static std::atomic<bool> done{false};
+        if (addr >= 0x10000 || done.exchange(true)) {
+            return;
+        }
+        LOG_ERROR(HW_Memory, "Null access @ {:#x}: guest backtrace follows at the end of this block", addr);
+        system.CurrentPhysicalCore().RequestBacktrace();
+    }
+
     /// @brief Reads a particular data type out of memory at the given virtual address.
     /// @param vaddr The virtual address to read the data type from.
     /// @tparam T The data type to read out of memory.
@@ -643,8 +656,9 @@ struct Memory::Impl {
     template <typename T>
     inline T Read(Common::ProcessAddress vaddr) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
-        if (auto const ptr = GetPointerImpl(addr, [addr]() {
+        if (auto const ptr = GetPointerImpl(addr, [this, addr]() {
             LOG_ERROR(HW_Memory, "Unmapped Read{} @ {:#016x}", sizeof(T) * 8, addr);
+            BacktraceNullAccess(addr);
         }, [&]() {
             HandleRasterizerDownload(addr, sizeof(T));
         }); ptr) [[likely]] {
@@ -664,8 +678,9 @@ struct Memory::Impl {
     template <typename T>
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
-        if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
+        if (auto const ptr = GetPointerImpl(addr, [this, addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
+            BacktraceNullAccess(addr);
         }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]]
             std::memcpy(ptr, &data, sizeof(T));
     }

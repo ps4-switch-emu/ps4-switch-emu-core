@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <functional>
 #include <list>
+#include <string>
 #include <mutex>
 
 #include "common/common_types.h"
@@ -61,6 +62,10 @@ public:
     bool IsReadyGuest(u32 syncpoint_id, u32 expected_value) const {
         return syncpoints_guest[syncpoint_id].load(std::memory_order_acquire) >= expected_value;
     }
+
+    /// Diagnostics: every syncpoint in use - guest and host values, and the values registered
+    /// actions still wait for (a game stuck waiting on the GPU: which one, for what).
+    std::string DebugSummary();
 
     bool IsReadyHost(u32 syncpoint_id, u32 expected_value) const {
         return syncpoints_host[syncpoint_id].load(std::memory_order_acquire) >= expected_value;
